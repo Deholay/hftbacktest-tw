@@ -1,0 +1,11 @@
+[Stock]
+\\DC_TW\taiwan_stock\FubunData\tick_csv
+
+[Odd Lot]
+\\DC_TW\taiwan_stock\ticks_parquet_odd_lot
+
+[ETF]
+\\DC_TW\taiwan_stock\ticks_parquet_etf
+
+[Stock Future]
+\\DC_TW\taiwan_stock\ticks_parquet_stock_future
