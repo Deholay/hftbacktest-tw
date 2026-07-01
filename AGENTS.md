@@ -15,6 +15,8 @@ runner: reusable logic belongs in `scripts/`.
 
 - `scripts/tw_stock_data_to_npz.py`
   Converts Taiwan stock top-5 rows into hftbacktest event `.npz` data.
+  DataAPI access should come from `data_platform_client/data_stock/api`, not the
+  older `data_platform/data_stock/api`.
 
 - `scripts/tw_stock_hftbacktest.py`
   Shared `BacktestConfig`, hftbacktest asset setup, package import isolation,
@@ -36,6 +38,22 @@ runner: reusable logic belongs in `scripts/`.
 
 Strategy output should be DataFrames. Prefer compact summary DataFrames in the
 notebook and keep detailed raw output available as separate variables.
+
+## Data Platform Dependency
+
+Use `data_platform_client` as the data platform dependency for conversion.
+
+- `tw_stock_data_to_npz.py` defaults to
+  `data_platform_client/data_stock/api`.
+- Do not switch conversion back to `data_platform/data_stock/api`.
+- The older `data_platform` API path has cast all columns to `Int64` in the
+  past, which truncates ETF decimal prices such as `77.95` to `77`.
+- If a notebook still emits only integer prices, restart the kernel or reload
+  `scripts.tw_stock_data_to_npz`; stale imports can keep using the old path.
+
+For 0050 with `tick_size = 0.05`, a healthy converted sample should contain
+fractional prices such as `77.90`, `77.95`, `78.00`, `78.05`, not only `77`
+and `78`.
 
 ## HftBacktest Depth Rules
 
@@ -75,6 +93,15 @@ The source data is market-by-price, not market-by-order.
 ev, exch_ts, local_ts, px, qty, order_id, ival, fval
 ```
 
+hftbacktest can consume either:
+
+- an `.npz` file path containing key `data`, or
+- an in-memory NumPy event array with the same hftbacktest event dtype.
+
+It cannot consume raw data platform rows directly. Raw top-5 rows must first be
+converted into hftbacktest events, even if the result is passed in memory instead
+of saved as `.npz`.
+
 Each source top-5 row is converted as:
 
 1. Clear visible price range.
@@ -98,3 +125,14 @@ When debugging missing `ask5` / `bid5`, check both:
 2. `BacktestConfig.tick_size` matches the symbol's actual price grid.
 
 Do not infer tick size from already-suspect or rounded event output.
+
+For 0050 conversion sanity checks, inspect the produced event prices:
+
+```python
+data = np.load(DATA_FILE)["data"]
+unique_px = np.unique(data["px"][np.isfinite(data["px"]) & (data["px"] > 0)])
+print(unique_px[:20])
+```
+
+If the output only has `[77., 78.]` for a 0.05-tick window, the conversion path
+is wrong or stale.
