@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import csv
+import importlib
 import math
 import sys
 from dataclasses import dataclass
@@ -69,6 +70,59 @@ EVENT_DTYPE = np.dtype(
 )
 
 
+def default_data_api_module_dir(root: Path) -> Path:
+    """Return the data_platform_client API path used by default."""
+    return root / "data_platform_client" / "data_stock" / "api"
+
+
+def module_loaded_from(module, root: Path) -> bool:
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return False
+    try:
+        Path(module_file).resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def import_data_api_class(module_dir: Path):
+    """Import DataAPI from either the packaged client API or an explicit module dir."""
+    module_dir = module_dir.resolve()
+    errors: list[str] = []
+
+    if module_dir.name == "api" and module_dir.parent.name == "data_stock":
+        package_root = module_dir.parent.parent
+        if (module_dir.parent / "__init__.py").exists():
+            sys.path.insert(0, str(package_root))
+            try:
+                module = importlib.import_module("data_stock.api.api_parquet")
+                if not module_loaded_from(module, module_dir):
+                    errors.append(
+                        f"package import resolved outside {module_dir}: "
+                        f"{getattr(module, '__file__', None)!r}"
+                    )
+                else:
+                    return module.DataAPI
+            except Exception as exc:
+                errors.append(f"package import data_stock.api.api_parquet failed: {exc!r}")
+
+    sys.path.insert(0, str(module_dir))
+    try:
+        module = importlib.import_module("api_parquet")
+        if not module_loaded_from(module, module_dir):
+            errors.append(
+                f"top-level import resolved outside {module_dir}: "
+                f"{getattr(module, '__file__', None)!r}"
+            )
+        else:
+            return module.DataAPI
+    except Exception as exc:
+        errors.append(f"top-level import api_parquet failed: {exc!r}")
+
+    raise RuntimeError(f"cannot import DataAPI from {module_dir}; " + "; ".join(errors))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert Taiwan stock top-5 L2 data into HftBacktest .npz events."
@@ -82,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-api",
         action="store_true",
-        help="Load rows through data_platform DataAPI.get_data_single_symbol.",
+        help="Load rows through data_platform_client DataAPI.get_data_single_symbol.",
     )
     parser.add_argument(
         "--start-date",
@@ -102,14 +156,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--index-backend",
         default="duckdb",
-        choices=("duckdb", "none"),
-        help="DataAPI index backend. Default: duckdb.",
+        choices=("duckdb", "parquet"),
+        help="data_platform_client index backend. Default: duckdb.",
     )
     parser.add_argument(
         "--data-api-module-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "data_platform" / "data_stock" / "api",
-        help="Directory containing api_parquet.py. Default: ./data_platform/data_stock/api.",
+        default=default_data_api_module_dir(Path(__file__).resolve().parents[1]),
+        help=(
+            "Directory containing api_parquet.py. Defaults to "
+            "./data_platform_client/data_stock/api."
+        ),
     )
     parser.add_argument(
         "--symbol",
@@ -554,11 +611,7 @@ def row_iter_from_csv(args: argparse.Namespace) -> Iterator[dict[str, object]]:
 
 def row_iter_from_data_api(args: argparse.Namespace) -> Iterator[dict[str, object]]:
     module_dir = args.data_api_module_dir.resolve()
-    sys.path.insert(0, str(module_dir))
-    try:
-        from api_parquet import DataAPI
-    except Exception as exc:
-        raise RuntimeError(f"cannot import DataAPI from {module_dir}") from exc
+    DataAPI = import_data_api_class(module_dir)
 
     api = DataAPI(base_dir=args.data_platform_base, index_backend=args.index_backend)
     df = api.get_data_single_symbol(str(args.symbol), args.start_date, args.end_date)
@@ -783,7 +836,7 @@ def convert_tw_stock_to_npz(
         data_platform_base=data_platform_base,
         index_backend=index_backend,
         data_api_module_dir=data_api_module_dir
-        or root / "data_platform" / "data_stock" / "api",
+        or default_data_api_module_dir(root),
         symbol=symbol,
         date=start_date,
         timezone=timezone_name,
