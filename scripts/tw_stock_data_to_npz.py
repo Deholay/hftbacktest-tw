@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Convert Taiwan stock top-5 L2 CSV rows into HftBacktest Event data.
 
@@ -96,8 +96,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data-platform-base",
-        default=r"\\DC_TW\taiwan_stock\數據平台",
-        help=r"DataAPI base_dir. Default: \\DC_TW\taiwan_stock\數據平台.",
+        default=r"\\DC_TW\taiwan_stock\?豢?撟喳",
+        help=r"DataAPI base_dir. Default: \\DC_TW\taiwan_stock\?豢?撟喳.",
     )
     parser.add_argument(
         "--index-backend",
@@ -713,6 +713,92 @@ def convert(args: argparse.Namespace) -> np.ndarray:
     return data
 
 
+def default_output_path(
+    workspace_root: Path,
+    symbol: str,
+    start_date: str,
+    end_date: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+) -> Path:
+    date_part = start_date.replace("-", "")
+    if end_date and end_date != start_date:
+        date_part = f"{date_part}_{end_date.replace('-', '')}"
+    time_part = ""
+    if start_time or end_time:
+        start_label = (start_time or "start").replace(":", "").replace(".", "")
+        end_label = (end_time or "end").replace(":", "").replace(".", "")
+        time_part = f"_{start_label}_{end_label}"
+    return workspace_root / "data" / "tw_stock_events" / f"{symbol}_{date_part}{time_part}.npz"
+
+
+def convert_tw_stock_to_npz(
+    *,
+    symbol: str,
+    start_date: str,
+    end_date: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    output: Path | None = None,
+    workspace_root: Path | None = None,
+    input_csv: Path | None = None,
+    data_api: bool | None = None,
+    data_platform_base: str = r"\\DC_TW\taiwan_stock\數據平台",
+    index_backend: str = "duckdb",
+    data_api_module_dir: Path | None = None,
+    timezone_name: str = "Asia/Taipei",
+    timestamp_unit: str = "auto",
+    base_latency_ns: int = 0,
+    volume_scale: float = 1.0,
+    levels: int = 5,
+    status_allow: list[str] | None = None,
+    trade_side: str = "infer",
+    no_depth: bool = False,
+    no_trades: bool = False,
+    qa_sample_rows: int = 1000,
+) -> tuple[Path, np.ndarray]:
+    """Convert one Taiwan stock symbol/time window to an HftBacktest npz file."""
+    root = Path.cwd() if workspace_root is None else workspace_root
+    root = root.resolve()
+    end_date = start_date if end_date is None else end_date
+    use_data_api = input_csv is None if data_api is None else data_api
+    if use_data_api == bool(input_csv):
+        raise ValueError("choose exactly one input mode: data_api=True or input_csv=Path(...)")
+
+    tz = ZoneInfo(timezone_name)
+    start_exch_ts = parse_timestamp(start_time, timestamp_unit, start_date, tz) if start_time else None
+    end_exch_ts = parse_timestamp(end_time, timestamp_unit, end_date, tz) if end_time else None
+    output_path = output or default_output_path(root, symbol, start_date, end_date, start_time, end_time)
+
+    args = argparse.Namespace(
+        output=output_path,
+        input_csv=input_csv,
+        data_api=use_data_api,
+        start_date=start_date,
+        end_date=end_date,
+        data_platform_base=data_platform_base,
+        index_backend=index_backend,
+        data_api_module_dir=data_api_module_dir
+        or root / "data_platform" / "data_stock" / "api",
+        symbol=symbol,
+        date=start_date,
+        timezone=timezone_name,
+        timestamp_unit=timestamp_unit,
+        base_latency_ns=base_latency_ns,
+        volume_scale=volume_scale,
+        levels=levels,
+        status_allow=status_allow,
+        trade_side=trade_side,
+        no_depth=no_depth,
+        no_trades=no_trades,
+        start_exch_ts=start_exch_ts,
+        end_exch_ts=end_exch_ts,
+        qa_sample_rows=qa_sample_rows,
+    )
+    data = convert(args)
+    return output_path, data
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -723,5 +809,155 @@ def main() -> int:
     return 0
 
 
+
+def parse_hit_state_report_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="tw_stock_data_to_npz.py hit-state-report",
+        description=(
+            "Cross the spread with GTC limit orders and print state after each "
+            "step to verify fills, position, balance, fee, equity, and volume."
+        ),
+    )
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=Path("data/tw_stock_events/2330_20250909.npz"),
+        help="HftBacktest .npz event file.",
+    )
+    parser.add_argument("--contract-size", type=float, default=1000.0, help="Shares per board lot.")
+    parser.add_argument("--tick-size", type=float, default=5.0)
+    parser.add_argument("--lot-size", type=float, default=1.0)
+    parser.add_argument("--qty", type=float, default=1.0, help="Order qty in board lots.")
+    parser.add_argument("--round-trips", type=int, default=1, help="Number of buy-hit/sell-hit pairs.")
+    parser.add_argument("--warmup-ns", type=int, default=1_000_000_000, help="Initial elapse time before first order.")
+    parser.add_argument("--response-timeout-ns", type=int, default=10_000_000, help="Order response wait timeout.")
+    return parser.parse_args(argv)
+
+
+def submit_and_report(
+    hbt,
+    hbtpkg,
+    asset_no: int,
+    order_id: int,
+    side: str,
+    px: float,
+    qty: float,
+    response_timeout_ns: int,
+    contract_size: float,
+) -> None:
+    try:
+        from .tw_stock_hftbacktest import print_state, state_snapshot, submit_limit_order
+    except ImportError:
+        from tw_stock_hftbacktest import print_state, state_snapshot, submit_limit_order
+
+    before = state_snapshot(hbt, asset_no, contract_size)
+    print_state(f"before_{side}", order_id, before)
+
+    rc = submit_limit_order(hbt, hbtpkg, asset_no, order_id, side, px, qty)
+    print(f"submit_{side:<11} order_id={order_id:<6} px={px:.2f} qty={qty:.4f} rc={rc}")
+
+    response = hbt.wait_order_response(asset_no, order_id, response_timeout_ns)
+    after = state_snapshot(hbt, asset_no, contract_size)
+    print(f"response_{side:<9} order_id={order_id:<6} response={response}")
+    print_state(f"after_{side}", order_id, after)
+
+    hbt.clear_inactive_orders(asset_no)
+    print_state(f"clear_{side}", order_id, state_snapshot(hbt, asset_no, contract_size))
+
+
+def hit_state_report_main(argv: list[str] | None = None) -> int:
+    try:
+        from .tw_stock_hftbacktest import (
+            BacktestConfig,
+            build_backtest,
+            close_backtest,
+            import_hftbacktest,
+            print_state,
+            state_snapshot,
+            wait_for_bbo,
+        )
+    except ImportError:
+        from tw_stock_hftbacktest import (
+            BacktestConfig,
+            build_backtest,
+            close_backtest,
+            import_hftbacktest,
+            print_state,
+            state_snapshot,
+            wait_for_bbo,
+        )
+
+    args = parse_hit_state_report_args(argv)
+    workspace_root = Path(__file__).resolve().parents[1]
+    args.data = args.data if args.data.is_absolute() else workspace_root / args.data
+    if not args.data.exists():
+        raise FileNotFoundError(args.data)
+
+    hbtpkg = import_hftbacktest(workspace_root)
+    print(f"hftbacktest={getattr(hbtpkg, '__version__', 'unknown')} file={getattr(hbtpkg, '__file__', None)}")
+    print(f"data={args.data}")
+    print("fee model: maker=0, taker=0; order latency: 0 ns; qty unit: board lots")
+
+    config = BacktestConfig(
+        data=args.data,
+        contract_size=args.contract_size,
+        tick_size=args.tick_size,
+        lot_size=args.lot_size,
+        maker_fee=0.0,
+        taker_fee=0.0,
+        order_latency_ns=0,
+    )
+    hbt = build_backtest(config, hbtpkg)
+    asset_no = 0
+    try:
+        wait_for_bbo(hbt, asset_no, args.warmup_ns)
+        print_state("initial_bbo", None, state_snapshot(hbt, asset_no, args.contract_size))
+
+        next_order_id = 10_001
+        for round_no in range(1, args.round_trips + 1):
+            depth = hbt.depth(asset_no)
+            print(f"\nround={round_no} aggressive buy at best ask")
+            submit_and_report(
+                hbt,
+                hbtpkg,
+                asset_no,
+                next_order_id,
+                "buy",
+                float(depth.best_ask),
+                args.qty,
+                args.response_timeout_ns,
+                args.contract_size,
+            )
+            next_order_id += 1
+
+            depth = hbt.depth(asset_no)
+            print(f"\nround={round_no} aggressive sell at best bid")
+            submit_and_report(
+                hbt,
+                hbtpkg,
+                asset_no,
+                next_order_id,
+                "sell",
+                float(depth.best_bid),
+                args.qty,
+                args.response_timeout_ns,
+                args.contract_size,
+            )
+            next_order_id += 1
+
+        print("\nfinal")
+        print_state("final_state", None, state_snapshot(hbt, asset_no, args.contract_size))
+    finally:
+        close_backtest(hbt)
+    return 0
+
+
+def cli_main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args and args[0] in {"hit-state-report", "state-report", "report"}:
+        return hit_state_report_main(args[1:])
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())
