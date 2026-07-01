@@ -330,6 +330,10 @@ def valid_price_qty(price: float, qty: float) -> bool:
     return math.isfinite(price) and price > 0 and math.isfinite(qty) and qty > 0
 
 
+def add_depth_level(depth: dict[float, float], price: float, qty: float) -> None:
+    depth[price] = depth.get(price, 0.0) + qty
+
+
 def iter_depth_events(
     row: dict[str, str],
     exch_ts: int,
@@ -337,8 +341,8 @@ def iter_depth_events(
     levels: int,
     volume_scale: float,
 ) -> Iterable[tuple]:
-    bids: list[tuple[float, float]] = []
-    asks: list[tuple[float, float]] = []
+    bids: dict[float, float] = {}
+    asks: dict[float, float] = {}
 
     for level in range(1, levels + 1):
         ask_px = to_float(row.get(f"ask_price{level}"))
@@ -347,20 +351,20 @@ def iter_depth_events(
         bid_qty = to_float(row.get(f"bid_volume{level}")) * volume_scale
 
         if valid_price_qty(ask_px, ask_qty):
-            asks.append((ask_px, ask_qty))
+            add_depth_level(asks, ask_px, ask_qty)
         if valid_price_qty(bid_px, bid_qty):
-            bids.append((bid_px, bid_qty))
+            add_depth_level(bids, bid_px, bid_qty)
 
     if bids:
-        worst_bid = min(px for px, _ in bids)
+        worst_bid = min(bids)
         yield make_event(DEPTH_CLEAR_EVENT | BUY_EVENT, exch_ts, local_ts, worst_bid, 0.0)
-        for px, qty in bids:
+        for px, qty in sorted(bids.items(), reverse=True):
             yield make_event(DEPTH_SNAPSHOT_EVENT | BUY_EVENT, exch_ts, local_ts, px, qty)
 
     if asks:
-        worst_ask = max(px for px, _ in asks)
+        worst_ask = max(asks)
         yield make_event(DEPTH_CLEAR_EVENT | SELL_EVENT, exch_ts, local_ts, worst_ask, 0.0)
-        for px, qty in asks:
+        for px, qty in sorted(asks.items()):
             yield make_event(DEPTH_SNAPSHOT_EVENT | SELL_EVENT, exch_ts, local_ts, px, qty)
 
 

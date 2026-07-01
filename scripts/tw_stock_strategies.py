@@ -46,12 +46,81 @@ except ImportError:
 
 
 DEFAULT_QUEUE_MODELS = ["risk_adverse", "log_prob"]
+STRATEGY3_COMPARISON_COLUMNS = [
+    "candidate_id",
+    "queue_model",
+    "side",
+    "order_id",
+    "price",
+    "qty",
+    "send_order_ts",
+    "send_order_time",
+    "send_best_bid",
+    "send_best_ask",
+    "depth_level",
+    "selected_qty",
+    "max_window_s",
+    "candidate_window_start_time",
+    "depth_reduce_events",
+    "depth_reduce_qty",
+    "candidate_trade_events",
+    "candidate_trade_qty",
+    "candidate_score",
+    "fill_ts",
+    "fill_time",
+    "fill_exch_ts",
+    "fill_local_ts",
+    "exec_qty",
+    "exec_price",
+    "fill_step",
+    "fill_position",
+    "fill_balance",
+    "fill_equity",
+    "was_filled",
+    "time_to_fill_ns",
+    "time_to_fill_s",
+    "queue_model_fill_delta_ns",
+]
+LEVEL_COMPARISON_COLUMNS = [
+    "queue_model",
+    "side",
+    "level",
+    "actual_level",
+    "order_id",
+    "price",
+    "qty",
+    "send_best_bid",
+    "send_best_ask",
+    "send_order_ts",
+    "send_order_time",
+    "fill_ts",
+    "fill_time",
+    "was_filled",
+    "time_to_fill_ns",
+    "time_to_fill_s",
+    "queue_model_fill_delta_ns",
+    "exec_qty",
+    "exec_price",
+    "fill_step",
+    "position",
+    "balance",
+    "equity",
+]
 
 
 def ns_to_datetime(ns: int | float | pd._libs.missing.NAType):
     if pd.isna(ns):
         return pd.NaT
     return pd.to_datetime(ns, unit="ns", utc=True).tz_convert("Asia/Taipei")
+
+
+def infer_tick_size(event_data: np.ndarray, default: float = 5.0) -> float:
+    prices = np.unique(event_data["px"][np.isfinite(event_data["px"]) & (event_data["px"] > 0)])
+    if len(prices) < 2:
+        return default
+    diffs = np.diff(np.sort(prices))
+    diffs = diffs[diffs > 0]
+    return float(diffs.min()) if len(diffs) else default
 
 
 def config_with_queue_model(config: BacktestConfig, queue_model: str) -> BacktestConfig:
@@ -435,6 +504,21 @@ def scan_strategy3_candidates(
         .head(limit)
         .reset_index(drop=True)
     )
+    if candidates.empty and require_trade:
+        fallback_candidates = reductions.merge(trade_counts, on=["window_start", "side", "px"], how="left")
+        fallback_candidates[["trade_events", "trade_qty"]] = fallback_candidates[["trade_events", "trade_qty"]].fillna(0)
+        fallback_candidates["score"] = fallback_candidates["depth_reduce_events"] / (
+            fallback_candidates["trade_events"] + 1
+        )
+        candidates = (
+            fallback_candidates[
+                fallback_candidates["depth_reduce_events"].ge(min_depth_reduce_events)
+                & fallback_candidates["trade_events"].le(max_trade_events)
+            ]
+            .sort_values(["score", "depth_reduce_events", "depth_reduce_qty"], ascending=False)
+            .head(limit)
+            .reset_index(drop=True)
+        )
     candidates.insert(0, "candidate_id", candidates.index + 1)
     candidates["window_end"] = candidates["window_start"] + window_ns
     candidates["window_start_time"] = candidates["window_start"].map(ns_to_datetime)
@@ -448,6 +532,235 @@ def price_depth_level(side: str, px: float, best_bid: float, best_ask: float, ti
     if side == "sell":
         return int(round((px - best_ask) / tick_size)) + 1 if px >= best_ask else 0
     raise ValueError(f"unknown side: {side}")
+
+
+def price_at_level(depth, side: str, level: int, tick_size: float, max_scan_ticks: int = 10_000) -> tuple[float, int]:
+    if level < 1:
+        raise ValueError("level must be >= 1")
+    if side == "buy":
+        tick = int(depth.best_bid_tick)
+        found = 0
+        fallback_price = None
+        for candidate_tick in range(tick, tick - max_scan_ticks, -1):
+            if float(depth.bid_qty_at_tick(candidate_tick)) > 0:
+                found += 1
+                fallback_price = candidate_tick * tick_size
+                if found == level:
+                    return candidate_tick * tick_size, found
+        if fallback_price is not None:
+            return fallback_price, found
+    if side == "sell":
+        tick = int(depth.best_ask_tick)
+        found = 0
+        fallback_price = None
+        for candidate_tick in range(tick, tick + max_scan_ticks):
+            if float(depth.ask_qty_at_tick(candidate_tick)) > 0:
+                found += 1
+                fallback_price = candidate_tick * tick_size
+                if found == level:
+                    return candidate_tick * tick_size, found
+        if fallback_price is not None:
+            return fallback_price, found
+    raise ValueError(f"cannot find {side}{level} within {max_scan_ticks} ticks")
+
+
+def attach_level_metadata(
+    row: dict[str, Any],
+    side: str,
+    level: int,
+    actual_level: int,
+    best_bid: float,
+    best_ask: float,
+    max_window_s: int,
+) -> dict[str, Any]:
+    row.update(
+        {
+            "level": level,
+            "actual_level": actual_level,
+            "send_best_bid": best_bid,
+            "send_best_ask": best_ask,
+            "max_window_s": max_window_s,
+            "crossed_at_send": (side == "buy" and row["price"] >= best_ask)
+            or (side == "sell" and row["price"] <= best_bid),
+        }
+    )
+    return row
+
+
+def run_passive_level_strategy(
+    config: BacktestConfig,
+    hbtpkg,
+    event_data: np.ndarray,
+    queue_model: str,
+    side: str = "sell",
+    level: int = 5,
+    qty: float = 3.0,
+    max_window_s: int = 6 * 60 * 60,
+    step_ns: int = 1_000_000_000,
+    response_timeout_ns: int = 10_000_000,
+) -> pd.DataFrame:
+    queue_config = config_with_queue_model(config, queue_model)
+
+    def run(hbt):
+        asset_no = 0
+        rows = []
+        wait_for_bbo(hbt, asset_no)
+
+        depth = hbt.depth(asset_no)
+        best_bid = float(depth.best_bid)
+        best_ask = float(depth.best_ask)
+        px, actual_level = price_at_level(depth, side, level, queue_config.tick_size)
+        order_id = 40_000 + level
+
+        rc = submit_limit_order(hbt, hbtpkg, asset_no, order_id, side, px, qty)
+        response = hbt.wait_order_response(asset_no, order_id, response_timeout_ns)
+        order = get_order(hbt, asset_no, order_id)
+        if order is not None and float(order.exec_qty) > 0:
+            raise RuntimeError(f"passive {side}{level} order filled on accept at px={px}")
+
+        row = record_order_state(
+            hbt,
+            hbtpkg,
+            asset_no,
+            queue_config,
+            "accepted",
+            f"passive_{side}{level}",
+            event_data=event_data,
+            queue_model=queue_model,
+            side=side,
+            order_id=order_id,
+            px=px,
+            qty=qty,
+            rc=rc,
+            response=response,
+            step=0,
+        )
+        rows.append(attach_level_metadata(row, side, level, actual_level, best_bid, best_ask, max_window_s))
+
+        send_ts = int(order.local_timestamp)
+        end_ts = send_ts + int(max_window_s * 1_000_000_000)
+        step = 0
+        while int(hbt.current_timestamp) < end_ts:
+            order = get_order(hbt, asset_no, order_id)
+            if order is not None and (float(order.exec_qty) > 0 or int(order.status) == hbtpkg.FILLED):
+                row = record_order_state(
+                    hbt,
+                    hbtpkg,
+                    asset_no,
+                    queue_config,
+                    "filled",
+                    f"passive_{side}{level}",
+                    event_data=event_data,
+                    queue_model=queue_model,
+                    side=side,
+                    order_id=order_id,
+                    px=px,
+                    qty=qty,
+                    step=step,
+                    is_fill=True,
+                )
+                rows.append(attach_level_metadata(row, side, level, actual_level, best_bid, best_ask, max_window_s))
+                break
+            if hbt.elapse(step_ns) != 0:
+                break
+            step += 1
+
+        row = record_order_state(
+            hbt,
+            hbtpkg,
+            asset_no,
+            queue_config,
+            "final_state",
+            f"passive_{side}{level}",
+            event_data=event_data,
+            queue_model=queue_model,
+            side=side,
+            order_id=order_id,
+            px=px,
+            qty=qty,
+            step=step,
+        )
+        rows.append(attach_level_metadata(row, side, level, actual_level, best_bid, best_ask, max_window_s))
+        return pd.DataFrame(rows)
+
+    return with_backtest(queue_config, hbtpkg, run)
+
+
+def summarize_level_output(output: pd.DataFrame) -> pd.DataFrame:
+    accepted = output[output["label"].eq("accepted")].copy()
+    fills = output[output["label"].eq("filled")].copy()
+    if accepted.empty:
+        return pd.DataFrame(columns=LEVEL_COMPARISON_COLUMNS)
+
+    keys = ["queue_model", "side", "level", "actual_level", "order_id"]
+    comparison = accepted[
+        keys
+        + [
+            "price",
+            "qty",
+            "send_best_bid",
+            "send_best_ask",
+            "send_order_ts",
+            "send_order_time",
+        ]
+    ].merge(
+        fills[
+            keys
+            + [
+                "fill_ts",
+                "fill_time",
+                "exec_qty",
+                "exec_price",
+                "step",
+                "position",
+                "balance",
+                "equity",
+            ]
+        ].rename(columns={"step": "fill_step"}),
+        on=keys,
+        how="left",
+    )
+    comparison["was_filled"] = comparison["fill_ts"].notna()
+    comparison["time_to_fill_ns"] = comparison["fill_ts"] - comparison["send_order_ts"]
+    comparison["time_to_fill_s"] = comparison["time_to_fill_ns"] / 1_000_000_000
+    comparison["queue_model_fill_delta_ns"] = pd.NA
+    filled_mask = comparison["was_filled"]
+    comparison.loc[filled_mask, "queue_model_fill_delta_ns"] = comparison[filled_mask].groupby(
+        ["side", "level", "price"]
+    )["fill_ts"].transform(lambda values: values - values.min())
+    for column in LEVEL_COMPARISON_COLUMNS:
+        if column not in comparison.columns:
+            comparison[column] = pd.NA
+    return comparison[LEVEL_COMPARISON_COLUMNS].sort_values(["side", "level", "queue_model"]).reset_index(drop=True)
+
+
+def run_level_queue_model_comparison(
+    config: BacktestConfig,
+    hbtpkg,
+    event_data: np.ndarray,
+    queue_models: Sequence[str] = DEFAULT_QUEUE_MODELS,
+    side: str = "sell",
+    level: int = 5,
+    qty: float = 3.0,
+    max_window_s: int = 6 * 60 * 60,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    output = pd.concat(
+        [
+            run_passive_level_strategy(
+                config,
+                hbtpkg,
+                event_data,
+                queue_model,
+                side=side,
+                level=level,
+                qty=qty,
+                max_window_s=max_window_s,
+            )
+            for queue_model in queue_models
+        ],
+        ignore_index=True,
+    )
+    return output, summarize_level_output(output)
 
 
 def attach_candidate_metadata(
@@ -602,12 +915,16 @@ def run_deep_passive_candidate(
 
 def summarize_strategy3_output(output: pd.DataFrame) -> pd.DataFrame:
     if output.empty:
-        return output.copy()
+        return pd.DataFrame(columns=STRATEGY3_COMPARISON_COLUMNS)
     keys = ["candidate_id", "queue_model", "side", "order_id"]
     accepted = output[output["label"].eq("accepted")].copy()
     fills = output[output["label"].eq("filled")].copy()
     if accepted.empty:
-        return output[output["label"].str.startswith("skipped")].copy()
+        skipped = output[output["label"].str.startswith("skipped")].copy()
+        for column in STRATEGY3_COMPARISON_COLUMNS:
+            if column not in skipped.columns:
+                skipped[column] = pd.NA
+        return skipped[STRATEGY3_COMPARISON_COLUMNS]
 
     accepted_cols = keys + [
         "price",
@@ -660,7 +977,11 @@ def summarize_strategy3_output(output: pd.DataFrame) -> pd.DataFrame:
     comparison.loc[filled_mask, "queue_model_fill_delta_ns"] = comparison[filled_mask].groupby(
         ["candidate_id", "side", "price"]
     )["fill_ts"].transform(lambda values: values - values.min())
-    return comparison.sort_values(["candidate_id", "side", "queue_model"]).reset_index(drop=True)
+    comparison = comparison.sort_values(["candidate_id", "side", "queue_model"]).reset_index(drop=True)
+    for column in STRATEGY3_COMPARISON_COLUMNS:
+        if column not in comparison.columns:
+            comparison[column] = pd.NA
+    return comparison[STRATEGY3_COMPARISON_COLUMNS]
 
 
 def run_strategy3_deep_queue_comparison(
