@@ -10,6 +10,24 @@ The current working notebook is `notebooks/hftbacktest_TWStock.ipynb`. The noteb
 - `scripts/tw_stock_hftbacktest.py`: shared hftbacktest config, asset setup, BBO/state helpers, and package import isolation.
 - `scripts/tw_stock_strategies.py`: strategy runners and DataFrame summary helpers.
 - `notebooks/hftbacktest_TWStock.ipynb`: runnable experiment wrapper.
+- `notebooks/hftbacktest_TWETF.ipynb`: ETF daily parquet runner.
+- `notebooks/hftbacktest_TWOddLot.ipynb`: odd-lot daily parquet runner.
+- `notebooks/hftbacktest_TWStockFuture.ipynb`: stock-future daily parquet runner.
+
+## Additional Source Converters
+
+The stock DataAPI path remains `data_platform_client/data_stock/api`. ETF, Odd Lot, and Stock Future use the daily parquet roots listed in `path.toml`, then share the same event builder, hftbacktest setup, and strategy code.
+
+Column index check against the stock top-5 schema:
+
+| Source | Same as stock? | Relevant column layout | Converter |
+| --- | --- | --- | --- |
+| Stock | Yes | `ask_price1`/`ask_volume1` start at stock schema indexes 16/17. | `convert_tw_stock_to_npz` |
+| ETF | No | 23 columns; `ask_price1` index 7, `bid_price1` index 8; no per-level volume columns. | `convert_tw_etf_to_npz` |
+| Odd Lot | No | Same 23-column price-only layout as ETF; `symbol` may be stored as an integer, so `0050` also matches `50`. | `convert_tw_odd_lot_to_npz` |
+| Stock Future | No | 40 columns; `ask_price1`/`ask_volume1`/`bid_price1`/`bid_volume1` start at indexes 7/8/9/10. | `convert_tw_stock_future_to_npz` |
+
+ETF and Odd Lot parquet data only contain top-5 prices, not top-5 quantities. Their converters use `price_only_depth_qty=1.0` by default so BBO/depth replay can run, but queue-size-sensitive strategy output should be read as a structural replay test rather than a true queue-volume model.
 
 ## Current Notebook Flow
 

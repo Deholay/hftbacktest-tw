@@ -36,7 +36,7 @@ import importlib
 import math
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 from zoneinfo import ZoneInfo
@@ -69,10 +69,101 @@ EVENT_DTYPE = np.dtype(
     align=True,
 )
 
+SOURCE_KIND_ALIASES = {
+    "stock": "stock",
+    "tw_stock": "stock",
+    "odd lot": "odd_lot",
+    "odd_lot": "odd_lot",
+    "odd-lot": "odd_lot",
+    "tw_odd_lot": "odd_lot",
+    "etf": "etf",
+    "tw_etf": "etf",
+    "stock future": "stock_future",
+    "stock_future": "stock_future",
+    "stock-future": "stock_future",
+    "tw_stock_future": "stock_future",
+}
+
+SOURCE_KIND_LABELS = {
+    "stock": "Stock",
+    "odd_lot": "Odd Lot",
+    "etf": "ETF",
+    "stock_future": "Stock Future",
+}
+
+DEFAULT_DAILY_PARQUET_DIRS = {
+    "odd_lot": Path(r"\\DC_TW\taiwan_stock\ticks_parquet_odd_lot"),
+    "etf": Path(r"\\DC_TW\taiwan_stock\ticks_parquet_etf"),
+    "stock_future": Path(r"\\DC_TW\taiwan_stock\ticks_parquet_stock_future"),
+}
+
+PRICE_ONLY_DEPTH_SOURCE_KINDS = {"odd_lot", "etf"}
+
 
 def default_data_api_module_dir(root: Path) -> Path:
     """Return the data_platform_client API path used by default."""
     return root / "data_platform_client" / "data_stock" / "api"
+
+
+def normalize_source_kind(source_kind: str) -> str:
+    normalized = SOURCE_KIND_ALIASES.get(source_kind.strip().lower().replace("_", " "))
+    if normalized is not None:
+        return normalized
+    normalized = SOURCE_KIND_ALIASES.get(source_kind.strip().lower())
+    if normalized is not None:
+        return normalized
+    valid = ", ".join(sorted(SOURCE_KIND_LABELS))
+    raise ValueError(f"unknown source_kind={source_kind!r}; valid values: {valid}")
+
+
+def read_path_config(path: Path) -> dict[str, Path]:
+    """Read the local path.toml section/path format used by this workspace."""
+    if not path.exists():
+        return {}
+
+    paths: dict[str, Path] = {}
+    section: str | None = None
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if section is None:
+            continue
+        try:
+            source_kind = normalize_source_kind(section)
+        except ValueError:
+            continue
+        paths[source_kind] = Path(line)
+    return paths
+
+
+def default_daily_parquet_dir(
+    workspace_root: Path,
+    source_kind: str,
+    path_config: Path | None = None,
+) -> Path:
+    source_kind = normalize_source_kind(source_kind)
+    config_path = path_config or workspace_root / "path.toml"
+    configured = read_path_config(config_path).get(source_kind)
+    if configured is not None:
+        return configured
+    try:
+        return DEFAULT_DAILY_PARQUET_DIRS[source_kind]
+    except KeyError as exc:
+        raise ValueError(f"{source_kind!r} does not have a daily parquet directory") from exc
+
+
+def output_folder_for_source(source_kind: str) -> str:
+    source_kind = normalize_source_kind(source_kind)
+    return {
+        "stock": "tw_stock_events",
+        "odd_lot": "tw_odd_lot_events",
+        "etf": "tw_etf_events",
+        "stock_future": "tw_stock_future_events",
+    }[source_kind]
 
 
 def module_loaded_from(module, root: Path) -> bool:
@@ -129,14 +220,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("output", type=Path, help="Output .npz file.")
     parser.add_argument(
+        "--source-kind",
+        default="stock",
+        help="Market data source kind. Default: stock.",
+    )
+    parser.add_argument(
         "--input-csv",
         type=Path,
-        help="Input CSV file. Mutually exclusive with --data-api.",
+        help="Input CSV file. Mutually exclusive with --data-api and --daily-parquet.",
     )
     parser.add_argument(
         "--data-api",
         action="store_true",
         help="Load rows through data_platform_client DataAPI.get_data_single_symbol.",
+    )
+    parser.add_argument(
+        "--daily-parquet",
+        action="store_true",
+        help="Load rows from daily parquet files such as ETF, Odd Lot, or Stock Future sources.",
+    )
+    parser.add_argument(
+        "--daily-parquet-dir",
+        type=Path,
+        help="Directory containing daily parquet files named YYYY-MM-DD.parquet.",
+    )
+    parser.add_argument(
+        "--path-config",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "path.toml",
+        help="Workspace path config. Default: ./path.toml.",
     )
     parser.add_argument(
         "--start-date",
@@ -203,6 +315,14 @@ def parse_args() -> argparse.Namespace:
         help="Multiply all volume fields by this value. Default: 1.0.",
     )
     parser.add_argument(
+        "--price-only-depth-qty",
+        type=float,
+        help=(
+            "Depth quantity to use when the source has top-5 prices but no "
+            "level volume columns. Defaults to 1.0 for ETF and Odd Lot."
+        ),
+    )
+    parser.add_argument(
         "--levels",
         type=int,
         default=5,
@@ -252,10 +372,22 @@ def parse_args() -> argparse.Namespace:
         help="Number of converted rows to use for replay QA. Default: 1000.",
     )
     args = parser.parse_args()
-    if args.data_api == bool(args.input_csv):
-        parser.error("choose exactly one input mode: --data-api or --input-csv PATH")
+    args.source_kind = normalize_source_kind(args.source_kind)
+    input_modes = [args.data_api, bool(args.input_csv), args.daily_parquet]
+    if sum(bool(mode) for mode in input_modes) != 1:
+        parser.error("choose exactly one input mode: --data-api, --daily-parquet, or --input-csv PATH")
     if args.data_api and args.symbol is None:
         args.symbol = "2330"
+    if args.daily_parquet and args.symbol is None:
+        parser.error("--symbol is required with --daily-parquet")
+    if args.daily_parquet and args.daily_parquet_dir is None:
+        args.daily_parquet_dir = default_daily_parquet_dir(
+            Path(__file__).resolve().parents[1],
+            args.source_kind,
+            args.path_config,
+        )
+    if args.price_only_depth_qty is None and args.source_kind in PRICE_ONLY_DEPTH_SOURCE_KINDS:
+        args.price_only_depth_qty = 1.0
     return args
 
 
@@ -391,21 +523,49 @@ def add_depth_level(depth: dict[float, float], price: float, qty: float) -> None
     depth[price] = depth.get(price, 0.0) + qty
 
 
+def depth_qty_from_row(
+    row: dict[str, object],
+    field_name: str,
+    price: float,
+    volume_scale: float,
+    price_only_depth_qty: float | None,
+) -> float:
+    value = row.get(field_name)
+    if value is not None and str(value).strip() != "":
+        return to_float(value) * volume_scale
+    if price_only_depth_qty is not None and math.isfinite(price) and price > 0:
+        return price_only_depth_qty * volume_scale
+    return math.nan
+
+
 def iter_depth_events(
-    row: dict[str, str],
+    row: dict[str, object],
     exch_ts: int,
     local_ts: int,
     levels: int,
     volume_scale: float,
+    price_only_depth_qty: float | None = None,
 ) -> Iterable[tuple]:
     bids: dict[float, float] = {}
     asks: dict[float, float] = {}
 
     for level in range(1, levels + 1):
         ask_px = to_float(row.get(f"ask_price{level}"))
-        ask_qty = to_float(row.get(f"ask_volume{level}")) * volume_scale
         bid_px = to_float(row.get(f"bid_price{level}"))
-        bid_qty = to_float(row.get(f"bid_volume{level}")) * volume_scale
+        ask_qty = depth_qty_from_row(
+            row,
+            f"ask_volume{level}",
+            ask_px,
+            volume_scale,
+            price_only_depth_qty,
+        )
+        bid_qty = depth_qty_from_row(
+            row,
+            f"bid_volume{level}",
+            bid_px,
+            volume_scale,
+            price_only_depth_qty,
+        )
 
         if valid_price_qty(ask_px, ask_qty):
             add_depth_level(asks, ask_px, ask_qty)
@@ -618,6 +778,95 @@ def row_iter_from_data_api(args: argparse.Namespace) -> Iterator[dict[str, objec
     yield from df.to_dicts()
 
 
+def iter_date_strings(start_date: str, end_date: str) -> Iterator[str]:
+    current = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    while current <= end:
+        yield current.strftime("%Y-%m-%d")
+        current += timedelta(days=1)
+
+
+def daily_parquet_files(data_dir: Path, start_date: str, end_date: str) -> list[Path]:
+    files: list[Path] = []
+    for date_text in iter_date_strings(start_date, end_date):
+        path = data_dir / f"{date_text}.parquet"
+        if path.exists():
+            files.append(path)
+    return files
+
+
+def symbol_filter_values(symbol: str) -> list[str]:
+    values = [str(symbol)]
+    stripped = str(symbol).lstrip("0")
+    if stripped and stripped not in values:
+        values.append(stripped)
+    return values
+
+
+def daily_parquet_columns(levels: int) -> list[str]:
+    columns = [
+        "symbol",
+        "symbol_id",
+        "exchtime",
+        "localtime",
+        "status",
+        "last_price",
+        "total_volume",
+        "sequence",
+    ]
+    for level in range(1, levels + 1):
+        columns.extend(
+            [
+                f"ask_price{level}",
+                f"ask_volume{level}",
+                f"bid_price{level}",
+                f"bid_volume{level}",
+            ]
+        )
+    return columns
+
+
+def row_iter_from_daily_parquet(args: argparse.Namespace) -> Iterator[dict[str, object]]:
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise RuntimeError("daily parquet input requires polars") from exc
+
+    data_dir = Path(args.daily_parquet_dir).resolve()
+    files = daily_parquet_files(data_dir, args.start_date, args.end_date)
+    if not files:
+        raise FileNotFoundError(
+            f"no daily parquet files found in {data_dir} for {args.start_date} to {args.end_date}"
+        )
+
+    lf = pl.scan_parquet([str(path) for path in files])
+    schema_names = set(lf.collect_schema().names())
+    required = {"symbol", "exchtime", "last_price", "total_volume"}
+    for level in range(1, args.levels + 1):
+        required.add(f"ask_price{level}")
+        required.add(f"bid_price{level}")
+    missing = sorted(required - schema_names)
+    if missing:
+        raise ValueError(f"daily parquet source missing required columns: {missing}")
+
+    selected_columns = [column for column in daily_parquet_columns(args.levels) if column in schema_names]
+    lf = lf.select(selected_columns)
+
+    lf = lf.filter(pl.col("symbol").cast(pl.Utf8).is_in(symbol_filter_values(str(args.symbol))))
+    if args.status_allow and "status" in schema_names:
+        lf = lf.filter(pl.col("status").cast(pl.Utf8).is_in([str(value) for value in args.status_allow]))
+    if args.start_exch_ts is not None:
+        lf = lf.filter(pl.col("exchtime").cast(pl.Int64) >= int(args.start_exch_ts))
+    if args.end_exch_ts is not None:
+        lf = lf.filter(pl.col("exchtime").cast(pl.Int64) <= int(args.end_exch_ts))
+
+    df = lf.collect()
+    sort_columns = [column for column in ("exchtime", "localtime", "sequence") if column in df.columns]
+    if sort_columns:
+        df = df.sort(sort_columns)
+    yield from df.to_dicts()
+
+
 def build_events_from_rows(
     rows: Iterable[dict[str, object]],
     args: argparse.Namespace,
@@ -690,6 +939,7 @@ def build_events_from_rows(
                     local_ts,
                     args.levels,
                     args.volume_scale,
+                    args.price_only_depth_qty,
                 )
             )
 
@@ -759,6 +1009,8 @@ def print_summary(stats: ConversionStats, output: Path) -> None:
 def convert(args: argparse.Namespace) -> np.ndarray:
     if args.data_api:
         rows = row_iter_from_data_api(args)
+    elif args.daily_parquet:
+        rows = row_iter_from_daily_parquet(args)
     else:
         rows = row_iter_from_csv(args)
 
@@ -777,6 +1029,7 @@ def default_output_path(
     end_date: str | None = None,
     start_time: str | None = None,
     end_time: str | None = None,
+    source_kind: str = "stock",
 ) -> Path:
     date_part = start_date.replace("-", "")
     if end_date and end_date != start_date:
@@ -786,7 +1039,7 @@ def default_output_path(
         start_label = (start_time or "start").replace(":", "").replace(".", "")
         end_label = (end_time or "end").replace(":", "").replace(".", "")
         time_part = f"_{start_label}_{end_label}"
-    return workspace_root / "data" / "tw_stock_events" / f"{symbol}_{date_part}{time_part}.npz"
+    return workspace_root / "data" / output_folder_for_source(source_kind) / f"{symbol}_{date_part}{time_part}.npz"
 
 
 def convert_tw_stock_to_npz(
@@ -800,6 +1053,10 @@ def convert_tw_stock_to_npz(
     workspace_root: Path | None = None,
     input_csv: Path | None = None,
     data_api: bool | None = None,
+    daily_parquet: bool | None = None,
+    daily_parquet_dir: Path | None = None,
+    path_config: Path | None = None,
+    source_kind: str = "stock",
     data_platform_base: str = r"\\DC_TW\taiwan_stock\數據平台",
     index_backend: str = "duckdb",
     data_api_module_dir: Path | None = None,
@@ -807,6 +1064,7 @@ def convert_tw_stock_to_npz(
     timestamp_unit: str = "auto",
     base_latency_ns: int = 0,
     volume_scale: float = 1.0,
+    price_only_depth_qty: float | None = None,
     levels: int = 5,
     status_allow: list[str] | None = None,
     trade_side: str = "infer",
@@ -814,23 +1072,42 @@ def convert_tw_stock_to_npz(
     no_trades: bool = False,
     qa_sample_rows: int = 1000,
 ) -> tuple[Path, np.ndarray]:
-    """Convert one Taiwan stock symbol/time window to an HftBacktest npz file."""
+    """Convert one Taiwan top-5 symbol/time window to an HftBacktest npz file."""
     root = Path.cwd() if workspace_root is None else workspace_root
     root = root.resolve()
     end_date = start_date if end_date is None else end_date
-    use_data_api = input_csv is None if data_api is None else data_api
-    if use_data_api == bool(input_csv):
-        raise ValueError("choose exactly one input mode: data_api=True or input_csv=Path(...)")
+    source_kind = normalize_source_kind(source_kind)
+    use_daily_parquet = False if daily_parquet is None else daily_parquet
+    use_data_api = input_csv is None and not use_daily_parquet if data_api is None else data_api
+    input_modes = [use_data_api, bool(input_csv), use_daily_parquet]
+    if sum(bool(mode) for mode in input_modes) != 1:
+        raise ValueError("choose exactly one input mode: data_api=True, daily_parquet=True, or input_csv=Path(...)")
+    if use_daily_parquet:
+        daily_parquet_dir = daily_parquet_dir or default_daily_parquet_dir(root, source_kind, path_config)
+    if price_only_depth_qty is None and source_kind in PRICE_ONLY_DEPTH_SOURCE_KINDS:
+        price_only_depth_qty = 1.0
 
     tz = ZoneInfo(timezone_name)
     start_exch_ts = parse_timestamp(start_time, timestamp_unit, start_date, tz) if start_time else None
     end_exch_ts = parse_timestamp(end_time, timestamp_unit, end_date, tz) if end_time else None
-    output_path = output or default_output_path(root, symbol, start_date, end_date, start_time, end_time)
+    output_path = output or default_output_path(
+        root,
+        symbol,
+        start_date,
+        end_date,
+        start_time,
+        end_time,
+        source_kind,
+    )
 
     args = argparse.Namespace(
         output=output_path,
         input_csv=input_csv,
         data_api=use_data_api,
+        daily_parquet=use_daily_parquet,
+        daily_parquet_dir=daily_parquet_dir,
+        path_config=path_config or root / "path.toml",
+        source_kind=source_kind,
         start_date=start_date,
         end_date=end_date,
         data_platform_base=data_platform_base,
@@ -843,6 +1120,7 @@ def convert_tw_stock_to_npz(
         timestamp_unit=timestamp_unit,
         base_latency_ns=base_latency_ns,
         volume_scale=volume_scale,
+        price_only_depth_qty=price_only_depth_qty,
         levels=levels,
         status_allow=status_allow,
         trade_side=trade_side,
@@ -854,6 +1132,36 @@ def convert_tw_stock_to_npz(
     )
     data = convert(args)
     return output_path, data
+
+
+def convert_tw_etf_to_npz(**kwargs) -> tuple[Path, np.ndarray]:
+    """Convert Taiwan ETF daily parquet top-5 prices into HftBacktest events."""
+    return convert_tw_stock_to_npz(
+        source_kind="etf",
+        data_api=False,
+        daily_parquet=True,
+        **kwargs,
+    )
+
+
+def convert_tw_odd_lot_to_npz(**kwargs) -> tuple[Path, np.ndarray]:
+    """Convert Taiwan odd-lot daily parquet top-5 prices into HftBacktest events."""
+    return convert_tw_stock_to_npz(
+        source_kind="odd_lot",
+        data_api=False,
+        daily_parquet=True,
+        **kwargs,
+    )
+
+
+def convert_tw_stock_future_to_npz(**kwargs) -> tuple[Path, np.ndarray]:
+    """Convert Taiwan stock-future daily parquet top-5 depth into HftBacktest events."""
+    return convert_tw_stock_to_npz(
+        source_kind="stock_future",
+        data_api=False,
+        daily_parquet=True,
+        **kwargs,
+    )
 
 
 def main() -> int:
