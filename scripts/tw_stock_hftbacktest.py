@@ -21,6 +21,7 @@ try:
         SELL_EVENT,
         TRADE_EVENT,
         event_kind,
+        output_folder_for_source,
     )
 except ImportError:
     from tw_stock_data_to_npz import (
@@ -32,6 +33,7 @@ except ImportError:
         SELL_EVENT,
         TRADE_EVENT,
         event_kind,
+        output_folder_for_source,
     )
 
 
@@ -62,9 +64,14 @@ def workspace_root(anchor: Path | None = None) -> Path:
     raise FileNotFoundError(f"cannot find workspace root from {start}")
 
 
-def default_data_path(root: Path | None = None, symbol: str = "2330", date: str = "20250909") -> Path:
+def default_data_path(
+    root: Path | None = None,
+    symbol: str = "2330",
+    date: str = "20250909",
+    source_kind: str = "stock",
+) -> Path:
     base = workspace_root() if root is None else root
-    return base / "data" / "tw_stock_events" / f"{symbol}_{date}.npz"
+    return base / "data" / output_folder_for_source(source_kind) / f"{symbol}_{date}.npz"
 
 
 def import_hftbacktest(workspace: Path | None = None):
