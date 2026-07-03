@@ -1,11 +1,11 @@
 [Stock]
-Z:\tick_csv
+'/mnt/z/ticks_parquet_stock_future/{ldate}.parquet'
 
 [Odd Lot]
-Z:\ticks_parquet_odd_lot
+'/mnt/z/ticks_parquet_odd_lot/{ldate}.parquet'
 
 [ETF]
-Z:\ticks_parquet_etf
+'/mnt/z/ticks_parquet_etf/{ldate}.parquet'
 
 [Stock Future]
-Z:\ticks_parquet_stock_future
+'/mnt/z/ticks_parquet_stock_future/{ldate}.parquet'

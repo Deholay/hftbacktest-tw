@@ -1,2 +1,0 @@
-﻿pair_name,spot_symbol,future_symbol,rows,filled_pairs,second_leg_failures,flatten_count,realized_pnl,final_quantity,final_direction,spot_tick_size,future_tick_size,first_leg,step_ns,second_leg_delay_ns,spot_order_latency_ns,future_order_latency_ns
-1301_CFFG6,1301,CFFG6,0,0,0,0,0.0,0.0,HOLD,0.05,0.05,future,1000000000,0,0,0

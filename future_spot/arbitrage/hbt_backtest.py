@@ -71,6 +71,9 @@ class HbtLegFill:
     exec_qty: float
     local_timestamp: int | None
     exch_timestamp: int | None
+    order_req_local_ts: int | None = None
+    order_exch_ts: int | None = None
+    order_resp_local_ts: int | None = None
 
 
 class HbtPairBacktester:
@@ -84,6 +87,7 @@ class HbtPairBacktester:
         self.order_id = 1_000_000
         self.rows: list[dict[str, Any]] = []
         self.market_rows: list[dict[str, Any]] = []
+        self.latency_rows: list[dict[str, Any]] = []
         self.resolved_tick_sizes: dict[str, float] = {}
 
     def run(self) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -181,7 +185,27 @@ class HbtPairBacktester:
         signal_timestamp = int(hbt.current_timestamp)
         first_leg = self.config.first_leg
         second_leg = "stock" if first_leg == "future" else "future"
+        self._record_latency_row(
+            hbt,
+            step,
+            signal,
+            "SIGNAL",
+            "signal_market",
+            signal_market,
+            signal_pricing,
+            local_ts=signal_timestamp,
+        )
         first_fill = self._submit_leg(hbt, signal, first_leg, signal_market, is_second_leg=False)
+        self._record_latency_row(
+            hbt,
+            step,
+            signal,
+            "FIRST_ORDER_RESPONSE",
+            "first_order_entry",
+            signal_market,
+            signal_pricing,
+            fill=first_fill,
+        )
         if not first_fill.filled:
             self._append_execution_row(
                 hbt,
@@ -216,8 +240,27 @@ class HbtPairBacktester:
 
         decision_market = self._current_market(hbt) or signal_market
         decision_pricing = self.pricer.price(decision_market)
+        self._record_latency_row(
+            hbt,
+            step,
+            signal,
+            "POST_FIRST_MARKET",
+            "post_first_market",
+            decision_market,
+            decision_pricing,
+        )
         if self.config.second_leg_profit_check and not self._second_leg_profit_ok(signal, decision_market):
             flatten_fill = self._flatten_first_leg(hbt, signal, first_leg, decision_market)
+            self._record_latency_row(
+                hbt,
+                step,
+                signal,
+                "FLATTEN_FIRST_ORDER",
+                "flatten_first_order",
+                decision_market,
+                decision_pricing,
+                fill=flatten_fill,
+            )
             realized = self._first_leg_flatten_pnl(signal, first_fill, flatten_fill)
             self._append_execution_row(
                 hbt,
@@ -235,8 +278,28 @@ class HbtPairBacktester:
             return
 
         second_fill = self._submit_leg(hbt, signal, second_leg, decision_market, is_second_leg=True)
+        self._record_latency_row(
+            hbt,
+            step,
+            signal,
+            "SECOND_ORDER_RESPONSE",
+            "second_order_entry",
+            decision_market,
+            decision_pricing,
+            fill=second_fill,
+        )
         if not second_fill.filled:
             flatten_fill = self._flatten_first_leg(hbt, signal, first_leg, decision_market)
+            self._record_latency_row(
+                hbt,
+                step,
+                signal,
+                "FLATTEN_FIRST_ORDER",
+                "flatten_first_order",
+                decision_market,
+                decision_pricing,
+                fill=flatten_fill,
+            )
             realized = self._first_leg_flatten_pnl(signal, first_fill, flatten_fill)
             self._append_execution_row(
                 hbt,
@@ -313,6 +376,7 @@ class HbtPairBacktester:
         else:
             raise RuntimeError(f"unsupported side: {side}")
         response = hbt.wait_order_response(asset_no, order_id, self.config.response_timeout_ns)
+        req_ts, order_exch_ts, resp_ts = hbt_order_latency(hbt, asset_no)
         order = get_order(hbt, asset_no, order_id)
         filled = order is not None and float(order.exec_qty) > 0
         status = None if order is None else int(order.status)
@@ -330,6 +394,9 @@ class HbtPairBacktester:
             exec_qty=0.0 if order is None else float(order.exec_qty),
             local_timestamp=None if order is None else int(order.local_timestamp),
             exch_timestamp=None if order is None else int(order.exch_timestamp),
+            order_req_local_ts=req_ts,
+            order_exch_ts=order_exch_ts,
+            order_resp_local_ts=resp_ts,
         )
         if not filled and order_is_active(order, self.hbtpkg):
             hbt.cancel(asset_no, order_id, False)
@@ -511,6 +578,65 @@ class HbtPairBacktester:
     def market_frame(self) -> pd.DataFrame:
         return pd.DataFrame(self.market_rows)
 
+    def latency_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(self.latency_rows)
+
+    def _record_latency_row(
+        self,
+        hbt,
+        step: int,
+        signal: Signal,
+        status: str,
+        event_type: str,
+        market: PairMarket,
+        pricing: Any,
+        *,
+        fill: HbtLegFill | None = None,
+        local_ts: int | None = None,
+    ) -> None:
+        spot_feed = hbt_feed_latency(hbt, STOCK_ASSET_NO)
+        future_feed = hbt_feed_latency(hbt, FUTURE_ASSET_NO)
+        order_entry_latency_ns = None
+        order_response_latency_ns = None
+        if fill is not None and fill.order_req_local_ts is not None and fill.order_exch_ts is not None:
+            order_entry_latency_ns = fill.order_exch_ts - fill.order_req_local_ts
+        if fill is not None and fill.order_resp_local_ts is not None and fill.order_exch_ts is not None:
+            order_response_latency_ns = fill.order_resp_local_ts - fill.order_exch_ts
+
+        row = base_row(
+            hbt=hbt,
+            step=step,
+            pair=self.config.pair,
+            signal=signal,
+            status=status,
+            market=market,
+            pricing=pricing,
+            position=self.position,
+            resolved_tick_sizes=self.resolved_tick_sizes,
+            failure_reason=None,
+        )
+        row.update(
+            {
+                "event_type": event_type,
+                "leg": None if fill is None else fill.leg,
+                "side": None if fill is None else fill.side,
+                "order_id": None if fill is None else fill.order_id,
+                "local_ts": latency_event_local_ts(hbt, fill, local_ts),
+                "spot_exch_ts": feed_exch_ts(spot_feed),
+                "spot_feed_local_ts": feed_local_ts(spot_feed),
+                "spot_feed_latency_ns": feed_latency_ns(spot_feed),
+                "future_exch_ts": feed_exch_ts(future_feed),
+                "future_feed_local_ts": feed_local_ts(future_feed),
+                "future_feed_latency_ns": feed_latency_ns(future_feed),
+                "order_req_local_ts": None if fill is None else fill.order_req_local_ts,
+                "order_exch_ts": None if fill is None else fill.order_exch_ts,
+                "order_resp_local_ts": None if fill is None else fill.order_resp_local_ts,
+                "order_entry_latency_ns": order_entry_latency_ns,
+                "order_response_latency_ns": order_response_latency_ns,
+            }
+        )
+        self.latency_rows.append(row)
+
     def _append_execution_row(
         self,
         hbt,
@@ -545,6 +671,16 @@ class HbtPairBacktester:
         row.update(fill_columns("flatten", flatten_fill))
         row["realized_pnl"] = realized_pnl
         self.rows.append(row)
+        self._record_latency_row(
+            hbt,
+            step,
+            signal,
+            status,
+            "completion",
+            market,
+            pricing,
+            local_ts=int(hbt.current_timestamp),
+        )
 
     def _summary_row(self, trades: pd.DataFrame) -> dict[str, Any]:
         if trades.empty:
@@ -736,7 +872,18 @@ def fill_columns(prefix: str, fill: HbtLegFill | None) -> dict[str, Any]:
             f"{prefix}_exec_qty": None,
             f"{prefix}_local_timestamp": None,
             f"{prefix}_exch_timestamp": None,
+            f"{prefix}_order_req_local_ts": None,
+            f"{prefix}_order_exch_ts": None,
+            f"{prefix}_order_resp_local_ts": None,
+            f"{prefix}_order_entry_latency_ns": None,
+            f"{prefix}_order_response_latency_ns": None,
         }
+    order_entry_latency_ns = None
+    order_response_latency_ns = None
+    if fill.order_req_local_ts is not None and fill.order_exch_ts is not None:
+        order_entry_latency_ns = fill.order_exch_ts - fill.order_req_local_ts
+    if fill.order_resp_local_ts is not None and fill.order_exch_ts is not None:
+        order_response_latency_ns = fill.order_resp_local_ts - fill.order_exch_ts
     return {
         f"{prefix}_leg": fill.leg,
         f"{prefix}_side": fill.side,
@@ -750,6 +897,11 @@ def fill_columns(prefix: str, fill: HbtLegFill | None) -> dict[str, Any]:
         f"{prefix}_exec_qty": fill.exec_qty,
         f"{prefix}_local_timestamp": fill.local_timestamp,
         f"{prefix}_exch_timestamp": fill.exch_timestamp,
+        f"{prefix}_order_req_local_ts": fill.order_req_local_ts,
+        f"{prefix}_order_exch_ts": fill.order_exch_ts,
+        f"{prefix}_order_resp_local_ts": fill.order_resp_local_ts,
+        f"{prefix}_order_entry_latency_ns": order_entry_latency_ns,
+        f"{prefix}_order_response_latency_ns": order_response_latency_ns,
     }
 
 
@@ -794,3 +946,39 @@ def base_row(
         "position_direction": position.direction.value,
         **resolved_tick_sizes,
     }
+
+
+def hbt_feed_latency(hbt: Any, asset_no: int) -> tuple[int, int] | None:
+    latency = hbt.feed_latency(asset_no)
+    if latency is None:
+        return None
+    return int(latency[0]), int(latency[1])
+
+
+def hbt_order_latency(hbt: Any, asset_no: int) -> tuple[int | None, int | None, int | None]:
+    latency = hbt.order_latency(asset_no)
+    if latency is None:
+        return None, None, None
+    return int(latency[0]), int(latency[1]), int(latency[2])
+
+
+def feed_exch_ts(feed_latency: tuple[int, int] | None) -> int | None:
+    return None if feed_latency is None else feed_latency[0]
+
+
+def feed_local_ts(feed_latency: tuple[int, int] | None) -> int | None:
+    return None if feed_latency is None else feed_latency[1]
+
+
+def feed_latency_ns(feed_latency: tuple[int, int] | None) -> int | None:
+    if feed_latency is None:
+        return None
+    return feed_latency[1] - feed_latency[0]
+
+
+def latency_event_local_ts(hbt: Any, fill: HbtLegFill | None, local_ts: int | None) -> int:
+    if local_ts is not None:
+        return int(local_ts)
+    if fill is not None and fill.order_req_local_ts is not None:
+        return int(fill.order_req_local_ts)
+    return int(hbt.current_timestamp)

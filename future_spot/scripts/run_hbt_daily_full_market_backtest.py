@@ -40,12 +40,11 @@ from build_arbitrage_config_from_date import (  # noqa: E402
 )
 
 
-DEFAULT_FUTURES_PARQUET_TEMPLATE = r"Z:\ticks_parquet_stock_future\{ldate}.parquet"
-DEFAULT_TWSE_DAYTRADE_TEMPLATE = r"Z:\TWSE\每日個股狀況\{date_nodash}.csv"
-DEFAULT_TPEX_DAYTRADE_TEMPLATE = r"Z:\TPEX\每日個股狀況\{date_nodash}.csv"
-DEFAULT_TWSE_DAILY_TEMPLATE = r"Z:\TWSE\每日個股行情\{ldate_nodash}.ftr"
-DEFAULT_TPEX_DAILY_TEMPLATE = r"Z:\TPEX\每日個股行情\{ldate_nodash}.ftr"
-
+DEFAULT_FUTURES_PARQUET_TEMPLATE = '/mnt/z/ticks_parquet_stock_future/{ldate}.parquet'
+DEFAULT_TWSE_DAYTRADE_TEMPLATE = '/mnt/z/TWSE/每日個股狀況/{date_nodash}.csv'
+DEFAULT_TPEX_DAYTRADE_TEMPLATE = '/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv'
+DEFAULT_TWSE_DAILY_TEMPLATE = '/mnt/z/TWSE/每日個股行情/{ldate_nodash}.ftr'
+DEFAULT_TPEX_DAILY_TEMPLATE = '/mnt/z/TPEX/每日個股行情/{ldate_nodash}.ftr'
 
 @dataclass(frozen=True)
 class DailyPairRecord:
@@ -153,10 +152,11 @@ def main() -> int:
     settings = hbt_settings_frame(args, records, event_paths)
     write_csv(settings, args.output_dir / "hbt_settings.csv")
 
-    pair_results, summary, trades, market, run_errors = run_backtests(args, records, event_paths)
+    pair_results, summary, trades, market, latency, run_errors = run_backtests(args, records, event_paths)
     write_csv(summary, args.output_dir / "summary_all_daily_pairs.csv")
     write_csv(trades, args.output_dir / "trades_all_daily_pairs.csv")
     write_csv(market, args.output_dir / "market_all_daily_pairs.csv")
+    write_csv(latency, args.output_dir / "latency_all_daily_pairs.csv")
     write_csv(run_errors, args.output_dir / "run_errors.csv")
 
     entry_exit_by_pair, entry_exit_all, entry_exit_index = build_entry_exit_outputs(pair_results, records)
@@ -496,11 +496,12 @@ def run_backtests(
     args: argparse.Namespace,
     records: list[DailyPairRecord],
     event_paths: dict[str, dict[str, Path]],
-) -> tuple[dict[str, dict[str, pd.DataFrame]], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict[str, dict[str, pd.DataFrame]], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     results: dict[str, dict[str, pd.DataFrame]] = {}
     summary_frames = []
     trade_frames = []
     market_frames = []
+    latency_frames = []
     error_rows = []
     for record in records:
         paths = event_paths.get(record.run_key)
@@ -512,15 +513,19 @@ def run_backtests(
             backtester = HbtPairBacktester(config)
             trades, summary = backtester.run()
             market = backtester.market_frame()
+            latency = backtester.latency_frame()
             trades = add_run_columns(add_execution_latency_columns(with_time_columns(trades)), record)
             market = add_run_columns(attach_entry_signals(with_time_columns(market), config.pair), record)
+            latency = add_run_columns(with_time_columns(latency, "local_ts"), record)
             summary = add_run_columns(summary, record)
-            results[record.run_key] = {"trades": trades, "summary": summary, "market": market}
+            results[record.run_key] = {"trades": trades, "summary": summary, "market": market, "latency": latency}
             summary_frames.append(summary)
             if not trades.empty:
                 trade_frames.append(trades)
             if not market.empty:
                 market_frames.append(market)
+            if not latency.empty:
+                latency_frames.append(latency)
         except Exception as exc:
             error_rows.append(run_error_row(record, repr(exc)))
             if not args.continue_on_error:
@@ -530,6 +535,7 @@ def run_backtests(
         concat_frames(summary_frames),
         concat_frames(trade_frames),
         concat_frames(market_frames),
+        concat_frames(latency_frames),
         pd.DataFrame(error_rows),
     )
 
