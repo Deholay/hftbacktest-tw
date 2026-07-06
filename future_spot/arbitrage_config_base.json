@@ -1,0 +1,97 @@
+{
+  "mode": "LIVE",
+  "allow_live_order": false,
+  "poll_interval_sec": 0.0,
+  "max_total_pairs": 4,
+  "max_total_spot_notional": 1000000,
+  "log_threshold_only": true,
+  "log_order_only": false,
+  "front_month_only": true,
+  "sync_system_time_on_start": true,
+  "fubon": {
+    "stock": {
+      "personal_id": "",
+      "password": "",
+      "cert_path": "",
+      "cert_pass": ""
+    },
+    "futures": {
+      "personal_id": "",
+      "password": "",
+      "cert_path": "",
+      "cert_pass": ""
+    }
+  },
+  "historical": {
+    "replay_interval_sec": 0.0,
+    "stock": {
+      "path": "Z:\\數據平台\\ticker_store\\daily_parquet\\twstock_{date_nodash}.parquet",
+      "timestamp_col": "exchtime",
+      "symbol_col": "symbol",
+      "bid_col": "bid_price1",
+      "ask_col": "ask_price1",
+      "bid_size_col": "bid_volume1",
+      "ask_size_col": "ask_volume1",
+      "last_col": "last_price",
+      "status_col": "status",
+      "filter_trial_status": false,
+      "default_size": 1
+    },
+    "futures": {
+      "path": "Z:\\ticks_parquet_stock_future\\{date_dash}.parquet",
+      "timestamp_col": "exchtime",
+      "symbol_col": "symbol",
+      "bid_col": "bid_price1",
+      "ask_col": "ask_price1",
+      "bid_size_col": "bid_volume1",
+      "ask_size_col": "ask_volume1",
+      "last_col": "last_price",
+      "status_col": "status",
+      "filter_trial_status": true,
+      "session_start_time": "09:00:00",
+      "session_end_time": "13:25:00",
+      "default_size": 1
+    }
+  },
+  "pair_defaults": {
+    "spot_shares_per_pair": 1,
+    "future_shares_per_pair": 1,
+    "spot_order_qty": 2000,
+    "future_order_qty": 1,
+    "future_pnl_multiplier": 2000,
+    "entry_threshold_pct": 0.013,
+    "exit_threshold_pct": 0.004,
+    "exit_tick_multiple": 2,
+    "exit_tick_rule": "lte",
+    "min_exit_realized_pnl": 0,
+    "min_effective_tick_multiple": 2,
+    "min_entry_interval_sec": 0,
+    "stop_loss_pct": -0.2,
+    "stock_commission_rate": 0.001425,
+    "stock_commission_discount": 0.28,
+    "stock_transaction_tax_rate": 0.003,
+    "max_pairs": 10,
+    "allow_short_spot": false,
+    "first_leg_time_in_force": "FOK",
+    "second_leg_tick_offset": 2,
+    "initial_position": {
+      "quantity": 0,
+      "direction": "HOLD",
+      "entry_basis_pct": null,
+      "entry_spot_price": null,
+      "entry_future_price": null
+    },
+    "futures_after_hours": false,
+    "stock_min_bid_size": 2,
+    "stock_min_ask_size": 2,
+    "future_min_bid_size": 1,
+    "future_min_ask_size": 1,
+    "second_leg_time_in_force": "FOK",
+    "second_leg_failure_action": "flatten_first_leg",
+    "flatten_first_leg_tick_offset": 2,
+    "flatten_first_leg_time_in_force": "IOC",
+    "cooldown_after_second_leg_failure_sec": 30,
+    "fok_order_timeout_sec": 3,
+    "min_second_leg_adjusted_basis_pct": 0.005
+  }
+}

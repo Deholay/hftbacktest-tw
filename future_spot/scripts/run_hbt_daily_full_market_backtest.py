@@ -41,6 +41,7 @@ from build_arbitrage_config_from_date import (  # noqa: E402
 
 
 DEFAULT_FUTURES_PARQUET_TEMPLATE = '/mnt/z/ticks_parquet_stock_future/{ldate}.parquet'
+DEFAULT_SPOT_INPUT_CSV_TEMPLATE = '/mnt/z/FubunData/tick_csv/twstock_{date_nodash}.csv'
 DEFAULT_TWSE_DAYTRADE_TEMPLATE = '/mnt/z/TWSE/每日個股狀況/{date_nodash}.csv'
 DEFAULT_TPEX_DAYTRADE_TEMPLATE = '/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv'
 DEFAULT_TWSE_DAILY_TEMPLATE = '/mnt/z/TWSE/每日個股行情/{ldate_nodash}.ftr'
@@ -70,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default="2026-05-21", help="First trade date, YYYY-MM-DD.")
     parser.add_argument("--end-date", default="2026-05-26", help="Last trade date, YYYY-MM-DD.")
-    parser.add_argument("--base-config", type=Path, default=Path("arbitrage_config_20260702.json"))
+    parser.add_argument("--base-config", type=Path, default=Path("arbitrage_config_base.json"))
     parser.add_argument("--calendar", type=Path, default=Path("Calendar.csv"))
     parser.add_argument("--stockinfo", type=Path, default=Path("stockinfo.csv"))
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -97,9 +98,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-event-data", action="store_true")
     parser.add_argument("--conversion-qa-sample-rows", type=int, default=1000)
     parser.add_argument(
+        "--spot-input-csv-template",
+        default=DEFAULT_SPOT_INPUT_CSV_TEMPLATE,
+        help=(
+            "Spot tick CSV path template for event conversion. Supports "
+            "{date}, {date_dash}, and {date_nodash}. Default avoids DataAPI."
+        ),
+    )
+    parser.add_argument(
         "--data-platform-base",
         default=r"\\DC_TW\taiwan_stock\數據平台",
-        help="Base directory for stock top-5 data platform conversion.",
+        help="Legacy DataAPI base directory. Only used when --spot-input-csv-template is empty.",
     )
     parser.add_argument(
         "--event-futures-parquet-dir",
@@ -118,6 +127,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--max-trades-per-pair", type=int, default=None)
     parser.add_argument("--record-market-every-steps", type=int, default=1, help="Use 0 to disable market rows.")
+    parser.add_argument("--rebuild-hbt-results", action="store_true", help="Rerun HBT even when result CSVs already exist.")
     parser.add_argument("--queue-model", default="risk_adverse")
     parser.add_argument("--entry-threshold-pct", type=float, default=None)
     parser.add_argument("--exit-threshold-pct", type=float, default=None)
@@ -152,7 +162,7 @@ def main() -> int:
     settings = hbt_settings_frame(args, records, event_paths)
     write_csv(settings, args.output_dir / "hbt_settings.csv")
 
-    pair_results, summary, trades, market, latency, run_errors = run_backtests(args, records, event_paths)
+    pair_results, summary, trades, market, latency, run_errors = run_or_load_backtests(args, records, event_paths)
     write_csv(summary, args.output_dir / "summary_all_daily_pairs.csv")
     write_csv(trades, args.output_dir / "trades_all_daily_pairs.csv")
     write_csv(market, args.output_dir / "market_all_daily_pairs.csv")
@@ -395,6 +405,7 @@ def ensure_spot_events(args: argparse.Namespace, symbol: str, trade_date: str) -
     if args.no_convert_missing_event_data and not args.rebuild_event_data:
         return EventDataResult(None, "missing", f"missing spot npz: {output}")
     try:
+        input_csv = spot_input_csv_path(args, trade_date)
         path, _ = convert_tw_stock_to_npz(
             symbol=symbol,
             start_date=trade_date,
@@ -403,7 +414,8 @@ def ensure_spot_events(args: argparse.Namespace, symbol: str, trade_date: str) -
             end_time=args.session_end,
             output=output,
             workspace_root=WORKSPACE_ROOT,
-            data_api=True,
+            input_csv=input_csv,
+            data_api=input_csv is None,
             daily_parquet=False,
             data_platform_base=args.data_platform_base,
             levels=5,
@@ -412,6 +424,22 @@ def ensure_spot_events(args: argparse.Namespace, symbol: str, trade_date: str) -
         return EventDataResult(path, "generated")
     except Exception as exc:
         return EventDataResult(None, "error", repr(exc))
+
+
+def spot_input_csv_path(args: argparse.Namespace, trade_date: str) -> Path | None:
+    template = getattr(args, "spot_input_csv_template", DEFAULT_SPOT_INPUT_CSV_TEMPLATE)
+    if template is None or str(template).strip() == "":
+        return None
+    date_dash = normalize_date(trade_date)
+    date_nodash = date_dash.replace("-", "")
+    path = Path(
+        str(template).format(
+            date=date_dash,
+            date_dash=date_dash,
+            date_nodash=date_nodash,
+        )
+    )
+    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
 
 
 def ensure_future_events(args: argparse.Namespace, symbol: str, trade_date: str) -> EventDataResult:
@@ -538,6 +566,82 @@ def run_backtests(
         concat_frames(latency_frames),
         pd.DataFrame(error_rows),
     )
+
+
+def run_or_load_backtests(
+    args: argparse.Namespace,
+    records: list[DailyPairRecord],
+    event_paths: dict[str, dict[str, Path]],
+) -> tuple[dict[str, dict[str, pd.DataFrame]], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if not getattr(args, "rebuild_hbt_results", False) and hbt_result_csvs_exist(args.output_dir):
+        logging.info("reuse existing HBT result CSVs from %s", args.output_dir)
+        summary, trades, market, latency, run_errors = load_hbt_result_csvs(args.output_dir)
+        pair_results = pair_results_from_frames(trades, summary, market, latency)
+        return pair_results, summary, trades, market, latency, run_errors
+    return run_backtests(args, records, event_paths)
+
+
+def hbt_result_csv_paths(output_dir: Path) -> dict[str, Path]:
+    return {
+        "summary": output_dir / "summary_all_daily_pairs.csv",
+        "trades": output_dir / "trades_all_daily_pairs.csv",
+        "market": output_dir / "market_all_daily_pairs.csv",
+        "latency": output_dir / "latency_all_daily_pairs.csv",
+        "run_errors": output_dir / "run_errors.csv",
+    }
+
+
+def hbt_result_csvs_exist(output_dir: Path) -> bool:
+    paths = hbt_result_csv_paths(output_dir)
+    required = ("summary", "trades", "market", "latency", "run_errors")
+    return all(paths[name].exists() for name in required)
+
+
+def load_hbt_result_csvs(output_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    paths = hbt_result_csv_paths(output_dir)
+    return (
+        read_csv_if_exists(paths["summary"]),
+        read_csv_if_exists(paths["trades"]),
+        read_csv_if_exists(paths["market"]),
+        read_csv_if_exists(paths["latency"]),
+        read_csv_if_exists(paths["run_errors"]),
+    )
+
+
+def read_csv_if_exists(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def pair_results_from_frames(
+    trades: pd.DataFrame,
+    summary: pd.DataFrame,
+    market: pd.DataFrame,
+    latency: pd.DataFrame,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    run_keys: set[str] = set()
+    for frame in (trades, summary, market, latency):
+        if not frame.empty and "run_key" in frame.columns:
+            run_keys.update(frame["run_key"].dropna().astype(str).unique())
+    return {
+        run_key: {
+            "trades": frame_for_run_key(trades, run_key),
+            "summary": frame_for_run_key(summary, run_key),
+            "market": frame_for_run_key(market, run_key),
+            "latency": frame_for_run_key(latency, run_key),
+        }
+        for run_key in sorted(run_keys)
+    }
+
+
+def frame_for_run_key(frame: pd.DataFrame, run_key: str) -> pd.DataFrame:
+    if frame.empty or "run_key" not in frame.columns:
+        return pd.DataFrame()
+    return frame.loc[frame["run_key"].astype(str).eq(run_key)].copy()
 
 
 def build_pair_hbt_config(args: argparse.Namespace, pair: PairConfig, paths: dict[str, Path]) -> HbtPairBacktestConfig:
@@ -759,6 +863,470 @@ def entry_signal_output(market: pd.DataFrame) -> pd.DataFrame:
         "short_spot_long_future_ticks",
     ]
     return market.loc[market["entry_signal_hit"], [col for col in cols if col in market.columns]].reset_index(drop=True)
+
+
+def build_cash_roi_outputs(
+    trades: pd.DataFrame,
+    market: pd.DataFrame,
+    records: list[DailyPairRecord],
+) -> dict[str, pd.DataFrame]:
+    pair_cash_settings = pair_cash_settings_frame(records)
+    filled_trades = filled_trade_frame(trades, pair_cash_settings)
+    stuck_outputs = build_stuck_cash_outputs(filled_trades)
+    roi_outputs = build_locked_roi_outputs(
+        filled_trades,
+        market,
+        stuck_outputs["stuck_cash_by_pair"],
+    )
+    return {
+        "pair_cash_settings": pair_cash_settings,
+        "filled_trades": filled_trades,
+        **stuck_outputs,
+        **roi_outputs,
+    }
+
+
+def pair_cash_settings_frame(records: list[DailyPairRecord]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "run_key": record.run_key,
+                "spot_order_qty": record.pair.spot_order_qty,
+                "future_order_qty": record.pair.future_order_qty,
+                "future_pnl_multiplier": record.pair.future_pnl_multiplier,
+                "stock_commission_rate": record.pair.stock_commission_rate,
+                "stock_commission_discount": record.pair.stock_commission_discount,
+                "stock_transaction_tax_rate": record.pair.stock_transaction_tax_rate,
+            }
+            for record in records
+        ]
+    )
+
+
+def filled_trade_frame(trades: pd.DataFrame, pair_cash_settings: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame()
+    filled = trades.loc[trades["status"].eq("FILLED")].copy()
+    if filled.empty:
+        return pd.DataFrame()
+    for column in ("first_exec_price", "second_exec_price", "realized_pnl"):
+        if column in filled.columns:
+            filled[column] = pd.to_numeric(filled[column], errors="coerce")
+    filled["spot_exec_price"] = filled["second_exec_price"].where(
+        filled["second_leg"].eq("stock"),
+        filled["first_exec_price"],
+    )
+    filled["spot_side"] = filled["second_side"].where(
+        filled["second_leg"].eq("stock"),
+        filled["first_side"],
+    )
+    filled["future_exec_price"] = filled["first_exec_price"].where(
+        filled["first_leg"].eq("future"),
+        filled["second_exec_price"],
+    )
+    return filled.merge(pair_cash_settings, on="run_key", how="left")
+
+
+def build_stuck_cash_outputs(filled_trades: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    if filled_trades.empty:
+        empty_pair = empty_stuck_cash_by_pair()
+        return {
+            "stuck_cash_summary": empty_stuck_cash_summary(),
+            "daily_stuck_cash": empty_daily_stuck_cash(),
+            "stuck_cash_by_pair": empty_pair,
+            "top_stuck_cash_pairs": empty_pair,
+        }
+
+    cash_trades = filled_trades.copy()
+    cash_trades["stock_notional"] = cash_trades["spot_exec_price"] * cash_trades["spot_order_qty"]
+    cash_trades["commission_rate"] = cash_trades["stock_commission_rate"] * cash_trades["stock_commission_discount"]
+    cash_trades["stock_fee"] = cash_trades["stock_notional"] * cash_trades["commission_rate"]
+    cash_trades["stock_tax"] = cash_trades["stock_notional"] * cash_trades["stock_transaction_tax_rate"]
+
+    entry_cash = cash_trades.loc[cash_trades["signal"].eq(Signal.ENTER_LONG_SPOT_SHORT_FUTURE.value)].copy()
+    exit_cash = cash_trades.loc[cash_trades["signal"].eq(Signal.EXIT.value)].copy()
+    if entry_cash.empty:
+        empty_pair = empty_stuck_cash_by_pair()
+        return {
+            "stuck_cash_summary": empty_stuck_cash_summary(),
+            "daily_stuck_cash": empty_daily_stuck_cash(),
+            "stuck_cash_by_pair": empty_pair,
+            "top_stuck_cash_pairs": empty_pair,
+        }
+
+    entry_cash["entry_cash_out"] = entry_cash["stock_notional"] + entry_cash["stock_fee"]
+    if not exit_cash.empty:
+        exit_cash["exit_cash_in"] = exit_cash["stock_notional"] - exit_cash["stock_fee"] - exit_cash["stock_tax"]
+
+    entry_by_pair = entry_cash.groupby(
+        ["trade_date", "run_key", "pair_name", "spot_symbol", "future_symbol"],
+        as_index=False,
+    ).agg(
+        entries=("signal", "size"),
+        entry_cash_out=("entry_cash_out", "sum"),
+        entry_stock_notional=("stock_notional", "sum"),
+        avg_entry_spot=("spot_exec_price", "mean"),
+    )
+    exit_by_pair = (
+        exit_cash.groupby(["trade_date", "run_key", "pair_name"], as_index=False)
+        .agg(
+            exits=("signal", "size"),
+            exit_cash_in=("exit_cash_in", "sum"),
+            exit_stock_notional=("stock_notional", "sum"),
+            avg_exit_spot=("spot_exec_price", "mean"),
+        )
+        if not exit_cash.empty
+        else pd.DataFrame(columns=["trade_date", "run_key", "pair_name", "exits", "exit_cash_in", "exit_stock_notional", "avg_exit_spot"])
+    )
+
+    stuck_cash_by_pair = entry_by_pair.merge(
+        exit_by_pair,
+        on=["trade_date", "run_key", "pair_name"],
+        how="left",
+    ).fillna({"exits": 0, "exit_cash_in": 0.0, "exit_stock_notional": 0.0})
+    stuck_cash_by_pair["open_pairs"] = stuck_cash_by_pair["entries"] - stuck_cash_by_pair["exits"]
+    stuck_cash_by_pair["net_stock_cash_stuck"] = (
+        stuck_cash_by_pair["entry_cash_out"] - stuck_cash_by_pair["exit_cash_in"]
+    )
+
+    daily_stuck_cash = (
+        stuck_cash_by_pair.groupby("trade_date", as_index=False)
+        .agg(
+            entries=("entries", "sum"),
+            exits=("exits", "sum"),
+            open_pairs=("open_pairs", "sum"),
+            entry_cash_out=("entry_cash_out", "sum"),
+            exit_cash_in=("exit_cash_in", "sum"),
+            net_stock_cash_stuck=("net_stock_cash_stuck", "sum"),
+        )
+    )
+    stuck_cash_summary = pd.DataFrame(
+        [
+            {
+                "entry_rows": len(entry_cash),
+                "exit_rows": len(exit_cash),
+                "open_pairs": stuck_cash_by_pair["open_pairs"].sum(),
+                "entry_cash_out": entry_cash["entry_cash_out"].sum(),
+                "exit_cash_in": exit_cash["exit_cash_in"].sum() if "exit_cash_in" in exit_cash else 0.0,
+                "net_stock_cash_stuck": stuck_cash_by_pair["net_stock_cash_stuck"].sum(),
+            }
+        ]
+    )
+    top_stuck_cash_pairs = stuck_cash_by_pair.sort_values("net_stock_cash_stuck", ascending=False)[
+        [
+            "trade_date",
+            "pair_name",
+            "spot_symbol",
+            "future_symbol",
+            "entries",
+            "exits",
+            "open_pairs",
+            "entry_cash_out",
+            "exit_cash_in",
+            "net_stock_cash_stuck",
+            "avg_entry_spot",
+            "avg_exit_spot",
+        ]
+    ]
+    return {
+        "stuck_cash_summary": stuck_cash_summary,
+        "daily_stuck_cash": daily_stuck_cash,
+        "stuck_cash_by_pair": stuck_cash_by_pair,
+        "top_stuck_cash_pairs": top_stuck_cash_pairs,
+    }
+
+
+def build_locked_roi_outputs(
+    filled_trades: pd.DataFrame,
+    market: pd.DataFrame,
+    stuck_cash_by_pair: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    if filled_trades.empty or stuck_cash_by_pair.empty:
+        empty_pair = empty_pair_roi_including_open()
+        return {
+            "roi_summary_including_open": empty_roi_summary(),
+            "daily_roi_including_open": empty_daily_roi(),
+            "roi_by_pair": empty_pair,
+            "pair_roi_including_open": empty_pair,
+            "open_lots": pd.DataFrame(),
+        }
+
+    latest_market = latest_market_frame(market)
+    open_lots = open_entry_lots(filled_trades)
+    open_pnl_by_pair = open_locked_pnl_by_pair(open_lots, latest_market)
+    realized_by_pair = (
+        filled_trades.loc[filled_trades["signal"].eq(Signal.EXIT.value)]
+        .groupby(["trade_date", "run_key", "pair_name"], as_index=False)
+        .agg(realized_pnl=("realized_pnl", "sum"))
+    )
+
+    roi_by_pair = (
+        stuck_cash_by_pair.merge(
+            open_pnl_by_pair,
+            on=["trade_date", "run_key", "pair_name", "spot_symbol", "future_symbol"],
+            how="left",
+        )
+        .merge(realized_by_pair, on=["trade_date", "run_key", "pair_name"], how="left")
+    )
+    for column in ("realized_pnl", "open_pairs", "open_locked_pnl"):
+        roi_by_pair[column] = roi_by_pair[column].fillna(0.0)
+    roi_by_pair["total_pnl_including_open"] = roi_by_pair["realized_pnl"] + roi_by_pair["open_locked_pnl"]
+    roi_by_pair["total_roi_on_entry_cash_pct"] = roi_by_pair["total_pnl_including_open"] / roi_by_pair["entry_cash_out"]
+    roi_by_pair["open_roi_on_stuck_cash_pct"] = roi_by_pair["open_locked_pnl"] / roi_by_pair[
+        "net_stock_cash_stuck"
+    ].where(roi_by_pair["net_stock_cash_stuck"].gt(0) & roi_by_pair["open_pairs"].gt(0))
+
+    daily_roi_including_open = (
+        roi_by_pair.groupby("trade_date", as_index=False)
+        .agg(
+            entry_cash_out=("entry_cash_out", "sum"),
+            net_stock_cash_stuck=("net_stock_cash_stuck", "sum"),
+            realized_pnl=("realized_pnl", "sum"),
+            open_locked_pnl=("open_locked_pnl", "sum"),
+            total_pnl_including_open=("total_pnl_including_open", "sum"),
+            open_pairs=("open_pairs", "sum"),
+        )
+    )
+    daily_roi_including_open["total_roi_on_entry_cash_pct"] = (
+        daily_roi_including_open["total_pnl_including_open"] / daily_roi_including_open["entry_cash_out"]
+    )
+    daily_roi_including_open["open_roi_on_stuck_cash_pct"] = daily_roi_including_open["open_locked_pnl"] / daily_roi_including_open[
+        "net_stock_cash_stuck"
+    ].where(daily_roi_including_open["net_stock_cash_stuck"].gt(0))
+
+    roi_summary_including_open = pd.DataFrame(
+        [
+            {
+                "entry_cash_out": roi_by_pair["entry_cash_out"].sum(),
+                "net_stock_cash_stuck": roi_by_pair["net_stock_cash_stuck"].sum(),
+                "realized_pnl": roi_by_pair["realized_pnl"].sum(),
+                "open_locked_pnl": roi_by_pair["open_locked_pnl"].sum(),
+                "total_pnl_including_open": roi_by_pair["total_pnl_including_open"].sum(),
+                "total_roi_on_entry_cash_pct": safe_divide(
+                    roi_by_pair["total_pnl_including_open"].sum(),
+                    roi_by_pair["entry_cash_out"].sum(),
+                ),
+                "open_roi_on_stuck_cash_pct": safe_divide(
+                    roi_by_pair["open_locked_pnl"].sum(),
+                    roi_by_pair["net_stock_cash_stuck"].sum(),
+                ),
+                "open_pairs": roi_by_pair["open_pairs"].sum(),
+            }
+        ]
+    )
+    pair_roi_including_open = roi_by_pair[
+        [
+            "trade_date",
+            "pair_name",
+            "spot_symbol",
+            "future_symbol",
+            "entries",
+            "exits",
+            "open_pairs",
+            "entry_cash_out",
+            "net_stock_cash_stuck",
+            "realized_pnl",
+            "open_locked_pnl",
+            "total_pnl_including_open",
+            "total_roi_on_entry_cash_pct",
+            "open_roi_on_stuck_cash_pct",
+            "avg_entry_spot",
+            "avg_open_entry_future",
+            "mark_spot_bid",
+            "mark_future_ask",
+        ]
+    ].sort_values("total_pnl_including_open", ascending=False)
+    return {
+        "roi_summary_including_open": roi_summary_including_open,
+        "daily_roi_including_open": daily_roi_including_open,
+        "roi_by_pair": roi_by_pair,
+        "pair_roi_including_open": pair_roi_including_open,
+        "open_lots": open_lots,
+    }
+
+
+def latest_market_frame(market: pd.DataFrame) -> pd.DataFrame:
+    if market.empty:
+        return pd.DataFrame(columns=["run_key", "mark_timestamp", "spot_bid", "spot_ask", "future_bid", "future_ask"])
+    return (
+        market.sort_values(["run_key", "timestamp"])
+        .groupby("run_key", as_index=False)
+        .tail(1)[["run_key", "timestamp", "spot_bid", "spot_ask", "future_bid", "future_ask"]]
+        .rename(columns={"timestamp": "mark_timestamp"})
+    )
+
+
+def open_entry_lots(filled_trades: pd.DataFrame) -> pd.DataFrame:
+    open_lots: list[dict[str, Any]] = []
+    sort_cols = [col for col in ("run_key", "timestamp", "completion_timestamp") if col in filled_trades.columns]
+    sorted_trades = filled_trades.sort_values(sort_cols) if sort_cols else filled_trades
+    for _, run_trades in sorted_trades.groupby("run_key", sort=False):
+        remaining_lots: list[dict[str, Any]] = []
+        for row in run_trades.itertuples(index=False):
+            if row.signal == Signal.ENTER_LONG_SPOT_SHORT_FUTURE.value:
+                remaining_lots.append(
+                    {
+                        "trade_date": row.trade_date,
+                        "run_key": row.run_key,
+                        "pair_name": row.pair_name,
+                        "spot_symbol": row.spot_symbol,
+                        "future_symbol": row.future_symbol,
+                        "entry_spot_price": row.spot_exec_price,
+                        "entry_future_price": row.future_exec_price,
+                        "spot_order_qty": row.spot_order_qty,
+                        "future_order_qty": row.future_order_qty,
+                        "future_pnl_multiplier": row.future_pnl_multiplier,
+                        "stock_commission_rate": row.stock_commission_rate,
+                        "stock_commission_discount": row.stock_commission_discount,
+                        "stock_transaction_tax_rate": row.stock_transaction_tax_rate,
+                    }
+                )
+            elif row.signal == Signal.EXIT.value and remaining_lots:
+                remaining_lots.pop(0)
+        open_lots.extend(remaining_lots)
+    return pd.DataFrame(open_lots)
+
+
+def open_locked_pnl_by_pair(open_lots: pd.DataFrame, latest_market: pd.DataFrame) -> pd.DataFrame:
+    if open_lots.empty:
+        return pd.DataFrame(
+            columns=[
+                "trade_date",
+                "run_key",
+                "pair_name",
+                "spot_symbol",
+                "future_symbol",
+                "open_lot_count",
+                "open_locked_pnl",
+                "avg_open_entry_spot",
+                "avg_open_entry_future",
+                "mark_spot_bid",
+                "mark_future_ask",
+            ]
+        )
+    lots = open_lots.merge(latest_market, on="run_key", how="left")
+    lots["commission_rate"] = lots["stock_commission_rate"] * lots["stock_commission_discount"]
+    lots["future_multiplier"] = lots["future_pnl_multiplier"] * lots["future_order_qty"]
+    lots["convergence_price"] = lots["spot_bid"]
+    lots["gross_locked_pnl"] = (
+        lots["entry_future_price"] * lots["future_multiplier"]
+        - lots["entry_spot_price"] * lots["spot_order_qty"]
+        + lots["convergence_price"] * (lots["spot_order_qty"] - lots["future_multiplier"])
+    )
+    lots["entry_stock_fee"] = lots["entry_spot_price"] * lots["spot_order_qty"] * lots["commission_rate"]
+    lots["estimated_exit_stock_fee"] = lots["convergence_price"] * lots["spot_order_qty"] * lots["commission_rate"]
+    lots["estimated_exit_stock_tax"] = lots["convergence_price"] * lots["spot_order_qty"] * lots["stock_transaction_tax_rate"]
+    lots["open_locked_pnl"] = (
+        lots["gross_locked_pnl"]
+        - lots["entry_stock_fee"]
+        - lots["estimated_exit_stock_fee"]
+        - lots["estimated_exit_stock_tax"]
+    )
+    return lots.groupby(
+        ["trade_date", "run_key", "pair_name", "spot_symbol", "future_symbol"],
+        as_index=False,
+    ).agg(
+        open_lot_count=("open_locked_pnl", "size"),
+        open_locked_pnl=("open_locked_pnl", "sum"),
+        avg_open_entry_spot=("entry_spot_price", "mean"),
+        avg_open_entry_future=("entry_future_price", "mean"),
+        mark_spot_bid=("spot_bid", "last"),
+        mark_future_ask=("future_ask", "last"),
+    )
+
+
+def empty_stuck_cash_summary() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=["entry_rows", "exit_rows", "open_pairs", "entry_cash_out", "exit_cash_in", "net_stock_cash_stuck"]
+    )
+
+
+def empty_daily_stuck_cash() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=["trade_date", "entries", "exits", "open_pairs", "entry_cash_out", "exit_cash_in", "net_stock_cash_stuck"]
+    )
+
+
+def empty_stuck_cash_by_pair() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "trade_date",
+            "run_key",
+            "pair_name",
+            "spot_symbol",
+            "future_symbol",
+            "entries",
+            "entry_cash_out",
+            "entry_stock_notional",
+            "avg_entry_spot",
+            "exits",
+            "exit_cash_in",
+            "exit_stock_notional",
+            "avg_exit_spot",
+            "open_pairs",
+            "net_stock_cash_stuck",
+        ]
+    )
+
+
+def empty_roi_summary() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "entry_cash_out",
+            "net_stock_cash_stuck",
+            "realized_pnl",
+            "open_locked_pnl",
+            "total_pnl_including_open",
+            "total_roi_on_entry_cash_pct",
+            "open_roi_on_stuck_cash_pct",
+            "open_pairs",
+        ]
+    )
+
+
+def empty_daily_roi() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "trade_date",
+            "entry_cash_out",
+            "net_stock_cash_stuck",
+            "realized_pnl",
+            "open_locked_pnl",
+            "total_pnl_including_open",
+            "open_pairs",
+            "total_roi_on_entry_cash_pct",
+            "open_roi_on_stuck_cash_pct",
+        ]
+    )
+
+
+def empty_pair_roi_including_open() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "trade_date",
+            "pair_name",
+            "spot_symbol",
+            "future_symbol",
+            "entries",
+            "exits",
+            "open_pairs",
+            "entry_cash_out",
+            "net_stock_cash_stuck",
+            "realized_pnl",
+            "open_locked_pnl",
+            "total_pnl_including_open",
+            "total_roi_on_entry_cash_pct",
+            "open_roi_on_stuck_cash_pct",
+            "avg_entry_spot",
+            "avg_open_entry_future",
+            "mark_spot_bid",
+            "mark_future_ask",
+        ]
+    )
+
+
+def safe_divide(numerator: float, denominator: float) -> float:
+    return float("nan") if denominator == 0 else numerator / denominator
 
 
 def count_row_type(frame: pd.DataFrame, value: str) -> int:
