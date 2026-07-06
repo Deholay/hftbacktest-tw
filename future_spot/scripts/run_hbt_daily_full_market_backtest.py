@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -123,6 +126,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--response-latency-ms", type=float, default=0.0)
     parser.add_argument("--feed-latency-offset-ms", type=float, default=0.0)
     parser.add_argument("--second-leg-delay-ms", type=float, default=0.0)
+    parser.add_argument("--post-first-feed-wait", choices=("none", "spot", "future", "any", "both"), default="none")
+    parser.add_argument("--post-first-feed-timeout-ms", type=float, default=0.0)
+    parser.add_argument("--post-first-feed-poll-ms", type=float, default=1.0)
     parser.add_argument("--response-timeout-ms", type=float, default=50.0)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--max-trades-per-pair", type=int, default=None)
@@ -212,6 +218,10 @@ def select_trade_dates(calendar_path: Path, start_date: str, end_date: str) -> l
     if not selected:
         raise ValueError(f"No trade dates found between {start} and {end} in {calendar_path}")
     return selected
+
+
+def get_trade_dates(start_date: str, end_date: str, calendar_path: Path) -> list[str]:
+    return select_trade_dates(calendar_path, start_date, end_date)
 
 
 def pair_name_filter(values: list[str]) -> set[str]:
@@ -349,6 +359,7 @@ def build_event_data(
     args: argparse.Namespace,
     records: list[DailyPairRecord],
 ) -> tuple[dict[str, dict[str, Path]], pd.DataFrame]:
+    args.spot_input_csv_by_symbol = prepare_spot_input_csvs(args, records)
     cache: dict[tuple[str, str, str], EventDataResult] = {}
     paths_by_run_key: dict[str, dict[str, Path]] = {}
     rows: list[dict[str, Any]] = []
@@ -406,6 +417,11 @@ def ensure_spot_events(args: argparse.Namespace, symbol: str, trade_date: str) -
         return EventDataResult(None, "missing", f"missing spot npz: {output}")
     try:
         input_csv = spot_input_csv_path(args, trade_date)
+        split_input_csv = getattr(args, "spot_input_csv_by_symbol", {}).get((trade_date, symbol))
+        if split_input_csv is not None:
+            input_csv = split_input_csv
+        if input_csv is not None and not input_csv.exists():
+            return EventDataResult(None, "missing", f"missing spot input csv: {input_csv}")
         path, _ = convert_tw_stock_to_npz(
             symbol=symbol,
             start_date=trade_date,
@@ -424,6 +440,124 @@ def ensure_spot_events(args: argparse.Namespace, symbol: str, trade_date: str) -
         return EventDataResult(path, "generated")
     except Exception as exc:
         return EventDataResult(None, "error", repr(exc))
+
+
+def prepare_spot_input_csvs(args: argparse.Namespace, records: list[DailyPairRecord]) -> dict[tuple[str, str], Path]:
+    if not records:
+        return {}
+    if spot_input_csv_path(args, records[0].trade_date) is None:
+        return {}
+    result: dict[tuple[str, str], Path] = {}
+    symbols_by_date: dict[str, set[str]] = {}
+    for record in records:
+        symbols_by_date.setdefault(record.trade_date, set()).add(str(record.pair.spot_symbol))
+
+    for trade_date, symbols in symbols_by_date.items():
+        date_nodash = trade_date.replace("-", "")
+        split_dir = args.output_dir / "spot_tick_csv_by_symbol" / date_nodash
+        split_dir.mkdir(parents=True, exist_ok=True)
+        expected = {symbol: split_dir / f"{symbol}.csv" for symbol in symbols}
+        existing = {
+            symbol: path
+            for symbol, path in expected.items()
+            if path.exists() and not args.rebuild_event_data
+        }
+        result.update({(trade_date, symbol): path for symbol, path in existing.items()})
+        missing_symbols = sorted(set(expected) - set(existing))
+        if not missing_symbols:
+            continue
+
+        source = spot_input_csv_path(args, trade_date)
+        if source is None or not source.exists():
+            continue
+        split_daily_spot_csv(source, expected, missing_symbols)
+        result.update(
+            {
+                (trade_date, symbol): path
+                for symbol, path in expected.items()
+                if path.exists()
+            }
+        )
+    return result
+
+
+def split_daily_spot_csv(source: Path, outputs: dict[str, Path], symbols: list[str]) -> None:
+    if split_daily_spot_csv_with_rg(source, outputs, symbols):
+        return
+    split_daily_spot_csv_stream(source, outputs, symbols)
+
+
+def split_daily_spot_csv_with_rg(source: Path, outputs: dict[str, Path], symbols: list[str]) -> bool:
+    rg = shutil.which("rg")
+    if rg is None:
+        return False
+    header = first_csv_line(source)
+    if header is None:
+        return False
+    pattern = "^(?:" + "|".join(re.escape(symbol) for symbol in symbols) + "),"
+    process = subprocess.Popen(
+        [rg, "--no-heading", "--no-line-number", pattern, str(source)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    files: dict[str, Any] = {}
+    try:
+        for line in process.stdout:
+            symbol = line.split(",", 1)[0]
+            path = outputs.get(symbol)
+            if path is None:
+                continue
+            file = files.get(symbol)
+            if file is None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                file = path.open("w", newline="", encoding="utf-8-sig")
+                files[symbol] = file
+                file.write(header)
+            file.write(line)
+    finally:
+        for file in files.values():
+            file.close()
+    _, stderr = process.communicate()
+    if process.returncode not in (0, 1):
+        raise RuntimeError(f"rg failed while splitting {source}: {stderr.strip()}")
+    return True
+
+
+def first_csv_line(path: Path) -> str | None:
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        return file.readline() or None
+
+
+def split_daily_spot_csv_stream(source: Path, outputs: dict[str, Path], symbols: list[str]) -> None:
+    symbol_set = set(symbols)
+    writers: dict[str, csv.DictWriter] = {}
+    files: dict[str, Any] = {}
+    try:
+        with source.open("r", newline="", encoding="utf-8-sig") as source_file:
+            reader = csv.DictReader(source_file)
+            if reader.fieldnames is None or "symbol" not in reader.fieldnames:
+                raise ValueError(f"spot input csv missing symbol column: {source}")
+            for row in reader:
+                symbol = str(row.get("symbol", ""))
+                if symbol not in symbol_set:
+                    continue
+                path = outputs.get(symbol)
+                if path is None:
+                    continue
+                writer = writers.get(symbol)
+                if writer is None:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    file = path.open("w", newline="", encoding="utf-8-sig")
+                    files[symbol] = file
+                    writer = csv.DictWriter(file, fieldnames=reader.fieldnames)
+                    writers[symbol] = writer
+                    writer.writeheader()
+                writer.writerow(row)
+    finally:
+        for file in files.values():
+            file.close()
 
 
 def spot_input_csv_path(args: argparse.Namespace, trade_date: str) -> Path | None:
@@ -509,6 +643,12 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
         "tick_size": hbt_config.tick_size,
         "lot_size": hbt_config.lot_size,
         "order_latency_ns": hbt_config.order_latency_ns,
+        "response_latency_ns": ms_to_ns(args.response_latency_ms),
+        "feed_latency_offset_ns": ms_to_ns(args.feed_latency_offset_ms),
+        "second_leg_delay_ns": ms_to_ns(args.second_leg_delay_ms),
+        "post_first_feed_wait": getattr(args, "post_first_feed_wait", "none"),
+        "post_first_feed_timeout_ns": ms_to_ns(getattr(args, "post_first_feed_timeout_ms", 0.0)),
+        "post_first_feed_poll_ns": ms_to_ns(getattr(args, "post_first_feed_poll_ms", 1.0)),
         "queue_model": hbt_config.queue_model,
         "rows": summary["rows"],
         "first_exch_ts": summary["first_exch_ts"],
@@ -672,6 +812,9 @@ def build_pair_hbt_config(args: argparse.Namespace, pair: PairConfig, paths: dic
         step_ns=ms_to_ns(args.step_ms),
         response_timeout_ns=ms_to_ns(args.response_timeout_ms),
         second_leg_delay_ns=ms_to_ns(args.second_leg_delay_ms),
+        post_first_feed_wait=getattr(args, "post_first_feed_wait", "none"),
+        post_first_feed_timeout_ns=ms_to_ns(getattr(args, "post_first_feed_timeout_ms", 0.0)),
+        post_first_feed_poll_ns=ms_to_ns(getattr(args, "post_first_feed_poll_ms", 1.0)),
         max_steps=args.max_steps,
         max_trades=args.max_trades_per_pair,
         flatten_on_second_leg_failure=not args.no_flatten,
@@ -863,6 +1006,338 @@ def entry_signal_output(market: pd.DataFrame) -> pd.DataFrame:
         "short_spot_long_future_ticks",
     ]
     return market.loc[market["entry_signal_hit"], [col for col in cols if col in market.columns]].reset_index(drop=True)
+
+
+SECOND_LEG_FAILURE_STATUSES = frozenset(
+    {
+        "SECOND_LEG_UNFILLED",
+        "SECOND_LEG_PROFIT_CHECK_FAILED",
+        "POST_FIRST_FEED_TIMEOUT",
+    }
+)
+
+
+def build_second_leg_failure_outputs(
+    summary: pd.DataFrame,
+    trades: pd.DataFrame,
+    market: pd.DataFrame,
+    window_rows: int = 10,
+) -> dict[str, pd.DataFrame]:
+    failed_pairs = second_leg_failed_pairs(summary)
+    failed_trades = second_leg_failed_trades(trades)
+    failure_by_date = second_leg_failure_by_date(failed_pairs, failed_trades)
+    failure_by_status = second_leg_failure_by_status(failed_trades)
+    failure_by_pair = second_leg_failure_by_pair(failed_pairs, failed_trades)
+    failure_trade_windows = second_leg_failure_trade_windows(trades, failed_trades, window_rows=window_rows)
+    failure_market_tick_windows = second_leg_failure_market_tick_windows(market, failed_trades, window_rows=window_rows)
+    return {
+        "failure_overview": second_leg_failure_overview(failed_pairs, failed_trades, failure_market_tick_windows),
+        "failed_pairs": failed_pairs,
+        "failed_trades": failed_trades,
+        "failure_by_date": failure_by_date,
+        "failure_by_status": failure_by_status,
+        "failure_by_pair": failure_by_pair,
+        "failure_trade_windows": failure_trade_windows,
+        "failure_market_tick_windows": failure_market_tick_windows,
+    }
+
+
+def second_leg_failed_pairs(summary: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "trade_date",
+        "run_key",
+        "pair_name",
+        "spot_symbol",
+        "future_symbol",
+        "second_leg_failures",
+        "flatten_count",
+        "post_first_feed_wait",
+        "post_first_feed_timeout_ns",
+    ]
+    if summary.empty or "second_leg_failures" not in summary.columns:
+        return pd.DataFrame(columns=cols)
+    failed = summary.loc[pd.to_numeric(summary["second_leg_failures"], errors="coerce").fillna(0).gt(0)]
+    return sort_by_existing(
+        failed[existing_columns(failed, cols)].drop_duplicates(),
+        ["trade_date", "pair_name"],
+    )
+
+
+def second_leg_failed_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty or "status" not in trades.columns:
+        return pd.DataFrame()
+    failed = trades.loc[trades["status"].isin(SECOND_LEG_FAILURE_STATUSES)].copy()
+    if failed.empty:
+        return failed
+    if "timestamp" in failed.columns:
+        failed["failure_time"] = pd.to_datetime(failed["timestamp"], unit="ns", utc=True, errors="coerce").dt.tz_convert("Asia/Taipei")
+    return sort_by_existing(failed, ["trade_date", "pair_name", "timestamp"]).reset_index(drop=True)
+
+
+def second_leg_failure_overview(
+    failed_pairs: pd.DataFrame,
+    failed_trades: pd.DataFrame,
+    failure_market_tick_windows: pd.DataFrame,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "pairs_with_summary_failures": len(failed_pairs),
+                "failure_trade_rows": len(failed_trades),
+                "market_window_rows": len(failure_market_tick_windows),
+                "trade_dates": nunique_if_present(failed_pairs, "trade_date"),
+                "pair_names": nunique_if_present(failed_pairs, "pair_name"),
+                "flatten_count": numeric_sum_if_present(failed_pairs, "flatten_count"),
+            }
+        ]
+    )
+
+
+def second_leg_failure_by_date(failed_pairs: pd.DataFrame, failed_trades: pd.DataFrame) -> pd.DataFrame:
+    cols = ["trade_date", "summary_pairs", "summary_second_leg_failures", "failure_trade_rows", "flatten_count"]
+    if failed_pairs.empty and (failed_trades.empty or "trade_date" not in failed_trades.columns):
+        return pd.DataFrame(columns=cols)
+
+    summary_by_date = (
+        failed_pairs.groupby("trade_date", as_index=False)
+        .agg(
+            summary_pairs=("pair_name", "nunique") if "pair_name" in failed_pairs.columns else ("trade_date", "size"),
+            summary_second_leg_failures=("second_leg_failures", lambda s: pd.to_numeric(s, errors="coerce").fillna(0).sum())
+            if "second_leg_failures" in failed_pairs.columns
+            else ("trade_date", "size"),
+            flatten_count=("flatten_count", lambda s: pd.to_numeric(s, errors="coerce").fillna(0).sum())
+            if "flatten_count" in failed_pairs.columns
+            else ("trade_date", "size"),
+        )
+        if not failed_pairs.empty and "trade_date" in failed_pairs.columns
+        else pd.DataFrame(columns=["trade_date", "summary_pairs", "summary_second_leg_failures", "flatten_count"])
+    )
+    trades_by_date = (
+        failed_trades.groupby("trade_date", as_index=False).agg(failure_trade_rows=("status", "size"))
+        if not failed_trades.empty and "trade_date" in failed_trades.columns
+        else pd.DataFrame(columns=["trade_date", "failure_trade_rows"])
+    )
+    result = summary_by_date.merge(trades_by_date, on="trade_date", how="outer").fillna(
+        {
+            "summary_pairs": 0,
+            "summary_second_leg_failures": 0,
+            "failure_trade_rows": 0,
+            "flatten_count": 0,
+        }
+    )
+    return result.sort_values("trade_date").reset_index(drop=True)
+
+
+def second_leg_failure_by_status(failed_trades: pd.DataFrame) -> pd.DataFrame:
+    cols = ["trade_date", "status", "failure_reason", "rows", "pair_names"]
+    if failed_trades.empty or "status" not in failed_trades.columns:
+        return pd.DataFrame(columns=cols)
+    group_cols = existing_columns(failed_trades, ["trade_date", "status", "failure_reason"])
+    result = (
+        failed_trades.groupby(group_cols, dropna=False)
+        .agg(
+            rows=("status", "size"),
+            pair_names=("pair_name", "nunique") if "pair_name" in failed_trades.columns else ("status", "size"),
+        )
+        .reset_index()
+    )
+    if "trade_date" in result.columns and "rows" in result.columns:
+        return result.sort_values(["trade_date", "rows"], ascending=[True, False]).reset_index(drop=True)
+    return sort_by_existing(result, ["rows"]).reset_index(drop=True)
+
+
+def second_leg_failure_by_pair(failed_pairs: pd.DataFrame, failed_trades: pd.DataFrame) -> pd.DataFrame:
+    if not failed_trades.empty and "pair_name" in failed_trades.columns:
+        group_cols = existing_columns(failed_trades, ["trade_date", "run_key", "pair_name", "spot_symbol", "future_symbol", "status", "failure_reason"])
+        by_pair = (
+            failed_trades.groupby(group_cols, dropna=False)
+            .agg(
+                failure_trade_rows=("status", "size"),
+                first_failure_ts=("timestamp", "min") if "timestamp" in failed_trades.columns else ("status", "size"),
+                last_failure_ts=("timestamp", "max") if "timestamp" in failed_trades.columns else ("status", "size"),
+            )
+            .reset_index()
+        )
+    else:
+        by_pair = pd.DataFrame()
+
+    if by_pair.empty:
+        return failed_pairs.copy()
+
+    if not failed_pairs.empty and "run_key" in failed_pairs.columns:
+        summary_cols = existing_columns(failed_pairs, ["run_key", "second_leg_failures", "flatten_count", "post_first_feed_wait", "post_first_feed_timeout_ns"])
+        by_pair = by_pair.merge(failed_pairs[summary_cols].drop_duplicates("run_key"), on="run_key", how="left")
+    return sort_by_existing(by_pair, ["trade_date", "pair_name", "status"]).reset_index(drop=True)
+
+
+def second_leg_failure_trade_windows(
+    trades: pd.DataFrame,
+    failed_trades: pd.DataFrame,
+    window_rows: int = 10,
+) -> pd.DataFrame:
+    if trades.empty or failed_trades.empty or "run_key" not in trades.columns or "run_key" not in failed_trades.columns:
+        return pd.DataFrame()
+    cols = existing_columns(
+        trades,
+        [
+            "time",
+            "timestamp",
+            "step",
+            "signal",
+            "status",
+            "failure_reason",
+            "spot_bid",
+            "spot_ask",
+            "spot_bid_size",
+            "spot_ask_size",
+            "future_bid",
+            "future_ask",
+            "future_bid_size",
+            "future_ask_size",
+            "long_spot_short_future_pct",
+            "long_spot_short_future_ticks",
+            "first_leg",
+            "first_side",
+            "first_exec_price",
+            "first_exec_qty",
+            "second_leg",
+            "second_side",
+            "second_exec_price",
+            "second_exec_qty",
+            "flatten_leg",
+            "flatten_side",
+            "flatten_exec_price",
+            "flatten_exec_qty",
+            "position_quantity",
+        ],
+    )
+    windows = []
+    for failure_no, (_, failure) in enumerate(failed_trades.iterrows(), start=1):
+        pair_trades = sort_by_existing(
+            trades.loc[trades["run_key"].eq(failure["run_key"])],
+            ["timestamp"],
+        ).reset_index(drop=True)
+        pos = matching_position(pair_trades, failure)
+        if pos is None:
+            continue
+        start = max(0, pos - window_rows)
+        end = min(len(pair_trades), pos + window_rows + 1)
+        window = pair_trades.iloc[start:end][cols].copy()
+        window.insert(0, "failure_no", failure_no)
+        window.insert(1, "failure_label", failure_label(failure_no, failure))
+        window.insert(2, "trade_date", failure.get("trade_date", ""))
+        window.insert(3, "run_key", failure.get("run_key", ""))
+        window.insert(4, "pair_name", failure.get("pair_name", ""))
+        window.insert(5, "relative_row", range(start - pos, end - pos))
+        windows.append(window)
+    return concat_frames(windows)
+
+
+def second_leg_failure_market_tick_windows(
+    market: pd.DataFrame,
+    failed_trades: pd.DataFrame,
+    window_rows: int = 10,
+) -> pd.DataFrame:
+    if market.empty or failed_trades.empty or "run_key" not in market.columns or "run_key" not in failed_trades.columns or "timestamp" not in market.columns:
+        return pd.DataFrame()
+    cols = existing_columns(
+        market,
+        [
+            "time",
+            "timestamp",
+            "step",
+            "signal",
+            "status",
+            "spot_bid",
+            "spot_ask",
+            "spot_bid_size",
+            "spot_ask_size",
+            "future_bid",
+            "future_ask",
+            "future_bid_size",
+            "future_ask_size",
+            "long_spot_short_future_pct",
+            "long_spot_short_future_ticks",
+            "short_spot_long_future_pct",
+            "short_spot_long_future_ticks",
+            "position_quantity",
+        ],
+    )
+    windows = []
+    for failure_no, (_, failure) in enumerate(failed_trades.iterrows(), start=1):
+        failure_ts = numeric_value(failure.get("timestamp"))
+        if pd.isna(failure_ts):
+            continue
+        pair_market = market.loc[market["run_key"].eq(failure["run_key"])].sort_values("timestamp").reset_index(drop=True)
+        if pair_market.empty:
+            continue
+        market_ts = pd.to_numeric(pair_market["timestamp"], errors="coerce")
+        if market_ts.notna().sum() == 0:
+            continue
+        nearest_pos = int((market_ts - int(failure_ts)).abs().idxmin())
+        start = max(0, nearest_pos - window_rows)
+        end = min(len(pair_market), nearest_pos + window_rows + 1)
+        window = pair_market.iloc[start:end][cols].copy()
+        window.insert(0, "failure_no", failure_no)
+        window.insert(1, "failure_label", failure_label(failure_no, failure))
+        window.insert(2, "trade_date", failure.get("trade_date", ""))
+        window.insert(3, "run_key", failure.get("run_key", ""))
+        window.insert(4, "pair_name", failure.get("pair_name", ""))
+        window.insert(5, "relative_tick", range(start - nearest_pos, end - nearest_pos))
+        window.insert(6, "failure_timestamp", int(failure_ts))
+        window.insert(7, "failure_status", failure.get("status", ""))
+        window.insert(8, "failure_reason", failure.get("failure_reason", ""))
+        windows.append(window)
+    return concat_frames(windows)
+
+
+def existing_columns(frame: pd.DataFrame, columns: list[str]) -> list[str]:
+    return [column for column in columns if column in frame.columns]
+
+
+def sort_by_existing(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    by = existing_columns(frame, columns)
+    if not by:
+        return frame
+    return frame.sort_values(by)
+
+
+def numeric_value(value: Any) -> float:
+    return pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+
+
+def numeric_sum_if_present(frame: pd.DataFrame, column: str) -> float:
+    if frame.empty or column not in frame.columns:
+        return 0.0
+    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0).sum())
+
+
+def nunique_if_present(frame: pd.DataFrame, column: str) -> int:
+    if frame.empty or column not in frame.columns:
+        return 0
+    return int(frame[column].nunique(dropna=True))
+
+
+def matching_position(pair_trades: pd.DataFrame, failure: pd.Series) -> int | None:
+    if pair_trades.empty or "timestamp" not in pair_trades.columns:
+        return None
+    matches = pair_trades.index[pair_trades["timestamp"].eq(failure.get("timestamp"))]
+    if len(matches):
+        return int(matches[0])
+    failure_ts = numeric_value(failure.get("timestamp"))
+    if pd.isna(failure_ts):
+        return None
+    trade_ts = pd.to_numeric(pair_trades["timestamp"], errors="coerce")
+    if trade_ts.notna().sum() == 0:
+        return None
+    return int((trade_ts - int(failure_ts)).abs().idxmin())
+
+
+def failure_label(failure_no: int, failure: pd.Series) -> str:
+    return (
+        f"{failure_no}: {failure.get('trade_date', '')} {failure.get('pair_name', '')} "
+        f"{failure.get('status', '')}"
+    ).strip()
 
 
 def build_cash_roi_outputs(

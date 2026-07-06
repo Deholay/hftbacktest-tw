@@ -48,6 +48,9 @@ class HbtPairBacktestConfig:
     step_ns: int = 1_000_000_000
     response_timeout_ns: int = 50_000_000
     second_leg_delay_ns: int = 0
+    post_first_feed_wait: str = "none"
+    post_first_feed_timeout_ns: int = 0
+    post_first_feed_poll_ns: int = 1_000_000
     max_steps: int | None = None
     max_trades: int | None = None
     enforce_risk_limits: bool = True
@@ -238,17 +241,47 @@ class HbtPairBacktester:
             )
             return
 
+        post_first_feed_ok = self._wait_post_first_feed(hbt)
         decision_market = self._current_market(hbt) or signal_market
         decision_pricing = self.pricer.price(decision_market)
         self._record_latency_row(
             hbt,
             step,
             signal,
-            "POST_FIRST_MARKET",
+            "POST_FIRST_MARKET" if post_first_feed_ok else "POST_FIRST_FEED_TIMEOUT",
             "post_first_market",
             decision_market,
             decision_pricing,
         )
+        if not post_first_feed_ok:
+            flatten_fill = self._flatten_first_leg(hbt, signal, first_leg, decision_market)
+            self._record_latency_row(
+                hbt,
+                step,
+                signal,
+                "FLATTEN_FIRST_ORDER",
+                "flatten_first_order",
+                decision_market,
+                decision_pricing,
+                fill=flatten_fill,
+            )
+            realized = self._first_leg_flatten_pnl(signal, first_fill, flatten_fill)
+            self._append_execution_row(
+                hbt,
+                step,
+                signal,
+                "POST_FIRST_FEED_TIMEOUT",
+                decision_market,
+                decision_pricing,
+                first_fill,
+                None,
+                flatten_fill=flatten_fill,
+                realized_pnl=realized,
+                failure_reason="post-first feed refresh timeout",
+                signal_timestamp=signal_timestamp,
+            )
+            return
+
         if self.config.second_leg_profit_check and not self._second_leg_profit_ok(signal, decision_market):
             flatten_fill = self._flatten_first_leg(hbt, signal, first_leg, decision_market)
             self._record_latency_row(
@@ -332,6 +365,44 @@ class HbtPairBacktester:
             failure_reason=None,
             signal_timestamp=signal_timestamp,
         )
+
+    def _wait_post_first_feed(self, hbt) -> bool:
+        mode = self.config.post_first_feed_wait
+        if mode == "none":
+            return True
+        start_spot = hbt_feed_latency(hbt, STOCK_ASSET_NO)
+        start_future = hbt_feed_latency(hbt, FUTURE_ASSET_NO)
+        if self._post_first_feed_ready(mode, start_spot, start_future, hbt):
+            return True
+
+        deadline = int(hbt.current_timestamp) + max(0, self.config.post_first_feed_timeout_ns)
+        poll_ns = max(1, self.config.post_first_feed_poll_ns)
+        while int(hbt.current_timestamp) < deadline:
+            step_ns = min(poll_ns, deadline - int(hbt.current_timestamp))
+            if hbt.elapse(step_ns) != 0:
+                return False
+            if self._post_first_feed_ready(mode, start_spot, start_future, hbt):
+                return True
+        return self._post_first_feed_ready(mode, start_spot, start_future, hbt)
+
+    @staticmethod
+    def _post_first_feed_ready(
+        mode: str,
+        start_spot: tuple[int, int] | None,
+        start_future: tuple[int, int] | None,
+        hbt,
+    ) -> bool:
+        spot_ready = feed_refreshed(start_spot, hbt_feed_latency(hbt, STOCK_ASSET_NO))
+        future_ready = feed_refreshed(start_future, hbt_feed_latency(hbt, FUTURE_ASSET_NO))
+        if mode == "spot":
+            return spot_ready
+        if mode == "future":
+            return future_ready
+        if mode == "any":
+            return spot_ready or future_ready
+        if mode == "both":
+            return spot_ready and future_ready
+        raise ValueError(f"unknown post_first_feed_wait: {mode}")
 
     def _submit_leg(
         self,
@@ -688,7 +759,11 @@ class HbtPairBacktester:
             realized_pnl = 0.0
         else:
             filled = int(trades["status"].eq("FILLED").sum())
-            failed_second = int(trades["status"].isin(["SECOND_LEG_UNFILLED", "SECOND_LEG_PROFIT_CHECK_FAILED"]).sum())
+            failed_second = int(
+                trades["status"]
+                .isin(["SECOND_LEG_UNFILLED", "SECOND_LEG_PROFIT_CHECK_FAILED", "POST_FIRST_FEED_TIMEOUT"])
+                .sum()
+            )
             flatten_count = int(trades["flatten_filled"].fillna(False).sum()) if "flatten_filled" in trades else 0
             realized_pnl = float(trades["realized_pnl"].dropna().sum()) if "realized_pnl" in trades else 0.0
         return {
@@ -706,6 +781,9 @@ class HbtPairBacktester:
             "first_leg": self.config.first_leg,
             "step_ns": self.config.step_ns,
             "second_leg_delay_ns": self.config.second_leg_delay_ns,
+            "post_first_feed_wait": self.config.post_first_feed_wait,
+            "post_first_feed_timeout_ns": self.config.post_first_feed_timeout_ns,
+            "post_first_feed_poll_ns": self.config.post_first_feed_poll_ns,
             "spot_order_latency_ns": self.config.spot.order_entry_latency_ns,
             "future_order_latency_ns": self.config.future.order_entry_latency_ns,
         }
@@ -974,6 +1052,14 @@ def feed_latency_ns(feed_latency: tuple[int, int] | None) -> int | None:
     if feed_latency is None:
         return None
     return feed_latency[1] - feed_latency[0]
+
+
+def feed_refreshed(before: tuple[int, int] | None, after: tuple[int, int] | None) -> bool:
+    if after is None:
+        return False
+    if before is None:
+        return True
+    return after[1] > before[1]
 
 
 def latency_event_local_ts(hbt: Any, fill: HbtLegFill | None, local_ts: int | None) -> int:

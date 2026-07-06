@@ -65,6 +65,19 @@ For latency observation, add non-zero order latency:
   --response-latency-ms 5
 ```
 
+To force the second-leg decision to wait for a fresh post-first-leg feed, add:
+
+```bash
+  --post-first-feed-wait spot \
+  --post-first-feed-timeout-ms 5000 \
+  --rebuild-hbt-results
+```
+
+`spot` means the runner waits until the spot feed timestamp advances after the
+first future order response. If no fresh spot feed arrives before the timeout,
+the runner records `POST_FIRST_FEED_TIMEOUT` and attempts to flatten the first
+leg.
+
 The `/mnt/z/...` paths are needed when running from Linux/WSL. Windows-style
 paths such as `Z:\ticks_parquet_stock_future\...` are treated as literal file
 names by Linux Python and will not open correctly.
@@ -75,7 +88,14 @@ Spot tick conversion currently uses daily CSV files such as:
 /mnt/z/FubunData/tick_csv/twstock_20260521.csv
 ```
 
-This avoids the temporarily unavailable `data_platform_client` DataAPI path. If
+This avoids the temporarily unavailable `data_platform_client` DataAPI path. The
+runner first splits each daily spot CSV into per-symbol files under:
+
+```text
+future_spot/output/.../spot_tick_csv_by_symbol/YYYYMMDD/
+```
+
+Then each per-symbol CSV is converted to HBT `.npz`. If
 `--spot-input-csv-template` is set to an empty string, the runner falls back to
 the legacy DataAPI conversion path.
 
