@@ -1,6 +1,36 @@
 ﻿# TW Stock HftBacktest Notes
 
+[繁體中文](README.zh-TW.md)
+
 This repo contains Taiwan stock L2 / top-5 market-by-price experiments built on `hftbacktest`.
+
+## Project Architecture
+
+- `scripts/` owns reusable project-level interfaces and shared HBT helpers.
+- `scripts/strategy_api.py` is the public strategy integration contract for new
+  strategy families.
+- `future_spot/` is one concrete strategy implementation: Taiwan stock-future /
+  spot arbitrage.
+- Future strategy folders should implement adapters against
+  `scripts.strategy_api` instead of depending on `future_spot`.
+- `future_spot/scripts/` contains thin CLI entrypoints for the `future_spot`
+  strategy only. Reusable code should live in root `scripts/` or in the
+  strategy package that owns the domain behavior.
+
+See `STRATEGY_GUIDANCE.md` and `notebooks/hbt_strategy_interface_example.ipynb`
+for the adapter contract and notebook/CLI usage.
+
+## Setup
+
+Install the shared Python dependencies from the repository root:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+`requirements.txt` installs `hftbacktest` from pip along with the core
+numeric/notebook stack. Optional live-trading dependencies such as `fubon_neo`
+are not pinned because the current retained workflow is offline HBT research.
 
 The current working notebook is `notebooks/hftbacktest_TWStock.ipynb`. The notebook is intentionally thin: data conversion, hftbacktest setup, and strategy logic live in `scripts/` so notebook cells mostly run functions and display DataFrames.
 
@@ -9,6 +39,13 @@ The current working notebook is `notebooks/hftbacktest_TWStock.ipynb`. The noteb
 - `scripts/tw_stock_data_to_npz.py`: converts Taiwan stock top-5 rows into hftbacktest event `.npz` files.
 - `scripts/tw_stock_hftbacktest.py`: shared hftbacktest config, asset setup, BBO/state helpers, and package import isolation.
 - `scripts/tw_stock_strategies.py`: strategy runners and DataFrame summary helpers.
+- `scripts/strategy_api.py`: root strategy context/decision protocols and optional registry.
+- `scripts/hbt_types.py`: HBT asset/fill dataclasses that are not tied to one strategy family.
+- `scripts/hbt_common.py`: generic HBT queue/order/latency/fill helpers.
+- `scripts/io_utils.py`: generic CSV/DataFrame/time conversion helpers.
+- `future_spot/`: futures/spot arbitrage implementation of the root strategy interface.
+- `notebooks/hbt_strategy_interface_example.ipynb`: root-level template for new strategy notebooks.
+- `requirements.txt`: shared Python dependencies for notebooks and retained HBT runners.
 - `notebooks/hftbacktest_TWStock.ipynb`: runnable experiment wrapper.
 - `notebooks/hftbacktest_TWETF.ipynb`: ETF daily parquet runner.
 - `notebooks/hftbacktest_TWOddLot.ipynb`: odd-lot daily parquet runner.

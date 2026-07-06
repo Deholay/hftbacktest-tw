@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 try:
+    from .hbt_common import get_order
     from .tw_stock_data_to_npz import (
         BUY_EVENT,
         DEPTH_EVENT,
@@ -27,6 +28,7 @@ try:
         wait_for_bbo,
     )
 except ImportError:
+    from hbt_common import get_order
     from tw_stock_data_to_npz import (
         BUY_EVENT,
         DEPTH_EVENT,
@@ -125,15 +127,6 @@ def infer_tick_size(event_data: np.ndarray, default: float = 5.0) -> float:
 
 def config_with_queue_model(config: BacktestConfig, queue_model: str) -> BacktestConfig:
     return replace(config, queue_model=queue_model)
-
-
-def get_order(hbt, asset_no: int, order_id: int | None):
-    if order_id is None:
-        return None
-    try:
-        return hbt.orders(asset_no).get(order_id)
-    except Exception:
-        return None
 
 
 def order_is_active(order, hbtpkg) -> bool:

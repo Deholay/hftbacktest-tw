@@ -25,16 +25,22 @@ Notebook report:
 
 ```text
 future_spot/notebooks/hbt_pair_backtest_visualization.ipynb
+../notebooks/hbt_strategy_interface_example.ipynb
 ```
 
-The notebook is intentionally a thin summary report. It reads the generated CSV
-outputs and shows:
+The visualization notebook is intentionally a thin summary report. It reads the
+generated CSV outputs and shows:
 
 - entry / exit rules;
 - estimated profit by symbol and by pair;
 - latency summaries for local / spot exchange / future exchange timelines;
 - daily profit and execution charts;
 - selected pair entry / execution drill-down.
+
+The root strategy interface example notebook demonstrates the
+`scripts.strategy_api` contract plus the futures/spot adapter in
+`arbitrage/strategy_adapter.py`. Keep cross-strategy examples in root
+`notebooks/`; keep futures/spot-specific reports in `future_spot/notebooks/`.
 
 ## Run Command
 
@@ -43,7 +49,7 @@ Run from the Poetry project under `data_platform_client`:
 ```bash
 cd /home/zoufuc/hftbacktest/data_platform_client
 
-poetry run pip install 'numpy>=2.0,<2.3' pandas pyarrow /home/zoufuc/hftbacktest/hftbacktest/py-hftbacktest
+poetry run pip install -r /home/zoufuc/hftbacktest/requirements.txt
 
 poetry run python /home/zoufuc/hftbacktest/future_spot/scripts/run_hbt_daily_full_market_backtest.py \
   --start-date 2026-05-21 \
@@ -105,7 +111,7 @@ If a local `(venv)` raises this error:
 Numba needs NumPy 2.4 or less. Got NumPy 2.5.
 ```
 
-pin NumPy below the local `hftbacktest` package limit:
+pin NumPy below the `hftbacktest` package limit:
 
 ```bash
 python -m pip install --upgrade 'numpy>=2.0,<2.3'
@@ -141,21 +147,48 @@ Exit:
 
 Current HBT full-market path:
 
-- `scripts/run_hbt_daily_full_market_backtest.py`: daily full-market HBT runner,
-  CSV output writer, cached result loader, latency output, and cash / ROI helper
-  functions used by the notebook.
+- `scripts/run_hbt_daily_full_market_backtest.py`: thin CLI/backward-compatible
+  facade for the daily full-market HBT workflow.
 - `scripts/build_arbitrage_config_from_date.py`: builds one arbitrage config per
   trade date. The full-market runner calls this before converting/running pairs.
 - `arbitrage_config_base.json`: non-secret template config used by the daily
   config builder. Generated daily configs are written under the output
   directory.
 - `arbitrage/hbt_backtest.py`: pair-level HBT strategy simulation and latency
-  event capture.
+  event capture. It accepts a root-interface-compatible strategy object.
+- `arbitrage/strategy_adapter.py`: futures/spot implementation of
+  `scripts.strategy_api`.
+- `arbitrage/daily_pipeline.py`: date selection, path resolution, daily pair
+  records, and pair-universe frames.
+- `arbitrage/event_data.py`: spot/future event path resolution, CSV splitting,
+  event conversion, and reuse status.
+- `arbitrage/hbt_pipeline.py`: HBT settings audit, pair config construction,
+  pair backtest execution, and cached CSV loading.
+- `arbitrage/reporting.py`: entry/exit outputs, second-leg failure reports,
+  cash/ROI outputs, and CSV helpers.
+- `arbitrage/hbt_types.py`, `arbitrage/hbt_helpers.py`, `arbitrage/hbt_rows.py`:
+  futures/spot pair backtest config, domain-specific HBT helpers, and pair
+  output row builders.
 - `arbitrage/config.py`, `arbitrage/models.py`, `arbitrage/strategy.py`,
   `arbitrage/ticks.py`, `arbitrage/utils.py`: shared config parsing, data
   models, strategy calculations, tick handling, and utility helpers.
-- `arbitrage/providers.py`: provider adapters used by config construction and
-  the older replay/live stack.
+- `arbitrage/full_market_runner.py`: compatibility implementation behind the
+  split pipeline facades.
+
+`future_spot/scripts/` is for futures/spot command-line entrypoints only. If a
+module is expected to be reused by another strategy family, put it in root
+`scripts/` instead of this folder.
+
+Root shared modules currently used by `future_spot`:
+
+- `scripts/strategy_api.py`: strategy context/decision protocol.
+- `scripts/hbt_types.py`: generic HBT asset/fill dataclasses.
+- `scripts/hbt_common.py`: generic queue model, order, latency, and fill helpers.
+- `scripts/io_utils.py`: generic CSV/DataFrame/time conversion helpers.
+
+`Calendar.csv` and `stockinfo.csv` are source inputs for the retained config
+builder. `Calendar.csv` maps trade dates to `LDate`; `stockinfo.csv` maps
+futures targets to spot metadata and unit constraints.
 
 Generated files that are safe to remove:
 
@@ -166,42 +199,27 @@ Generated outputs are under `future_spot/output/`. Keep or remove them based on
 whether the corresponding CSV reports are still needed; they are not source
 code.
 
-## Cleanup Candidates
+## Strategy Interface
 
-These files are not part of the current notebook / full-market HBT path. Do not
-delete them blindly if older replay, live monitoring, or manual debug workflows
-are still in use.
+The project-level contract is `scripts/strategy_api.py`. `future_spot` implements
+that contract with `FutureSpotPairStrategy`.
 
-Likely legacy config flow:
+Default behavior is unchanged: if no custom strategy is supplied,
+`HbtPairBacktester` uses the futures/spot adapter, which evaluates the current
+stop-loss-aware signal engine and risk manager.
 
-- `scripts/build_targets_and_config.py`
-- `scripts/generate_arbitrage_config.py`
+For a custom futures/spot strategy:
 
-The current daily flow builds configs through
-`scripts/build_arbitrage_config_from_date.py`, one file per trade date.
+```python
+from future_spot.arbitrage.hbt_backtest import HbtPairBacktester
+from future_spot.arbitrage.strategy_adapter import FutureSpotPairStrategy
 
-Standalone utilities:
+backtester = HbtPairBacktester(run_config, strategy=FutureSpotPairStrategy())
+trades, summary = backtester.run()
+```
 
-- `scripts/run_hbt_pair_backtest.py`: single-pair HBT debug runner.
-- `scripts/build_futures_daily_ohlcv.py`: futures OHLCV utility.
-- `scripts/monitor_exit_future_ask.py`: live/manual exit monitor.
-- `scripts/monitor_margin_equity.py`: margin/equity monitor.
-
-Older replay/live stack:
-
-- `arbitrage/app.py`
-- `scripts/run_multi_day_backtest.py`
-- `scripts/run_multi_config_backtest.py`
-
-Potential dead helpers found by static scan:
-
-- `arbitrage/utils.py`: `parse_stock_quote`, `parse_future_quote`,
-  `tw_price_tick_size`.
-- `arbitrage/config.py`: `parse_non_negative_int`.
-
-Static scan can produce false positives for CLI entry points and manual tools,
-so cleanup should start with generated files, then legacy config scripts, and
-only then the older replay/live stack after confirming it is no longer used.
+For non-futures/spot strategy families, create a separate implementation folder
+and adapt to `scripts.strategy_api` instead of importing `future_spot`.
 
 ## Latest Run Snapshot
 

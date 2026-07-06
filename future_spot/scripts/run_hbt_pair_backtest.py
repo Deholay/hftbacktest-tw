@@ -13,10 +13,11 @@ for path in (PROJECT_ROOT, WORKSPACE_ROOT):
 
 from arbitrage.config import load_config  # noqa: E402
 from arbitrage.hbt_backtest import (  # noqa: E402
-    HbtAssetConfig,
     HbtPairBacktestConfig,
     HbtPairBacktester,
 )
+from scripts.hbt_types import HbtAssetConfig  # noqa: E402
+from scripts.io_utils import ms_to_ns  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,11 +152,5 @@ def resolve_path(path: str | Path, base: Path) -> Path:
     if value.parts and value.parts[0] == PROJECT_ROOT.name:
         return (PROJECT_ROOT.parent / value).resolve()
     return (base / value).resolve()
-
-
-def ms_to_ns(value: float) -> int:
-    return int(round(value * 1_000_000))
-
-
 if __name__ == "__main__":
     main()

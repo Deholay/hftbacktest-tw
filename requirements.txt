@@ -1,0 +1,17 @@
+# Core numeric/data stack.
+numpy>=2.0,<2.3
+pandas>=2.2
+pyarrow>=15
+polars>=1.0
+
+# Notebook/reporting support.
+matplotlib>=3.8
+ipykernel>=6.29
+notebook>=7.0
+
+# HftBacktest package used by the notebooks and runners.
+hftbacktest>=2.4.4,<2.5
+
+# Optional/live dependencies are intentionally not pinned here.
+# - fubon_neo is only needed for live/manual provider flows.
+# - data_platform_client is kept in this repository and imported by path where needed.

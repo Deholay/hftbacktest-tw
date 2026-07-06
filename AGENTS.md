@@ -7,6 +7,10 @@ Taiwan stock top-5 L2 / market-by-price experiments using `hftbacktest`.
 The main notebook is `notebooks/hftbacktest_TWStock.ipynb`. Keep it as a thin
 runner: reusable logic belongs in `scripts/`.
 
+Root `scripts/` is the cross-strategy library layer. Strategy folders such as
+`future_spot/` should implement adapters and domain behavior on top of root
+interfaces/helpers, not redefine project-wide contracts.
+
 ## Key Files
 
 - `notebooks/hftbacktest_TWStock.ipynb`
@@ -25,6 +29,27 @@ runner: reusable logic belongs in `scripts/`.
 - `scripts/tw_stock_strategies.py`
   Strategy runners and DataFrame summary helpers.
 
+- `scripts/strategy_api.py`
+  Project-wide strategy interface: `StrategyContext`, `StrategyDecision`,
+  `Strategy`, `StrategyRunner`, and lightweight registry helpers.
+
+- `scripts/hbt_types.py`, `scripts/hbt_common.py`, `scripts/io_utils.py`
+  Cross-strategy HBT dataclasses, queue/order/latency/fill helpers, and small
+  CSV/DataFrame/time helpers.
+
+- `requirements.txt`
+  Shared Python dependencies for notebooks and retained HBT runners. Optional
+  live/provider SDKs are not pinned here.
+
+- `notebooks/hbt_strategy_interface_example.ipynb`
+  Root-level template showing how future strategy notebooks should import the
+  root strategy interface plus a concrete strategy adapter.
+
+- `future_spot/`
+  Taiwan stock-future / spot arbitrage strategy implementation. Treat
+  `future_spot/arbitrage/` as domain implementation and `future_spot/scripts/`
+  as thin CLI entrypoints for that strategy only.
+
 - `README.md`
   Human-facing summary of current strategy work, event conversion caveats, and
   validation commands.
@@ -38,6 +63,18 @@ runner: reusable logic belongs in `scripts/`.
 
 Strategy output should be DataFrames. Prefer compact summary DataFrames in the
 notebook and keep detailed raw output available as separate variables.
+
+## Strategy Interface Rules
+
+- Put cross-strategy contracts and reusable HBT utilities in root `scripts/`.
+- Put strategy-specific models, pricing, risk, config parsing, output schemas,
+  and adapters inside the strategy folder.
+- `future_spot` implements `scripts.strategy_api` through
+  `future_spot/arbitrage/strategy_adapter.py`.
+- Do not make future strategies import `future_spot` for reusable behavior.
+  Promote clean, strategy-neutral helpers to root `scripts/` first.
+- Cross-strategy example notebooks belong in root `notebooks/`; strategy-specific
+  reports can live under the strategy folder.
 
 ## Data Platform Dependency
 
@@ -116,7 +153,7 @@ BBO by default.
 Use:
 
 ```powershell
-python -m py_compile scripts/tw_stock_data_to_npz.py scripts/tw_stock_strategies.py
+python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py
 ```
 
 When debugging missing `ask5` / `bid5`, check both:

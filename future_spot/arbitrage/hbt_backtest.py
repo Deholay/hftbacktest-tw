@@ -1,91 +1,62 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
+from scripts.strategy_api import Strategy, StrategyContext
+from scripts.hbt_common import (
+    apply_queue_model,
+    feed_exch_ts,
+    feed_latency_ns,
+    feed_local_ts,
+    feed_refreshed,
+    fill_columns,
+    get_order,
+    hbt_feed_latency,
+    hbt_order_latency,
+    hbt_time_in_force,
+    latency_event_local_ts,
+    order_is_active,
+    round_price_to_tick,
+)
 from scripts.tw_stock_hftbacktest import import_hftbacktest, workspace_root
 
 from .config import build_initial_position
-from .models import PairConfig, PairMarket, PairPosition, Quote, Signal
-from .strategy import PairPricer, RiskManager, StopLossAwareSignalEngine, weighted_average
-from .ticks import pair_leg_tick_size, tick_size_for_prices, trade_date_from_raw, tw_stock_future_tick_size
-from .utils import STOCK_BOARD_LOT_SHARES, exit_quantity_multiplier
-
-
-STOCK_ASSET_NO = 0
-FUTURE_ASSET_NO = 1
-
-
-@dataclass(frozen=True)
-class HbtAssetConfig:
-    symbol: str
-    data: Path
-    instrument: str
-    contract_size: float
-    lot_size: float = 1.0
-    maker_fee: float = 0.0
-    taker_fee: float = 0.0
-    tick_size: float | None = None
-    order_entry_latency_ns: int = 0
-    order_response_latency_ns: int = 0
-    feed_latency_offset_ns: int = 0
-    queue_model: str = "risk_adverse"
-    queue_model_param: float = 3.0
-    last_trades_capacity: int = 100
-
-
-@dataclass(frozen=True)
-class HbtPairBacktestConfig:
-    pair: PairConfig
-    spot: HbtAssetConfig
-    future: HbtAssetConfig
-    first_leg: str = "future"
-    step_ns: int = 1_000_000_000
-    response_timeout_ns: int = 50_000_000
-    second_leg_delay_ns: int = 0
-    post_first_feed_wait: str = "none"
-    post_first_feed_timeout_ns: int = 0
-    post_first_feed_poll_ns: int = 1_000_000
-    max_steps: int | None = None
-    max_trades: int | None = None
-    enforce_risk_limits: bool = True
-    flatten_on_second_leg_failure: bool = True
-    second_leg_profit_check: bool = True
-    record_market_every_steps: int | None = None
-
-
-@dataclass(frozen=True)
-class HbtLegFill:
-    leg: str
-    asset_no: int
-    side: str
-    order_id: int
-    requested_price: float
-    requested_qty: float
-    response: int
-    status: int | None
-    filled: bool
-    exec_price: float | None
-    exec_qty: float
-    local_timestamp: int | None
-    exch_timestamp: int | None
-    order_req_local_ts: int | None = None
-    order_exch_ts: int | None = None
-    order_resp_local_ts: int | None = None
+from .hbt_helpers import (
+    FUTURE_ASSET_NO,
+    STOCK_ASSET_NO,
+    asset_no_for_leg,
+    hbt_order_qty,
+    infer_hbt_asset_tick_size,
+    leg_side,
+    opposite_side,
+    quote_from_depth,
+    realized_pair_pnl,
+    time_in_force_for_leg,
+)
+from .hbt_rows import (
+    base_row,
+)
+from .hbt_types import HbtAssetConfig, HbtLegFill, HbtPairBacktestConfig
+from .models import PairMarket, Signal
+from .strategy import PairPricer, weighted_average
+from .strategy_adapter import FutureSpotStrategyPayload, default_strategy
+from .ticks import pair_leg_tick_size
+from .utils import exit_quantity_multiplier
 
 
 class HbtPairBacktester:
-    def __init__(self, config: HbtPairBacktestConfig, hbtpkg: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: HbtPairBacktestConfig,
+        hbtpkg: Any | None = None,
+        strategy: Strategy | None = None,
+    ) -> None:
         self.config = config
         self.hbtpkg = hbtpkg or import_hftbacktest(workspace_root(config.spot.data))
         self.pricer = PairPricer()
-        self.signal_engine = StopLossAwareSignalEngine()
-        self.risk = RiskManager()
+        self.strategy = strategy or default_strategy()
         self.position = build_initial_position(config.pair)
         self.order_id = 1_000_000
         self.rows: list[dict[str, Any]] = []
@@ -111,18 +82,24 @@ class HbtPairBacktester:
                     continue
                 pricing = self.pricer.price(market)
                 self._record_market_row(hbt, step, market, pricing)
-                signal = self.signal_engine.evaluate(self.config.pair, pricing, self.position)
+                decision = self.strategy.decide(
+                    StrategyContext(
+                        strategy_name=getattr(self.strategy, "name", self.strategy.__class__.__name__),
+                        timestamp_ns=int(hbt.current_timestamp),
+                        payload=FutureSpotStrategyPayload(
+                            pair=self.config.pair,
+                            market=market,
+                            pricing=pricing,
+                            position=self.position,
+                            enforce_risk_limits=self.config.enforce_risk_limits,
+                        ),
+                    )
+                )
+                signal = Signal(decision.action)
                 if signal == Signal.HOLD:
                     continue
-                ok, reason = self.risk.check(
-                    self.config.pair,
-                    market,
-                    signal,
-                    self.position,
-                    enforce_pair_max=self.config.enforce_risk_limits,
-                )
-                if not ok:
-                    self._append_skip_row(hbt, step, signal, market, pricing, reason)
+                if not decision.should_execute:
+                    self._append_skip_row(hbt, step, signal, market, pricing, decision.reason)
                     continue
                 self._execute_signal(hbt, step, signal, market, pricing)
 
@@ -791,280 +768,3 @@ class HbtPairBacktester:
     def _next_order_id(self) -> int:
         self.order_id += 1
         return self.order_id
-
-
-def infer_hbt_asset_tick_size(data: Path, instrument: str, fallback: float = 1.0) -> float:
-    event_data = np.load(data)["data"]
-    prices = event_data["px"][np.isfinite(event_data["px"]) & (event_data["px"] > 0)]
-    if instrument not in {"future", "stock_future"}:
-        return tick_size_for_prices(prices, instrument, fallback=fallback)
-
-    ticks: list[float] = []
-    for row in event_data:
-        price = float(row["px"])
-        if not math.isfinite(price) or price <= 0:
-            continue
-        trade_date = trade_date_from_raw({"exchtime": int(row["exch_ts"])})
-        ticks.append(tw_stock_future_tick_size(price, trade_date))
-    return min(ticks) if ticks else fallback
-
-
-def apply_queue_model(asset: Any, config: HbtAssetConfig):
-    if config.queue_model == "risk_adverse":
-        return asset.risk_adverse_queue_model()
-    if config.queue_model == "log_prob":
-        return asset.log_prob_queue_model()
-    if config.queue_model == "log_prob2":
-        return asset.log_prob_queue_model2()
-    if config.queue_model == "power_prob":
-        return asset.power_prob_queue_model(config.queue_model_param)
-    if config.queue_model == "power_prob2":
-        return asset.power_prob_queue_model2(config.queue_model_param)
-    if config.queue_model == "power_prob3":
-        return asset.power_prob_queue_model3(config.queue_model_param)
-    raise ValueError(f"unknown queue_model: {config.queue_model}")
-
-
-def quote_from_depth(depth: Any, symbol: str, timestamp: int) -> Quote | None:
-    best_bid = float(depth.best_bid)
-    best_ask = float(depth.best_ask)
-    if not math.isfinite(best_bid) or not math.isfinite(best_ask):
-        return None
-    bid_tick = int(depth.best_bid_tick)
-    ask_tick = int(depth.best_ask_tick)
-    return Quote(
-        symbol=symbol,
-        bid=best_bid,
-        ask=best_ask,
-        bid_size=float(depth.bid_qty_at_tick(bid_tick)),
-        ask_size=float(depth.ask_qty_at_tick(ask_tick)),
-        raw={"exchtime": int(timestamp), "timestamp": int(timestamp), "source": "hbt"},
-    )
-
-
-def hbt_order_qty(pair: PairConfig, leg: str) -> float:
-    if leg == "stock":
-        return pair.spot_order_qty / STOCK_BOARD_LOT_SHARES
-    if leg == "future":
-        return float(pair.future_order_qty)
-    raise ValueError(f"unknown leg: {leg}")
-
-
-def asset_no_for_leg(leg: str) -> int:
-    if leg == "stock":
-        return STOCK_ASSET_NO
-    if leg == "future":
-        return FUTURE_ASSET_NO
-    raise ValueError(f"unknown leg: {leg}")
-
-
-def leg_side(signal: Signal, position: PairPosition, leg: str) -> str | None:
-    if signal == Signal.ENTER_LONG_SPOT_SHORT_FUTURE:
-        return "buy" if leg == "stock" else "sell"
-    if signal == Signal.ENTER_SHORT_SPOT_LONG_FUTURE:
-        return "sell" if leg == "stock" else "buy"
-    if signal == Signal.EXIT and position.direction == Signal.ENTER_LONG_SPOT_SHORT_FUTURE:
-        return "sell" if leg == "stock" else "buy"
-    if signal == Signal.EXIT and position.direction == Signal.ENTER_SHORT_SPOT_LONG_FUTURE:
-        return "buy" if leg == "stock" else "sell"
-    return None
-
-
-def opposite_side(side: str | None) -> str | None:
-    if side == "buy":
-        return "sell"
-    if side == "sell":
-        return "buy"
-    return None
-
-
-def time_in_force_for_leg(pair: PairConfig, leg: str, first_leg: str) -> str:
-    if leg == first_leg:
-        return pair.first_leg_time_in_force
-    return pair.second_leg_time_in_force
-
-
-def hbt_time_in_force(hbtpkg: Any, value: str) -> int:
-    attr = getattr(hbtpkg, value.upper(), None)
-    if attr is not None:
-        return attr
-    return hbtpkg.GTC
-
-
-def get_order(hbt: Any, asset_no: int, order_id: int):
-    try:
-        return hbt.orders(asset_no).get(order_id)
-    except Exception:
-        return None
-
-
-def order_is_active(order: Any, hbtpkg: Any) -> bool:
-    return order is not None and int(order.status) == hbtpkg.NEW and float(order.leaves_qty) > 0
-
-
-def round_price_to_tick(price: float, tick_size: float) -> float:
-    return round(price / tick_size) * tick_size
-
-
-def realized_pair_pnl(
-    pair: PairConfig,
-    position: PairPosition,
-    exit_spot_price: float | None,
-    exit_future_price: float | None,
-) -> float | None:
-    if exit_spot_price is None or exit_future_price is None:
-        return None
-    if position.entry_spot_price is None or position.entry_future_price is None:
-        return None
-    spot_qty = pair.spot_order_qty
-    future_multiplier = pair.future_pnl_multiplier * pair.future_order_qty
-    commission_rate = pair.stock_commission_rate * pair.stock_commission_discount
-    entry_stock_fee = position.entry_spot_price * spot_qty * commission_rate
-    exit_stock_fee = exit_spot_price * spot_qty * commission_rate
-
-    if position.direction == Signal.ENTER_LONG_SPOT_SHORT_FUTURE:
-        spot_pnl = (exit_spot_price - position.entry_spot_price) * spot_qty
-        future_pnl = (position.entry_future_price - exit_future_price) * future_multiplier
-        stock_tax = exit_spot_price * spot_qty * pair.stock_transaction_tax_rate
-    elif position.direction == Signal.ENTER_SHORT_SPOT_LONG_FUTURE:
-        spot_pnl = (position.entry_spot_price - exit_spot_price) * spot_qty
-        future_pnl = (exit_future_price - position.entry_future_price) * future_multiplier
-        stock_tax = position.entry_spot_price * spot_qty * pair.stock_transaction_tax_rate
-    else:
-        return None
-    return spot_pnl + future_pnl - entry_stock_fee - exit_stock_fee - stock_tax
-
-
-def fill_columns(prefix: str, fill: HbtLegFill | None) -> dict[str, Any]:
-    if fill is None:
-        return {
-            f"{prefix}_leg": None,
-            f"{prefix}_side": None,
-            f"{prefix}_order_id": None,
-            f"{prefix}_requested_price": None,
-            f"{prefix}_requested_qty": None,
-            f"{prefix}_response": None,
-            f"{prefix}_status": None,
-            f"{prefix}_filled": False,
-            f"{prefix}_exec_price": None,
-            f"{prefix}_exec_qty": None,
-            f"{prefix}_local_timestamp": None,
-            f"{prefix}_exch_timestamp": None,
-            f"{prefix}_order_req_local_ts": None,
-            f"{prefix}_order_exch_ts": None,
-            f"{prefix}_order_resp_local_ts": None,
-            f"{prefix}_order_entry_latency_ns": None,
-            f"{prefix}_order_response_latency_ns": None,
-        }
-    order_entry_latency_ns = None
-    order_response_latency_ns = None
-    if fill.order_req_local_ts is not None and fill.order_exch_ts is not None:
-        order_entry_latency_ns = fill.order_exch_ts - fill.order_req_local_ts
-    if fill.order_resp_local_ts is not None and fill.order_exch_ts is not None:
-        order_response_latency_ns = fill.order_resp_local_ts - fill.order_exch_ts
-    return {
-        f"{prefix}_leg": fill.leg,
-        f"{prefix}_side": fill.side,
-        f"{prefix}_order_id": fill.order_id,
-        f"{prefix}_requested_price": fill.requested_price,
-        f"{prefix}_requested_qty": fill.requested_qty,
-        f"{prefix}_response": fill.response,
-        f"{prefix}_status": fill.status,
-        f"{prefix}_filled": fill.filled,
-        f"{prefix}_exec_price": fill.exec_price,
-        f"{prefix}_exec_qty": fill.exec_qty,
-        f"{prefix}_local_timestamp": fill.local_timestamp,
-        f"{prefix}_exch_timestamp": fill.exch_timestamp,
-        f"{prefix}_order_req_local_ts": fill.order_req_local_ts,
-        f"{prefix}_order_exch_ts": fill.order_exch_ts,
-        f"{prefix}_order_resp_local_ts": fill.order_resp_local_ts,
-        f"{prefix}_order_entry_latency_ns": order_entry_latency_ns,
-        f"{prefix}_order_response_latency_ns": order_response_latency_ns,
-    }
-
-
-def base_row(
-    *,
-    hbt: Any,
-    step: int,
-    pair: PairConfig,
-    signal: Signal,
-    status: str,
-    market: PairMarket,
-    pricing: Any,
-    position: PairPosition,
-    resolved_tick_sizes: dict[str, float],
-    failure_reason: str | None,
-) -> dict[str, Any]:
-    return {
-        "timestamp": int(hbt.current_timestamp),
-        "step": step,
-        "pair_name": pair.name,
-        "spot_symbol": pair.spot_symbol,
-        "future_symbol": pair.future_symbol,
-        "signal": signal.value,
-        "status": status,
-        "failure_reason": failure_reason,
-        "spot_bid": market.spot.bid,
-        "spot_ask": market.spot.ask,
-        "spot_bid_size": market.spot.bid_size,
-        "spot_ask_size": market.spot.ask_size,
-        "future_bid": market.future.bid,
-        "future_ask": market.future.ask,
-        "future_bid_size": market.future.bid_size,
-        "future_ask_size": market.future.ask_size,
-        "long_spot_short_future_pct": pricing.long_spot_short_future_pct,
-        "short_spot_long_future_pct": pricing.short_spot_long_future_pct,
-        "mid_basis_pct": pricing.mid_basis_pct,
-        "long_spot_short_future_ticks": pricing.long_spot_short_future_ticks,
-        "short_spot_long_future_ticks": pricing.short_spot_long_future_ticks,
-        "pricing_spot_tick_size": pricing.spot_tick_size,
-        "pricing_future_tick_size": pricing.future_tick_size,
-        "position_quantity": position.quantity,
-        "position_direction": position.direction.value,
-        **resolved_tick_sizes,
-    }
-
-
-def hbt_feed_latency(hbt: Any, asset_no: int) -> tuple[int, int] | None:
-    latency = hbt.feed_latency(asset_no)
-    if latency is None:
-        return None
-    return int(latency[0]), int(latency[1])
-
-
-def hbt_order_latency(hbt: Any, asset_no: int) -> tuple[int | None, int | None, int | None]:
-    latency = hbt.order_latency(asset_no)
-    if latency is None:
-        return None, None, None
-    return int(latency[0]), int(latency[1]), int(latency[2])
-
-
-def feed_exch_ts(feed_latency: tuple[int, int] | None) -> int | None:
-    return None if feed_latency is None else feed_latency[0]
-
-
-def feed_local_ts(feed_latency: tuple[int, int] | None) -> int | None:
-    return None if feed_latency is None else feed_latency[1]
-
-
-def feed_latency_ns(feed_latency: tuple[int, int] | None) -> int | None:
-    if feed_latency is None:
-        return None
-    return feed_latency[1] - feed_latency[0]
-
-
-def feed_refreshed(before: tuple[int, int] | None, after: tuple[int, int] | None) -> bool:
-    if after is None:
-        return False
-    if before is None:
-        return True
-    return after[1] > before[1]
-
-
-def latency_event_local_ts(hbt: Any, fill: HbtLegFill | None, local_ts: int | None) -> int:
-    if local_ts is not None:
-        return int(local_ts)
-    if fill is not None and fill.order_req_local_ts is not None:
-        return int(fill.order_req_local_ts)
-    return int(hbt.current_timestamp)

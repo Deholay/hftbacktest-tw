@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 try:
+    from .hbt_common import apply_queue_model
     from .tw_stock_data_to_npz import (
         BUY_EVENT,
         DEPTH_CLEAR_EVENT,
@@ -24,6 +25,7 @@ try:
         output_folder_for_source,
     )
 except ImportError:
+    from hbt_common import apply_queue_model
     from tw_stock_data_to_npz import (
         BUY_EVENT,
         DEPTH_CLEAR_EVENT,
@@ -172,22 +174,6 @@ def replay_bbo_summary(data: np.ndarray, sample_limit: int = 10) -> dict[str, An
 
     check_batch(last_ts)
     return {"crossed_batches": crossed, "samples": samples}
-
-
-def apply_queue_model(asset, config: BacktestConfig):
-    if config.queue_model == "risk_adverse":
-        return asset.risk_adverse_queue_model()
-    if config.queue_model == "log_prob":
-        return asset.log_prob_queue_model()
-    if config.queue_model == "log_prob2":
-        return asset.log_prob_queue_model2()
-    if config.queue_model == "power_prob":
-        return asset.power_prob_queue_model(config.queue_model_param)
-    if config.queue_model == "power_prob2":
-        return asset.power_prob_queue_model2(config.queue_model_param)
-    if config.queue_model == "power_prob3":
-        return asset.power_prob_queue_model3(config.queue_model_param)
-    raise ValueError(f"unknown queue_model: {config.queue_model}")
 
 
 def build_asset(hbtpkg, config: BacktestConfig):
