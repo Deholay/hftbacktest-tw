@@ -22,7 +22,9 @@ def default_notebook_args(**overrides: Any) -> Namespace:
     defaults: dict[str, Any] = {
         "start_date": "2026-05-21",
         "end_date": "2026-05-26",
-        "output_dir": PROJECT_ROOT / "output" / "hbt_daily_full_market_20260521_20260526_latency_10ms",
+        # Let resolve_output_dir derive the folder from the effective dates and
+        # latency settings. A caller can still pass output_dir explicitly.
+        "output_dir": None,
         "futures_parquet_template": "/mnt/z/ticks_parquet_stock_future/{ldate}.parquet",
         "twse_daytrade_template": "/mnt/z/TWSE/每日個股狀況/{date_nodash}.csv",
         "tpex_daytrade_template": "/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv",

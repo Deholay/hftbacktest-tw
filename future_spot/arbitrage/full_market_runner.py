@@ -246,7 +246,22 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
         return args.output_dir if args.output_dir.is_absolute() else (PROJECT_ROOT / args.output_dir).resolve()
     start = normalize_date(args.start_date).replace("-", "")
     end = normalize_date(args.end_date).replace("-", "")
-    return PROJECT_ROOT / "output" / f"hbt_daily_full_market_{start}_{end}"
+    order_latency = _output_name_number(getattr(args, "order_latency_ms", 0.0))
+    response_latency = _output_name_number(getattr(args, "response_latency_ms", 0.0))
+    feed_latency = _output_name_number(getattr(args, "feed_latency_offset_ms", 0.0))
+    if order_latency == response_latency == feed_latency:
+        latency_suffix = f"latency_{order_latency}ms"
+    else:
+        latency_suffix = (
+            f"order_{order_latency}ms_response_{response_latency}ms_"
+            f"feed_{feed_latency}ms"
+        )
+    return PROJECT_ROOT / "output" / f"hbt_daily_full_market_{start}_{end}_{latency_suffix}"
+
+
+def _output_name_number(value: float) -> str:
+    """Format a numeric setting as a filesystem-safe, compact token."""
+    return f"{float(value):g}".replace("-", "neg").replace(".", "p")
 
 
 def select_trade_dates(calendar_path: Path, start_date: str, end_date: str) -> list[str]:

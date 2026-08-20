@@ -16,7 +16,7 @@ for _path in (TEST_ROOT, PROJECT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT / "scripts")
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from arbitrage.full_market_runner import attach_entry_signals, parse_args
+from arbitrage.full_market_runner import attach_entry_signals, parse_args, resolve_output_dir
 from arbitrage.hbt_helpers import hbt_asset_audit, infer_hbt_asset_tick_size
 
 
@@ -38,6 +38,21 @@ class FastPipelineTest(unittest.TestCase):
         self.assertEqual(args.build_session_end, "13:25:00")
         self.assertEqual(args.record_market_every_steps, 60)
         self.assertGreaterEqual(args.workers, 1)
+
+    def test_default_output_dir_tracks_dates_and_latency(self) -> None:
+        args = parse_args(
+            [
+                "--start-date", "2026-06-01",
+                "--end-date", "2026-06-30",
+                "--order-latency-ms", "10",
+                "--response-latency-ms", "10",
+                "--feed-latency-offset-ms", "10",
+            ]
+        )
+        self.assertEqual(
+            resolve_output_dir(args).name,
+            "hbt_daily_full_market_20260601_20260630_latency_10ms",
+        )
 
     def test_tick_inference_and_audit_use_vectorized_min_price(self) -> None:
         data = np.zeros(3, dtype=EVENT_DTYPE)
