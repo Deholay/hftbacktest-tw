@@ -1017,7 +1017,29 @@ def convert(args: argparse.Namespace) -> np.ndarray:
     data, stats = build_events_from_rows(rows, args)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.output, data=data)
+    prices = data["px"]
+    valid_prices = prices[np.isfinite(prices) & (prices > 0)]
+    min_price = float(np.min(valid_prices)) if len(valid_prices) else math.nan
+    max_price = float(np.max(valid_prices)) if len(valid_prices) else math.nan
+    event_kind_mask = np.uint64(~EVENT_FLAG_MASK & np.iinfo(np.uint64).max)
+    kinds = data["ev"].astype(np.uint64, copy=False) & event_kind_mask
+    latency = data["local_ts"] - data["exch_ts"]
+    np.savez_compressed(
+        args.output,
+        data=data,
+        min_price=np.asarray([min_price], dtype=np.float64),
+        max_price=np.asarray([max_price], dtype=np.float64),
+        event_rows=np.asarray([len(data)], dtype=np.int64),
+        first_exch_ts=np.asarray([int(data["exch_ts"][0]) if len(data) else -1], dtype=np.int64),
+        last_exch_ts=np.asarray([int(data["exch_ts"][-1]) if len(data) else -1], dtype=np.int64),
+        min_latency_ns=np.asarray([int(np.min(latency)) if len(data) else -1], dtype=np.int64),
+        max_latency_ns=np.asarray([int(np.max(latency)) if len(data) else -1], dtype=np.int64),
+        depth_events=np.asarray(
+            [int(np.sum(np.isin(kinds, [DEPTH_EVENT, DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT])))],
+            dtype=np.int64,
+        ),
+        trade_events=np.asarray([int(np.sum(kinds == TRADE_EVENT))], dtype=np.int64),
+    )
     print_summary(stats, args.output)
     return data
 

@@ -16,6 +16,7 @@ class HbtAssetConfig:
     maker_fee: float = 0.0
     taker_fee: float = 0.0
     tick_size: float | None = None
+    trade_date: str | None = None
     order_entry_latency_ns: int = 0
     order_response_latency_ns: int = 0
     feed_latency_offset_ns: int = 0

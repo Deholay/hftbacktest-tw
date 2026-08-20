@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import hashlib
+import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -28,19 +32,21 @@ from scripts.tw_stock_data_to_npz import (  # noqa: E402
     convert_tw_stock_to_npz,
     default_output_path,
 )
-from scripts.tw_stock_hftbacktest import BacktestConfig, event_summary  # noqa: E402
+from scripts.tw_stock_hftbacktest import BacktestConfig  # noqa: E402
 from scripts.io_utils import concat_frames, ms_to_ns, read_csv_if_exists, safe_filename, write_csv  # noqa: E402
 from arbitrage.config import load_config  # noqa: E402
 from arbitrage.hbt_backtest import (  # noqa: E402
     HbtAssetConfig,
     HbtPairBacktestConfig,
     HbtPairBacktester,
-    infer_hbt_asset_tick_size,
 )
+from arbitrage.hbt_helpers import hbt_asset_audit  # noqa: E402
 from arbitrage.models import PairConfig, Signal  # noqa: E402
 from build_arbitrage_config_from_date import (  # noqa: E402
     BuildArbitrageConfigResult,
     build_arbitrage_config_from_date,
+    format_template as format_daily_template,
+    get_ldate as get_calendar_ldate,
     normalize_date,
 )
 
@@ -49,8 +55,10 @@ DEFAULT_FUTURES_PARQUET_TEMPLATE = '/mnt/z/ticks_parquet_stock_future/{ldate}.pa
 DEFAULT_SPOT_INPUT_CSV_TEMPLATE = '/mnt/z/FubunData/tick_csv/twstock_{date_nodash}.csv'
 DEFAULT_TWSE_DAYTRADE_TEMPLATE = '/mnt/z/TWSE/每日個股狀況/{date_nodash}.csv'
 DEFAULT_TPEX_DAYTRADE_TEMPLATE = '/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv'
-DEFAULT_TWSE_DAILY_TEMPLATE = '/mnt/z/TWSE/每日個股行情/{ldate_nodash}.ftr'
-DEFAULT_TPEX_DAILY_TEMPLATE = '/mnt/z/TPEX/每日個股行情/{ldate_nodash}.ftr'
+# The mounted Linux/WSL data layout uses 每日資料. Keep the CLI defaults
+# aligned with the notebook and with build_arbitrage_config_from_date.py.
+DEFAULT_TWSE_DAILY_TEMPLATE = '/mnt/z/TWSE/每日資料/{ldate_nodash}.ftr'
+DEFAULT_TPEX_DAILY_TEMPLATE = '/mnt/z/TPEX/每日資料/{ldate_nodash}.ftr'
 
 @dataclass(frozen=True)
 class DailyPairRecord:
@@ -67,7 +75,7 @@ class EventDataResult:
     error: str | None = None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build daily stock-future/spot pairs, convert HBT events, and run "
@@ -87,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--twse-daily-template", default=DEFAULT_TWSE_DAILY_TEMPLATE)
     parser.add_argument("--tpex-daily-template", default=DEFAULT_TPEX_DAILY_TEMPLATE)
     parser.add_argument("--build-session-start", default="08:45:00")
-    parser.add_argument("--build-session-end", default="13:45:00")
+    parser.add_argument("--build-session-end", default="13:25:00")
     parser.add_argument("--min-future-volume", type=int, default=1000)
     parser.add_argument("--min-stock-volume", type=int, default=20_000_000)
     parser.add_argument("--required-unit", type=int, default=2000)
@@ -95,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-daily-configs", action="store_true")
 
     parser.add_argument("--session-start", default="09:00:00")
-    parser.add_argument("--session-end", default="13:30:00")
+    parser.add_argument("--session-end", default="13:25:00")
     parser.add_argument("--pair-name", action="append", default=[], help="Pair name filter. Can repeat or use commas.")
     parser.add_argument("--max-pairs", type=int, default=None, help="Global cap after date/pair filtering.")
 
@@ -130,11 +138,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--second-leg-delay-ms", type=float, default=0.0)
     parser.add_argument("--post-first-feed-wait", choices=("none", "spot", "future", "any", "both"), default="none")
     parser.add_argument("--post-first-feed-timeout-ms", type=float, default=0.0)
-    parser.add_argument("--post-first-feed-poll-ms", type=float, default=1.0)
+    parser.add_argument("--post-first-feed-poll-ms", type=float, default=10.0)
     parser.add_argument("--response-timeout-ms", type=float, default=50.0)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--max-trades-per-pair", type=int, default=None)
-    parser.add_argument("--record-market-every-steps", type=int, default=1, help="Use 0 to disable market rows.")
+    parser.add_argument(
+        "--record-market-every-steps",
+        type=int,
+        default=60,
+        help="Periodic market sampling interval in strategy steps. Signal rows are always retained; use 0 for signals only.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(6, os.cpu_count() or 1),
+        help="Pair backtest worker processes. Use 1 for serial debugging.",
+    )
     parser.add_argument("--rebuild-hbt-results", action="store_true", help="Rerun HBT even when result CSVs already exist.")
     parser.add_argument("--queue-model", default="risk_adverse")
     parser.add_argument("--entry-threshold-pct", type=float, default=None)
@@ -144,9 +163,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-second-leg-profit-check", action="store_true")
     parser.add_argument("--no-flatten", action="store_true")
 
+    parser.add_argument("--skip-entry-exit-by-pair", action="store_true")
+    parser.add_argument("--skip-detailed-reports", action="store_true")
+    parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument(
+        "--detailed-report-format",
+        choices=("parquet", "csv", "both"),
+        default="parquet",
+        help="Storage format for large detailed report tables.",
+    )
+
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -164,11 +193,17 @@ def main() -> int:
     pair_universe = pair_universe_frame(records)
     write_csv(pair_universe, args.output_dir / "daily_pair_universe.csv")
 
-    event_paths, conversion_status = build_event_data(args, records)
-    write_csv(conversion_status, args.output_dir / "conversion_status.csv")
-
-    settings = hbt_settings_frame(args, records, event_paths)
-    write_csv(settings, args.output_dir / "hbt_settings.csv")
+    cache_hit = hbt_cache_is_valid(args, records)
+    if cache_hit:
+        logging.info("valid result manifest found; skip event preparation and NPZ audit")
+        event_paths = {}
+        conversion_status = read_csv_if_exists(args.output_dir / "conversion_status.csv")
+        settings = read_csv_if_exists(args.output_dir / "hbt_settings.csv")
+    else:
+        event_paths, conversion_status = build_event_data(args, records)
+        write_csv(conversion_status, args.output_dir / "conversion_status.csv")
+        settings = hbt_settings_frame(args, records, event_paths)
+        write_csv(settings, args.output_dir / "hbt_settings.csv")
 
     pair_results, summary, trades, market, latency, run_errors = run_or_load_backtests(args, records, event_paths)
     write_csv(summary, args.output_dir / "summary_all_daily_pairs.csv")
@@ -176,11 +211,14 @@ def main() -> int:
     write_csv(market, args.output_dir / "market_all_daily_pairs.csv")
     write_csv(latency, args.output_dir / "latency_all_daily_pairs.csv")
     write_csv(run_errors, args.output_dir / "run_errors.csv")
+    if not cache_hit:
+        write_hbt_manifest(args, records)
 
     entry_exit_by_pair, entry_exit_all, entry_exit_index = build_entry_exit_outputs(pair_results, records)
     write_csv(entry_exit_all, args.output_dir / "entry_exit_all_daily_pairs.csv")
     write_csv(entry_exit_index, args.output_dir / "entry_exit_index.csv")
-    write_entry_exit_by_pair(entry_exit_by_pair, args.output_dir / "entry_exit_by_pair")
+    if not args.skip_entry_exit_by_pair:
+        write_entry_exit_by_pair(entry_exit_by_pair, args.output_dir / "entry_exit_by_pair")
 
     logging.info(
         "done dates=%s daily_pairs=%s ready_pairs=%s completed_pairs=%s errors=%s output=%s",
@@ -241,6 +279,12 @@ def build_daily_pair_records(
     target_dir = args.output_dir / "daily_targets"
     config_dir.mkdir(parents=True, exist_ok=True)
     target_dir.mkdir(parents=True, exist_ok=True)
+    build_manifest_path = config_dir / "build_manifest.json"
+    try:
+        build_manifest = json.loads(build_manifest_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        build_manifest = {"schema_version": 1, "dates": {}}
+    manifest_dates = build_manifest.setdefault("dates", {})
 
     allowed_names = pair_name_filter(args.pair_name)
     records: list[DailyPairRecord] = []
@@ -251,7 +295,14 @@ def build_daily_pair_records(
         target_path = target_dir / f"target_futures_{date_nodash}.csv"
         status = "existing"
         result: BuildArbitrageConfigResult | None = None
-        if args.rebuild_daily_configs or not config_path.exists() or not target_path.exists():
+        build_signature = daily_config_build_signature(args, trade_date)
+        needs_rebuild = (
+            args.rebuild_daily_configs
+            or not config_path.exists()
+            or not target_path.exists()
+            or manifest_dates.get(trade_date) != build_signature
+        )
+        if needs_rebuild:
             try:
                 result = build_arbitrage_config_from_date(
                     trade_date,
@@ -273,6 +324,7 @@ def build_daily_pair_records(
                     name_template=args.name_template,
                 )
                 status = "generated"
+                manifest_dates[trade_date] = build_signature
             except SystemExit as exc:
                 error = str(exc) or f"SystemExit({exc.code})"
                 status_rows.append(build_status_row(trade_date, config_path, target_path, "error", error))
@@ -306,7 +358,40 @@ def build_daily_pair_records(
 
     if args.max_pairs is not None:
         records = records[: args.max_pairs]
+    build_manifest_path.write_text(
+        json.dumps(build_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     return records, pd.DataFrame(status_rows)
+
+
+def daily_config_build_signature(args: argparse.Namespace, trade_date: str) -> dict[str, Any]:
+    ldate = get_calendar_ldate(args.calendar, trade_date)
+    source_templates = (
+        args.futures_parquet_template,
+        args.twse_daytrade_template,
+        args.tpex_daytrade_template,
+        args.twse_daily_template,
+        args.tpex_daily_template,
+    )
+    sources = [
+        Path(format_daily_template(template, trade_date, ldate)).resolve()
+        for template in source_templates
+    ]
+    return {
+        "trade_date": trade_date,
+        "ldate": ldate,
+        "build_session_start": args.build_session_start,
+        "build_session_end": args.build_session_end,
+        "min_future_volume": args.min_future_volume,
+        "min_stock_volume": args.min_stock_volume,
+        "required_unit": args.required_unit,
+        "name_template": args.name_template,
+        "base_config": _content_fingerprint(args.base_config),
+        "calendar": _content_fingerprint(args.calendar),
+        "stockinfo": _content_fingerprint(args.stockinfo),
+        "sources": [_stat_fingerprint(path) for path in sources],
+    }
 
 
 def build_status_row(
@@ -445,7 +530,14 @@ def ensure_spot_events(args: argparse.Namespace, symbol: str, trade_date: str) -
 
 
 def prepare_spot_input_csvs(args: argparse.Namespace, records: list[DailyPairRecord]) -> dict[tuple[str, str], Path]:
+    records = [
+        record
+        for record in records
+        if args.rebuild_event_data
+        or not expected_event_path(args, record.pair.spot_symbol, "stock", record.trade_date).exists()
+    ]
     if not records:
+        logging.info("all spot event NPZ files exist; skip daily CSV splitting")
         return {}
     if spot_input_csv_path(args, records[0].trade_date) is None:
         return {}
@@ -456,7 +548,9 @@ def prepare_spot_input_csvs(args: argparse.Namespace, records: list[DailyPairRec
 
     for trade_date, symbols in symbols_by_date.items():
         date_nodash = trade_date.replace("-", "")
-        split_dir = args.output_dir / "spot_tick_csv_by_symbol" / date_nodash
+        # This cache is shared across output directories. A parameter sweep no
+        # longer duplicates several GB of per-symbol source CSV files.
+        split_dir = WORKSPACE_ROOT / "data" / "spot_tick_csv_by_symbol" / date_nodash
         split_dir.mkdir(parents=True, exist_ok=True)
         expected = {symbol: split_dir / f"{symbol}.csv" for symbol in symbols}
         existing = {
@@ -609,19 +703,32 @@ def hbt_settings_frame(
     event_paths: dict[str, dict[str, Path]],
 ) -> pd.DataFrame:
     rows = []
+    args.hbt_tick_sizes = {}
     for record in records:
         paths = event_paths.get(record.run_key)
         if not paths:
             continue
-        rows.append(summarize_asset(args, record, "spot", paths["spot"]))
-        rows.append(summarize_asset(args, record, "future", paths["future"]))
+        spot = summarize_asset(args, record, "spot", paths["spot"])
+        future = summarize_asset(args, record, "future", paths["future"])
+        rows.extend((spot, future))
+        args.hbt_tick_sizes[str(paths["spot"])] = spot["tick_size"]
+        args.hbt_tick_sizes[str(paths["future"])] = future["tick_size"]
     return pd.DataFrame(rows)
 
 
 def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str, data_path: Path) -> dict[str, Any]:
     instrument = "stock" if leg == "spot" else "future"
     contract_size = 1000.0 if leg == "spot" else float(record.pair.future_pnl_multiplier)
-    tick_size = infer_hbt_asset_tick_size(data_path, instrument)
+    configured_tick = record.pair.spot_tick_size if leg == "spot" else record.pair.future_tick_size
+    audit_cache = getattr(args, "hbt_asset_audits", None)
+    if audit_cache is None:
+        audit_cache = args.hbt_asset_audits = {}
+    audit_key = (str(data_path), instrument, record.trade_date)
+    if audit_key not in audit_cache:
+        audit_cache[audit_key] = hbt_asset_audit(data_path, instrument, trade_date=record.trade_date)
+    tick_size, summary = audit_cache[audit_key]
+    if configured_tick is not None:
+        tick_size = configured_tick
     hbt_config = BacktestConfig(
         data=data_path,
         contract_size=contract_size,
@@ -632,8 +739,6 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
         order_latency_ns=ms_to_ns(args.order_latency_ms),
         queue_model=args.queue_model,
     )
-    data = np.load(data_path)["data"]
-    summary = event_summary(data)
     return {
         "trade_date": record.trade_date,
         "run_key": record.run_key,
@@ -650,7 +755,7 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
         "second_leg_delay_ns": ms_to_ns(args.second_leg_delay_ms),
         "post_first_feed_wait": getattr(args, "post_first_feed_wait", "none"),
         "post_first_feed_timeout_ns": ms_to_ns(getattr(args, "post_first_feed_timeout_ms", 0.0)),
-        "post_first_feed_poll_ns": ms_to_ns(getattr(args, "post_first_feed_poll_ms", 1.0)),
+        "post_first_feed_poll_ns": ms_to_ns(getattr(args, "post_first_feed_poll_ms", 10.0)),
         "queue_model": hbt_config.queue_model,
         "rows": summary["rows"],
         "first_exch_ts": summary["first_exch_ts"],
@@ -673,33 +778,67 @@ def run_backtests(
     market_frames = []
     latency_frames = []
     error_rows = []
+    runnable: list[tuple[DailyPairRecord, dict[str, Path]]] = []
     for record in records:
         paths = event_paths.get(record.run_key)
         if paths is None:
             error_rows.append(run_error_row(record, "missing converted event data"))
             continue
-        try:
-            config = build_pair_hbt_config(args, record.pair, paths)
-            backtester = HbtPairBacktester(config)
-            trades, summary = backtester.run()
-            market = backtester.market_frame()
-            latency = backtester.latency_frame()
-            trades = add_run_columns(add_execution_latency_columns(with_time_columns(trades)), record)
-            market = add_run_columns(attach_entry_signals(with_time_columns(market), config.pair), record)
-            latency = add_run_columns(with_time_columns(latency, "local_ts"), record)
-            summary = add_run_columns(summary, record)
-            results[record.run_key] = {"trades": trades, "summary": summary, "market": market, "latency": latency}
-            summary_frames.append(summary)
-            if not trades.empty:
-                trade_frames.append(trades)
-            if not market.empty:
-                market_frames.append(market)
-            if not latency.empty:
-                latency_frames.append(latency)
-        except Exception as exc:
-            error_rows.append(run_error_row(record, repr(exc)))
-            if not args.continue_on_error:
-                raise
+        runnable.append((record, paths))
+
+    completed: dict[str, dict[str, pd.DataFrame]] = {}
+    failures: dict[str, str] = {}
+    workers = max(1, min(int(getattr(args, "workers", 1)), len(runnable) or 1))
+    logging.info("running %s pair backtests with workers=%s", len(runnable), workers)
+    if workers == 1:
+        for index, (record, paths) in enumerate(runnable, start=1):
+            try:
+                completed[record.run_key] = _run_single_pair_backtest(args, record, paths)
+                if index == len(runnable) or index % 10 == 0:
+                    logging.info("pair backtest progress=%s/%s", index, len(runnable))
+            except Exception as exc:
+                failures[record.run_key] = repr(exc)
+                if not args.continue_on_error:
+                    raise
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_records = {
+                executor.submit(_run_single_pair_backtest, args, record, paths): record
+                for record, paths in runnable
+            }
+            for index, future in enumerate(as_completed(future_records), start=1):
+                record = future_records[future]
+                try:
+                    completed[record.run_key] = future.result()
+                    if index == len(runnable) or index % 10 == 0:
+                        logging.info("pair backtest progress=%s/%s", index, len(runnable))
+                except Exception as exc:
+                    failures[record.run_key] = repr(exc)
+                    if not args.continue_on_error:
+                        for pending in future_records:
+                            pending.cancel()
+                        raise
+
+    for record in records:
+        if record.run_key in failures:
+            error_rows.append(run_error_row(record, failures[record.run_key]))
+            continue
+        result = completed.get(record.run_key)
+        if result is None:
+            continue
+        results[record.run_key] = result
+        summary = result["summary"]
+        trades = result["trades"]
+        market = result["market"]
+        latency = result["latency"]
+        summary_frames.append(summary)
+        if not trades.empty:
+            trade_frames.append(trades)
+        if not market.empty:
+            market_frames.append(market)
+        if not latency.empty:
+            latency_frames.append(latency)
+
     return (
         results,
         concat_frames(summary_frames),
@@ -710,12 +849,30 @@ def run_backtests(
     )
 
 
+def _run_single_pair_backtest(
+    args: argparse.Namespace,
+    record: DailyPairRecord,
+    paths: dict[str, Path],
+) -> dict[str, pd.DataFrame]:
+    """Process-safe unit of work for one independent pair backtest."""
+    config = build_pair_hbt_config(args, record.pair, paths, trade_date=record.trade_date)
+    backtester = HbtPairBacktester(config)
+    trades, summary = backtester.run()
+    market = backtester.market_frame()
+    latency = backtester.latency_frame()
+    trades = add_run_columns(add_execution_latency_columns(with_time_columns(trades)), record)
+    market = add_run_columns(attach_entry_signals(with_time_columns(market), config.pair), record)
+    latency = add_run_columns(with_time_columns(latency, "local_ts"), record)
+    summary = add_run_columns(summary, record)
+    return {"trades": trades, "summary": summary, "market": market, "latency": latency}
+
+
 def run_or_load_backtests(
     args: argparse.Namespace,
     records: list[DailyPairRecord],
     event_paths: dict[str, dict[str, Path]],
 ) -> tuple[dict[str, dict[str, pd.DataFrame]], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if not getattr(args, "rebuild_hbt_results", False) and hbt_result_csvs_exist(args.output_dir):
+    if hbt_cache_is_valid(args, records):
         logging.info("reuse existing HBT result CSVs from %s", args.output_dir)
         summary, trades, market, latency, run_errors = load_hbt_result_csvs(args.output_dir)
         summary = filter_frames_to_records(summary, records)
@@ -749,6 +906,132 @@ def hbt_result_csvs_exist(output_dir: Path) -> bool:
     paths = hbt_result_csv_paths(output_dir)
     required = ("summary", "trades", "market", "latency", "run_errors")
     return all(paths[name].exists() for name in required)
+
+
+HBT_CACHE_SCHEMA_VERSION = 2
+HBT_MANIFEST_NAME = "backtest_manifest.json"
+HBT_RESULT_ARG_NAMES = (
+    "start_date",
+    "end_date",
+    "session_start",
+    "session_end",
+    "first_leg",
+    "step_ms",
+    "order_latency_ms",
+    "response_latency_ms",
+    "feed_latency_offset_ms",
+    "second_leg_delay_ms",
+    "post_first_feed_wait",
+    "post_first_feed_timeout_ms",
+    "post_first_feed_poll_ms",
+    "response_timeout_ms",
+    "max_steps",
+    "max_trades_per_pair",
+    "record_market_every_steps",
+    "queue_model",
+    "entry_threshold_pct",
+    "exit_threshold_pct",
+    "min_effective_tick_multiple",
+    "min_second_leg_adjusted_basis_pct",
+    "no_second_leg_profit_check",
+    "no_flatten",
+)
+
+
+def hbt_manifest_path(output_dir: Path) -> Path:
+    return output_dir / HBT_MANIFEST_NAME
+
+
+def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord]) -> dict[str, Any]:
+    config_paths = sorted({record.config_path.resolve() for record in records}, key=str)
+    event_paths = sorted(
+        {
+            expected_event_path(args, record.pair.spot_symbol, "stock", record.trade_date).resolve()
+            for record in records
+        }
+        | {
+            expected_event_path(args, record.pair.future_symbol, "stock_future", record.trade_date).resolve()
+            for record in records
+        },
+        key=str,
+    )
+    implementation_paths = [
+        ARBITRAGE_ROOT / "hbt_backtest.py",
+        ARBITRAGE_ROOT / "hbt_helpers.py",
+        ARBITRAGE_ROOT / "strategy.py",
+        ARBITRAGE_ROOT / "strategy_adapter.py",
+        Path(__file__),
+    ]
+    return {
+        "schema_version": HBT_CACHE_SCHEMA_VERSION,
+        "arguments": {name: _json_value(getattr(args, name, None)) for name in HBT_RESULT_ARG_NAMES},
+        "run_keys": [record.run_key for record in records],
+        "daily_configs": [_content_fingerprint(path) for path in config_paths],
+        "event_files": [_stat_fingerprint(path) for path in event_paths],
+        "implementation_sha256": _combined_content_sha256(implementation_paths),
+    }
+
+
+def hbt_cache_is_valid(args: argparse.Namespace, records: list[DailyPairRecord]) -> bool:
+    if getattr(args, "rebuild_hbt_results", False) or not hbt_result_csvs_exist(args.output_dir):
+        return False
+    path = hbt_manifest_path(args.output_dir)
+    if not path.exists():
+        logging.info("cached CSVs have no manifest; rebuild required")
+        return False
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    current = hbt_manifest_payload(args, records)
+    if stored != current:
+        logging.info("backtest cache manifest changed; rebuild required")
+        return False
+    return True
+
+
+def write_hbt_manifest(args: argparse.Namespace, records: list[DailyPairRecord]) -> Path:
+    path = hbt_manifest_path(args.output_dir)
+    path.write_text(
+        json.dumps(hbt_manifest_payload(args, records), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _stat_fingerprint(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+        return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    except FileNotFoundError:
+        return {"path": str(path), "missing": True}
+
+
+def _content_fingerprint(path: Path) -> dict[str, Any]:
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return {"path": str(path), "missing": True}
+    return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _combined_content_sha256(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(str(path.name).encode())
+        try:
+            digest.update(path.read_bytes())
+        except FileNotFoundError:
+            digest.update(b"<missing>")
+    return digest.hexdigest()
 
 
 def load_hbt_result_csvs(output_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -789,14 +1072,22 @@ def frame_for_run_key(frame: pd.DataFrame, run_key: str) -> pd.DataFrame:
     return frame.loc[frame["run_key"].astype(str).eq(run_key)].copy()
 
 
-def build_pair_hbt_config(args: argparse.Namespace, pair: PairConfig, paths: dict[str, Path]) -> HbtPairBacktestConfig:
+def build_pair_hbt_config(
+    args: argparse.Namespace,
+    pair: PairConfig,
+    paths: dict[str, Path],
+    trade_date: str | None = None,
+) -> HbtPairBacktestConfig:
     pair = pair_with_overrides(args, pair)
+    tick_sizes = getattr(args, "hbt_tick_sizes", {})
     return HbtPairBacktestConfig(
         pair=pair,
         spot=HbtAssetConfig(
             symbol=pair.spot_symbol,
             data=paths["spot"],
             instrument="stock",
+            trade_date=trade_date,
+            tick_size=pair.spot_tick_size or tick_sizes.get(str(paths["spot"])),
             contract_size=1000.0,
             order_entry_latency_ns=ms_to_ns(args.order_latency_ms),
             order_response_latency_ns=ms_to_ns(args.response_latency_ms),
@@ -807,6 +1098,8 @@ def build_pair_hbt_config(args: argparse.Namespace, pair: PairConfig, paths: dic
             symbol=pair.future_symbol,
             data=paths["future"],
             instrument="future",
+            trade_date=trade_date,
+            tick_size=pair.future_tick_size or tick_sizes.get(str(paths["future"])),
             contract_size=float(pair.future_pnl_multiplier),
             order_entry_latency_ns=ms_to_ns(args.order_latency_ms),
             order_response_latency_ns=ms_to_ns(args.response_latency_ms),
@@ -819,7 +1112,7 @@ def build_pair_hbt_config(args: argparse.Namespace, pair: PairConfig, paths: dic
         second_leg_delay_ns=ms_to_ns(args.second_leg_delay_ms),
         post_first_feed_wait=getattr(args, "post_first_feed_wait", "none"),
         post_first_feed_timeout_ns=ms_to_ns(getattr(args, "post_first_feed_timeout_ms", 0.0)),
-        post_first_feed_poll_ns=ms_to_ns(getattr(args, "post_first_feed_poll_ms", 1.0)),
+        post_first_feed_poll_ns=ms_to_ns(getattr(args, "post_first_feed_poll_ms", 10.0)),
         max_steps=args.max_steps,
         max_trades=args.max_trades_per_pair,
         flatten_on_second_leg_failure=not args.no_flatten,
@@ -886,7 +1179,28 @@ def attach_entry_signals(market: pd.DataFrame, pair: PairConfig) -> pd.DataFrame
     if market.empty:
         return market
     result = market.copy()
-    result["entry_signal"] = result.apply(lambda row: entry_signal(row, pair), axis=1)
+    if {"entry_signal", "entry_signal_hit"}.issubset(result.columns):
+        return result
+    long_ok = (
+        result["long_spot_short_future_pct"].ge(pair.entry_threshold_pct)
+        & result["long_spot_short_future_ticks"].gt(pair.min_effective_tick_multiple)
+        & result["spot_ask_size"].ge(pair.stock_min_ask_size)
+        & result["future_bid_size"].ge(pair.future_min_bid_size)
+    )
+    if pair.allow_short_spot:
+        short_ok = (
+            result["short_spot_long_future_pct"].le(-pair.entry_threshold_pct)
+            & result["short_spot_long_future_ticks"].gt(pair.min_effective_tick_multiple)
+            & result["spot_bid_size"].ge(pair.stock_min_bid_size)
+            & result["future_ask_size"].ge(pair.future_min_ask_size)
+        )
+    else:
+        short_ok = pd.Series(False, index=result.index)
+    result["entry_signal"] = np.select(
+        [long_ok, short_ok],
+        [Signal.ENTER_LONG_SPOT_SHORT_FUTURE.value, Signal.ENTER_SHORT_SPOT_LONG_FUTURE.value],
+        default=Signal.HOLD.value,
+    )
     result["entry_signal_hit"] = result["entry_signal"].ne(Signal.HOLD.value)
     return result
 

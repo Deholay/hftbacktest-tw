@@ -7,6 +7,7 @@ from .full_market_runner import (
     frame_for_run_key,
     hbt_result_csv_paths,
     hbt_result_csvs_exist,
+    hbt_cache_is_valid,
     hbt_settings_frame,
     load_hbt_result_csvs,
     pair_results_from_frames,
@@ -14,6 +15,7 @@ from .full_market_runner import (
     read_csv_if_exists,
     run_backtests,
     run_or_load_backtests,
+    write_hbt_manifest,
     summarize_asset,
 )
 
@@ -22,6 +24,7 @@ __all__ = [
     "frame_for_run_key",
     "hbt_result_csv_paths",
     "hbt_result_csvs_exist",
+    "hbt_cache_is_valid",
     "hbt_settings_frame",
     "load_hbt_result_csvs",
     "pair_results_from_frames",
@@ -29,5 +32,6 @@ __all__ = [
     "read_csv_if_exists",
     "run_backtests",
     "run_or_load_backtests",
+    "write_hbt_manifest",
     "summarize_asset",
 ]

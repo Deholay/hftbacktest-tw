@@ -68,6 +68,8 @@ class HbtPairBacktester:
         hbt = self._build_backtest()
         try:
             step = 0
+            last_market: PairMarket | None = None
+            last_pricing: Any | None = None
             while True:
                 if self.config.max_steps is not None and step >= self.config.max_steps:
                     break
@@ -81,7 +83,8 @@ class HbtPairBacktester:
                 if market is None:
                     continue
                 pricing = self.pricer.price(market)
-                self._record_market_row(hbt, step, market, pricing)
+                last_market = market
+                last_pricing = pricing
                 decision = self.strategy.decide(
                     StrategyContext(
                         strategy_name=getattr(self.strategy, "name", self.strategy.__class__.__name__),
@@ -96,6 +99,7 @@ class HbtPairBacktester:
                     )
                 )
                 signal = Signal(decision.action)
+                self._record_market_row(hbt, step, market, pricing, signal)
                 if signal == Signal.HOLD:
                     continue
                 if not decision.should_execute:
@@ -103,6 +107,17 @@ class HbtPairBacktester:
                     continue
                 self._execute_signal(hbt, step, signal, market, pricing)
 
+            if last_market is not None and last_pricing is not None:
+                last_recorded_step = self.market_rows[-1].get("step") if self.market_rows else None
+                if last_recorded_step != step:
+                    self._record_market_row(
+                        hbt,
+                        step,
+                        last_market,
+                        last_pricing,
+                        Signal.HOLD,
+                        force=True,
+                    )
             trades = pd.DataFrame(self.rows)
             summary = pd.DataFrame([self._summary_row(trades)])
             return trades, summary
@@ -122,6 +137,7 @@ class HbtPairBacktester:
             asset_config.data,
             asset_config.instrument,
             fallback=1.0,
+            trade_date=asset_config.trade_date,
         )
         asset = (
             self.hbtpkg.BacktestAsset()
@@ -604,24 +620,34 @@ class HbtPairBacktester:
             )
         )
 
-    def _record_market_row(self, hbt, step: int, market: PairMarket, pricing: Any) -> None:
+    def _record_market_row(
+        self,
+        hbt,
+        step: int,
+        market: PairMarket,
+        pricing: Any,
+        signal: Signal,
+        force: bool = False,
+    ) -> None:
         interval = self.config.record_market_every_steps
-        if interval is None or interval <= 0 or step % interval != 0:
+        periodic = interval is not None and interval > 0 and step % interval == 0
+        if not force and not periodic and signal == Signal.HOLD:
             return
-        self.market_rows.append(
-            base_row(
-                hbt=hbt,
-                step=step,
-                pair=self.config.pair,
-                signal=Signal.HOLD,
-                status="MARKET",
-                market=market,
-                pricing=pricing,
-                position=self.position,
-                resolved_tick_sizes=self.resolved_tick_sizes,
-                failure_reason=None,
-            )
+        row = base_row(
+            hbt=hbt,
+            step=step,
+            pair=self.config.pair,
+            signal=signal,
+            status="MARKET",
+            market=market,
+            pricing=pricing,
+            position=self.position,
+            resolved_tick_sizes=self.resolved_tick_sizes,
+            failure_reason=None,
         )
+        row["entry_signal"] = signal.value
+        row["entry_signal_hit"] = signal != Signal.HOLD
+        self.market_rows.append(row)
 
     def market_frame(self) -> pd.DataFrame:
         return pd.DataFrame(self.market_rows)

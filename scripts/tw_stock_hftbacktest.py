@@ -106,7 +106,8 @@ def load_event_data(path: Path) -> np.ndarray:
 
 
 def event_summary(data: np.ndarray) -> dict[str, Any]:
-    kinds = np.array([event_kind(int(ev)) for ev in data["ev"]])
+    event_kind_mask = np.uint64(~EVENT_FLAG_MASK & np.iinfo(np.uint64).max)
+    kinds = data["ev"].astype(np.uint64, copy=False) & event_kind_mask
     return {
         "rows": len(data),
         "dtype": data.dtype,
@@ -118,7 +119,7 @@ def event_summary(data: np.ndarray) -> dict[str, Any]:
         "max_latency_ns": int(np.max(data["local_ts"] - data["exch_ts"])) if len(data) else None,
         "depth_events": int(np.sum(np.isin(kinds, [DEPTH_EVENT, DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT]))),
         "trade_events": int(np.sum(kinds == TRADE_EVENT)),
-        "unique_event_kinds": sorted(set(kinds.tolist())),
+        "unique_event_kinds": np.unique(kinds).tolist(),
     }
 
 

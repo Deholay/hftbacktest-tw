@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import math
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from scripts.tw_stock_data_to_npz import (
+    DEPTH_CLEAR_EVENT,
+    DEPTH_EVENT,
+    DEPTH_SNAPSHOT_EVENT,
+    EVENT_FLAG_MASK,
+    TRADE_EVENT,
+)
+
 from .models import PairConfig, PairPosition, Quote, Signal
-from .ticks import tick_size_for_prices, trade_date_from_raw, tw_stock_future_tick_size
+from .ticks import tw_stock_future_tick_size, tw_stock_tick_size
 from .utils import STOCK_BOARD_LOT_SHARES
 
 
@@ -15,20 +24,95 @@ STOCK_ASSET_NO = 0
 FUTURE_ASSET_NO = 1
 
 
-def infer_hbt_asset_tick_size(data: Path, instrument: str, fallback: float = 1.0) -> float:
-    event_data = np.load(data)["data"]
-    prices = event_data["px"][np.isfinite(event_data["px"]) & (event_data["px"] > 0)]
-    if instrument not in {"future", "stock_future"}:
-        return tick_size_for_prices(prices, instrument, fallback=fallback)
+def infer_hbt_asset_tick_size(
+    data: Path,
+    instrument: str,
+    fallback: float = 1.0,
+    trade_date: str | date | None = None,
+) -> float:
+    """Infer the smallest price-grid tick without a Python loop over events.
 
-    ticks: list[float] = []
-    for row in event_data:
-        price = float(row["px"])
-        if not math.isfinite(price) or price <= 0:
-            continue
-        trade_date = trade_date_from_raw({"exchtime": int(row["exch_ts"])})
-        ticks.append(tw_stock_future_tick_size(price, trade_date))
-    return min(ticks) if ticks else fallback
+    Taiwan stock/future tick schedules are monotonic within a trading date, so
+    the minimum positive event price determines the minimum grid used by HBT.
+    Older files only contain ``data``; newer converters may also persist the
+    scalar ``min_price`` metadata, which avoids decompressing the event array.
+    """
+    with np.load(data) as archive:
+        if "min_price" in archive.files:
+            min_price = float(np.asarray(archive["min_price"]).reshape(-1)[0])
+        else:
+            event_data = archive["data"]
+            prices = event_data["px"]
+            valid = np.isfinite(prices) & (prices > 0)
+            if not np.any(valid):
+                return fallback
+            min_price = float(np.min(prices[valid]))
+    if instrument == "stock":
+        return tw_stock_tick_size(min_price)
+    if instrument in {"future", "stock_future"}:
+        return tw_stock_future_tick_size(min_price, trade_date)
+    raise ValueError(f"unknown instrument: {instrument}")
+
+
+def hbt_asset_audit(
+    path: Path,
+    instrument: str,
+    trade_date: str | date | None = None,
+    fallback: float = 1.0,
+) -> tuple[float, dict[str, int | None]]:
+    """Load an event archive once and return its tick size and audit summary."""
+    with np.load(path) as archive:
+        scalar_names = {
+            "event_rows",
+            "first_exch_ts",
+            "last_exch_ts",
+            "min_latency_ns",
+            "max_latency_ns",
+            "depth_events",
+            "trade_events",
+        }
+        has_summary = scalar_names.issubset(archive.files)
+        has_min_price = "min_price" in archive.files
+        event_data = None if has_summary and has_min_price else archive["data"]
+        if has_min_price:
+            min_price = float(np.asarray(archive["min_price"]).reshape(-1)[0])
+        else:
+            assert event_data is not None
+            prices = event_data["px"]
+            valid = np.isfinite(prices) & (prices > 0)
+            min_price = float(np.min(prices[valid])) if np.any(valid) else math.nan
+
+        if has_summary:
+            summary = {name: int(np.asarray(archive[name]).reshape(-1)[0]) for name in scalar_names}
+            summary = {name: (None if value < 0 else value) for name, value in summary.items()}
+            summary["rows"] = summary.pop("event_rows")
+        else:
+            assert event_data is not None
+            event_kind_mask = np.uint64(~EVENT_FLAG_MASK & np.iinfo(np.uint64).max)
+            kinds = event_data["ev"].astype(np.uint64, copy=False) & event_kind_mask
+            latency = event_data["local_ts"] - event_data["exch_ts"]
+            rows = len(event_data)
+            summary = {
+                "rows": rows,
+                "first_exch_ts": int(event_data["exch_ts"][0]) if rows else None,
+                "last_exch_ts": int(event_data["exch_ts"][-1]) if rows else None,
+                "min_latency_ns": int(np.min(latency)) if rows else None,
+                "max_latency_ns": int(np.max(latency)) if rows else None,
+                "depth_events": int(
+                    np.sum(np.isin(kinds, [DEPTH_EVENT, DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT]))
+                ),
+                "trade_events": int(np.sum(kinds == TRADE_EVENT)),
+            }
+
+    if not math.isfinite(min_price) or min_price <= 0:
+        tick_size = fallback
+    elif instrument == "stock":
+        tick_size = tw_stock_tick_size(min_price)
+    elif instrument in {"future", "stock_future"}:
+        tick_size = tw_stock_future_tick_size(min_price, trade_date)
+    else:
+        raise ValueError(f"unknown instrument: {instrument}")
+    return tick_size, summary
 
 
 def quote_from_depth(depth: Any, symbol: str, timestamp: int) -> Quote | None:

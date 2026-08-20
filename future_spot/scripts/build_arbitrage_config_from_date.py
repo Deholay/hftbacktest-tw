@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--session-end",
-        default="13:45:00",
+        default="13:25:00",
         help="Futures session end time for target volume calculation.",
     )
     parser.add_argument(
@@ -207,7 +207,7 @@ def build_arbitrage_config_from_date(
     twse_daily_template: str = r"Z:\TWSE\瘥鞈?\{ldate_nodash}.ftr",
     tpex_daily_template: str = r"Z:\TPEX\瘥鞈?\{ldate_nodash}.ftr",
     session_start: str = "08:45:00",
-    session_end: str = "13:45:00",
+    session_end: str = "13:25:00",
     min_future_volume: int = 1000,
     min_stock_volume: int = 20_000_000,
     required_unit: int = 2000,

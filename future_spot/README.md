@@ -21,28 +21,60 @@ Key files:
 - `latency_all_daily_pairs.csv`: long-format local / spot exchange / future exchange latency events.
 - `run_errors.csv`: run errors; should be empty for a clean run.
 
-Notebook report:
+Notebook/test runner:
 
 ```text
-future_spot/notebooks/hbt_pair_backtest_visualization.ipynb
+future_spot/test/hbt_pair_backtest_visualization.ipynb
+future_spot/test/run_full_backtest.py
 ../notebooks/hbt_strategy_interface_example.ipynb
 ```
 
-The visualization notebook is intentionally a thin summary report. It reads the
-generated CSV outputs and shows:
+The visualization notebook is intentionally a thin runner. Its configuration,
+pipeline, report-table, and plotting functions are split into Python modules in
+`future_spot/test/`. Both the notebook and `run_full_backtest.py` save:
 
 - entry / exit rules;
 - estimated profit by symbol and by pair;
 - latency summaries for local / spot exchange / future exchange timelines;
 - daily profit and execution charts;
-- selected pair entry / execution drill-down.
+- selected pair entry / execution drill-down;
+- report CSVs under the selected output directory's `reports/` folder;
+- five PNG charts under its `figures/` folder.
 
 The root strategy interface example notebook demonstrates the
 `scripts.strategy_api` contract plus the futures/spot adapter in
 `arbitrage/strategy_adapter.py`. Keep cross-strategy examples in root
-`notebooks/`; keep futures/spot-specific reports in `future_spot/notebooks/`.
+`notebooks/`; keep futures/spot-specific test/report runners in `future_spot/test/`.
 
 ## Run Command
+
+The complete workflow, including report CSV and PNG generation, is:
+
+```bash
+python future_spot/test/run_full_backtest.py --start-date 2026-05-21 --end-date 2026-05-26
+```
+
+All options accepted by the existing full-market runner are accepted by this
+entrypoint. The lower-level core-only command remains available below.
+
+The optimized defaults use a `13:25:00` session end, six pair worker processes,
+and one periodic market sample per 60 strategy steps. Every non-HOLD signal row
+is still retained. Backtest reuse is protected by `backtest_manifest.json`,
+which fingerprints result-affecting arguments, daily configs, event-file stats,
+and strategy/HBT implementation files.
+
+For a lightweight run that keeps summary CSVs and PNG figures:
+
+```bash
+python future_spot/test/run_full_backtest.py \
+  --skip-detailed-reports \
+  --skip-entry-exit-by-pair
+```
+
+Large detailed report tables use Parquet by default. Use
+`--detailed-report-format csv` only when CSV detail is required. Use
+`--workers 1` for serial debugging and `--rebuild-hbt-results` to explicitly
+bypass a valid cache.
 
 Run from the Poetry project under `data_platform_client`:
 
