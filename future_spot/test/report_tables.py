@@ -70,7 +70,7 @@ def build_report_tables(artifacts: BacktestArtifacts) -> ReportArtifacts:
             continue
         if detailed_format in {"parquet", "both"}:
             path = report_dir / f"{name}.parquet"
-            frame.to_parquet(path, index=False)
+            reporting.write_parquet(frame, path)
         if detailed_format in {"csv", "both"}:
             reporting.write_csv(frame, report_dir / f"{name}.csv")
     selected_pair = None if pair_profit.empty else str(pair_profit.iloc[0]["pair_name"])

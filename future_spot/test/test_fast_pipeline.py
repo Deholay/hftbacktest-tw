@@ -18,6 +18,7 @@ for _path in (TEST_ROOT, PROJECT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT / "scripts")
 
 from arbitrage.full_market_runner import attach_entry_signals, parse_args, resolve_output_dir
 from arbitrage.hbt_helpers import hbt_asset_audit, infer_hbt_asset_tick_size
+from scripts.io_utils import write_parquet
 
 
 EVENT_DTYPE = np.dtype(
@@ -106,6 +107,24 @@ class FastPipelineTest(unittest.TestCase):
         )
         result = attach_entry_signals(market, pair)
         self.assertEqual(result["entry_signal_hit"].tolist(), [True, False])
+
+    def test_write_parquet_preserves_nullable_epoch_nanoseconds(self) -> None:
+        timestamp = 1_777_857_193_502_000_000
+        frame = pd.DataFrame(
+            {
+                "flatten_local_timestamp": pd.Series([timestamp, None, 0.0], dtype=object),
+                "status": pd.Series(["FILLED", None, "UNFILLED"], dtype=object),
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.parquet"
+            write_parquet(frame, path)
+            restored = pd.read_parquet(path)
+
+        self.assertEqual(int(restored.loc[0, "flatten_local_timestamp"]), timestamp)
+        self.assertTrue(pd.isna(restored.loc[1, "flatten_local_timestamp"]))
+        self.assertEqual(int(restored.loc[2, "flatten_local_timestamp"]), 0)
+        self.assertEqual(restored.loc[0, "status"], "FILLED")
 
 
 if __name__ == "__main__":

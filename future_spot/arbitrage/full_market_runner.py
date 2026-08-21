@@ -33,7 +33,14 @@ from scripts.tw_stock_data_to_npz import (  # noqa: E402
     default_output_path,
 )
 from scripts.tw_stock_hftbacktest import BacktestConfig  # noqa: E402
-from scripts.io_utils import concat_frames, ms_to_ns, read_csv_if_exists, safe_filename, write_csv  # noqa: E402
+from scripts.io_utils import (  # noqa: E402
+    concat_frames,
+    ms_to_ns,
+    read_csv_if_exists,
+    safe_filename,
+    write_csv,
+    write_parquet,
+)
 from arbitrage.config import load_config  # noqa: E402
 from arbitrage.hbt_backtest import (  # noqa: E402
     HbtAssetConfig,

@@ -49,6 +49,7 @@ from .full_market_runner import (
     sort_by_existing,
     with_time_columns,
     write_csv,
+    write_parquet,
     write_entry_exit_by_pair,
 )
 
