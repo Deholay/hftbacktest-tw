@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .full_market_runner import (
+    DEFAULT_DATA_PLATFORM_BASE,
     DEFAULT_SPOT_INPUT_CSV_TEMPLATE,
     EventDataResult,
     build_event_data,
@@ -18,6 +19,7 @@ from .full_market_runner import (
 )
 
 __all__ = [
+    "DEFAULT_DATA_PLATFORM_BASE",
     "DEFAULT_SPOT_INPUT_CSV_TEMPLATE",
     "EventDataResult",
     "build_event_data",

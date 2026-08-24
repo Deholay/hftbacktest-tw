@@ -4,6 +4,7 @@ import argparse
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import polars as pl
@@ -164,6 +165,50 @@ class ParquetConversionTest(unittest.TestCase):
                 self.assertEqual(int(saved["event_rows"][0]), len(converted))
                 self.assertEqual(float(saved["min_price"][0]), 77.90)
                 self.assertEqual(float(saved["max_price"][0]), 78.05)
+
+    def test_data_api_polars_frame_uses_columnar_builder(self) -> None:
+        class FakeDataAPI:
+            lazy_calls = 0
+            eager_calls = 0
+
+            def __init__(self, base_dir: str, index_backend: str) -> None:
+                self.base_dir = base_dir
+                self.index_backend = index_backend
+
+            def get_data_single_symbol_in_lazy(self, symbol: str, start_date: str, end_date: str):
+                type(self).lazy_calls += 1
+                return pl.DataFrame(sample_rows()).lazy()
+
+            def get_data_single_symbol(self, symbol: str, start_date: str, end_date: str):
+                type(self).eager_calls += 1
+                raise AssertionError("eager DataAPI path should not be used")
+
+        args = converter_args()
+        expected, _ = build_events_from_rows(sample_rows(), args)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "0050_data_api.npz"
+            with patch(
+                "scripts.tw_stock_data_to_npz.import_data_api_class",
+                return_value=FakeDataAPI,
+            ):
+                output_path, converted = convert_tw_stock_to_npz(
+                    symbol="0050",
+                    start_date="2023-11-14",
+                    output=output,
+                    workspace_root=root,
+                    data_api=True,
+                    data_platform_base="/mock/data-platform",
+                    data_api_module_dir=root / "data_stock" / "api",
+                    source_kind="stock",
+                    levels=2,
+                    npz_compression="uncompressed",
+                )
+
+        self.assertEqual(output_path, output)
+        np.testing.assert_array_equal(converted, expected)
+        self.assertEqual(FakeDataAPI.lazy_calls, 1)
+        self.assertEqual(FakeDataAPI.eager_calls, 0)
 
 
 if __name__ == "__main__":

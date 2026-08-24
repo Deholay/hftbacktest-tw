@@ -100,6 +100,7 @@ DEFAULT_DAILY_PARQUET_DIRS = {
 }
 
 PRICE_ONLY_DEPTH_SOURCE_KINDS = {"odd_lot", "etf"}
+DEFAULT_DATA_PLATFORM_BASE = "/mnt/z/數據平台"
 
 
 def default_data_api_module_dir(root: Path) -> Path:
@@ -264,8 +265,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data-platform-base",
-        default=r"\\DC_TW\taiwan_stock\?豢?撟喳",
-        help=r"DataAPI base_dir. Default: \\DC_TW\taiwan_stock\?豢?撟喳.",
+        default=DEFAULT_DATA_PLATFORM_BASE,
+        help=f"data_platform_client parquet-store root. Default: {DEFAULT_DATA_PLATFORM_BASE}.",
     )
     parser.add_argument(
         "--index-backend",
@@ -801,12 +802,8 @@ def row_iter_from_csv(args: argparse.Namespace) -> Iterator[dict[str, object]]:
 
 
 def row_iter_from_data_api(args: argparse.Namespace) -> Iterator[dict[str, object]]:
-    module_dir = args.data_api_module_dir.resolve()
-    DataAPI = import_data_api_class(module_dir)
-
-    api = DataAPI(base_dir=args.data_platform_base, index_backend=args.index_backend)
-    df = api.get_data_single_symbol(str(args.symbol), args.start_date, args.end_date)
-    yield from df.to_dicts()
+    """Compatibility iterator; conversion uses the columnar DataAPI path."""
+    yield from load_data_api_frame(args).to_dicts()
 
 
 def iter_date_strings(start_date: str, end_date: str) -> Iterator[str]:
@@ -857,6 +854,61 @@ def daily_parquet_columns(levels: int) -> list[str]:
     return columns
 
 
+def _collect_source_frame(lf, args: argparse.Namespace, *, filter_symbol: bool):
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise RuntimeError("columnar input requires polars") from exc
+
+    schema_names = set(lf.collect_schema().names())
+    if not schema_names:
+        return pl.DataFrame()
+    required = {"exchtime", "last_price", "total_volume"}
+    for level in range(1, args.levels + 1):
+        required.add(f"ask_price{level}")
+        required.add(f"bid_price{level}")
+    missing = sorted(required - schema_names)
+    if missing:
+        raise ValueError(f"columnar source missing required columns: {missing}")
+
+    selected_columns = [column for column in daily_parquet_columns(args.levels) if column in schema_names]
+    lf = lf.select(selected_columns)
+
+    if filter_symbol:
+        symbol_column = "symbol" if "symbol" in schema_names else "symbol_id"
+        if symbol_column not in schema_names:
+            raise ValueError("columnar source must contain symbol or symbol_id")
+        lf = lf.filter(
+            pl.col(symbol_column).cast(pl.Utf8).is_in(symbol_filter_values(str(args.symbol)))
+        )
+    if args.status_allow and "status" in schema_names:
+        lf = lf.filter(pl.col("status").cast(pl.Utf8).is_in([str(value) for value in args.status_allow]))
+    if args.start_exch_ts is not None:
+        lf = lf.filter(pl.col("exchtime").cast(pl.Int64) >= int(args.start_exch_ts))
+    if args.end_exch_ts is not None:
+        lf = lf.filter(pl.col("exchtime").cast(pl.Int64) <= int(args.end_exch_ts))
+
+    df = lf.collect()
+    sort_columns = [column for column in ("exchtime", "localtime", "sequence") if column in df.columns]
+    if sort_columns:
+        df = df.sort(sort_columns)
+    return df
+
+
+def load_data_api_frame(args: argparse.Namespace):
+    """Load one symbol as Polars columns from data_platform_client parquet."""
+    module_dir = args.data_api_module_dir.resolve()
+    DataAPI = import_data_api_class(module_dir)
+    api = DataAPI(base_dir=args.data_platform_base, index_backend=args.index_backend)
+    get_lazy = getattr(api, "get_data_single_symbol_in_lazy", None)
+    if callable(get_lazy):
+        lf = get_lazy(str(args.symbol), args.start_date, args.end_date)
+    else:
+        frame = api.get_data_single_symbol(str(args.symbol), args.start_date, args.end_date)
+        lf = frame.lazy()
+    return _collect_source_frame(lf, args, filter_symbol=False)
+
+
 def load_daily_parquet_frame(args: argparse.Namespace):
     try:
         import polars as pl
@@ -871,31 +923,7 @@ def load_daily_parquet_frame(args: argparse.Namespace):
         )
 
     lf = pl.scan_parquet([str(path) for path in files])
-    schema_names = set(lf.collect_schema().names())
-    required = {"symbol", "exchtime", "last_price", "total_volume"}
-    for level in range(1, args.levels + 1):
-        required.add(f"ask_price{level}")
-        required.add(f"bid_price{level}")
-    missing = sorted(required - schema_names)
-    if missing:
-        raise ValueError(f"daily parquet source missing required columns: {missing}")
-
-    selected_columns = [column for column in daily_parquet_columns(args.levels) if column in schema_names]
-    lf = lf.select(selected_columns)
-
-    lf = lf.filter(pl.col("symbol").cast(pl.Utf8).is_in(symbol_filter_values(str(args.symbol))))
-    if args.status_allow and "status" in schema_names:
-        lf = lf.filter(pl.col("status").cast(pl.Utf8).is_in([str(value) for value in args.status_allow]))
-    if args.start_exch_ts is not None:
-        lf = lf.filter(pl.col("exchtime").cast(pl.Int64) >= int(args.start_exch_ts))
-    if args.end_exch_ts is not None:
-        lf = lf.filter(pl.col("exchtime").cast(pl.Int64) <= int(args.end_exch_ts))
-
-    df = lf.collect()
-    sort_columns = [column for column in ("exchtime", "localtime", "sequence") if column in df.columns]
-    if sort_columns:
-        df = df.sort(sort_columns)
-    return df
+    return _collect_source_frame(lf, args, filter_symbol=True)
 
 
 def row_iter_from_daily_parquet(args: argparse.Namespace) -> Iterator[dict[str, object]]:
@@ -1474,11 +1502,9 @@ def print_summary(stats: ConversionStats, output: Path) -> None:
 def convert(args: argparse.Namespace) -> np.ndarray:
     load_started = time.perf_counter()
     if args.data_api:
-        rows = row_iter_from_data_api(args)
-        load_seconds = 0.0  # The lazy row iterator performs its load during event building.
-        build_started = time.perf_counter()
-        data, stats = build_events_from_rows(rows, args)
-        stats.event_build_seconds = time.perf_counter() - build_started
+        frame = load_data_api_frame(args)
+        load_seconds = time.perf_counter() - load_started
+        data, stats = build_events_from_parquet_frame(frame, args)
     elif args.daily_parquet:
         frame = load_daily_parquet_frame(args)
         load_seconds = time.perf_counter() - load_started
@@ -1557,7 +1583,7 @@ def convert_tw_stock_to_npz(
     daily_parquet_dir: Path | None = None,
     path_config: Path | None = None,
     source_kind: str = "stock",
-    data_platform_base: str = r"\\DC_TW\taiwan_stock\數據平台",
+    data_platform_base: str = DEFAULT_DATA_PLATFORM_BASE,
     index_backend: str = "duckdb",
     data_api_module_dir: Path | None = None,
     timezone_name: str = "Asia/Taipei",

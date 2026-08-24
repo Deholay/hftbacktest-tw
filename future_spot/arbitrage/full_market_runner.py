@@ -28,6 +28,7 @@ for path in (SCRIPT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT):
         sys.path.insert(0, text)
 
 from scripts.tw_stock_data_to_npz import (  # noqa: E402
+    DEFAULT_DATA_PLATFORM_BASE,
     convert_tw_stock_future_to_npz,
     convert_tw_stock_to_npz,
     default_output_path,
@@ -59,7 +60,7 @@ from build_arbitrage_config_from_date import (  # noqa: E402
 
 
 DEFAULT_FUTURES_PARQUET_TEMPLATE = '/mnt/z/ticks_parquet_stock_future/{ldate}.parquet'
-DEFAULT_SPOT_INPUT_CSV_TEMPLATE = '/mnt/z/FubunData/tick_csv/twstock_{date_nodash}.csv'
+DEFAULT_SPOT_INPUT_CSV_TEMPLATE = ''
 DEFAULT_TWSE_DAYTRADE_TEMPLATE = '/mnt/z/TWSE/每日個股狀況/{date_nodash}.csv'
 DEFAULT_TPEX_DAYTRADE_TEMPLATE = '/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv'
 # The mounted Linux/WSL data layout uses 每日資料. Keep the CLI defaults
@@ -127,14 +128,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--spot-input-csv-template",
         default=DEFAULT_SPOT_INPUT_CSV_TEMPLATE,
         help=(
-            "Spot tick CSV path template for event conversion. Supports "
-            "{date}, {date_dash}, and {date_nodash}. Default avoids DataAPI."
+            "Optional fallback spot tick CSV template. Supports {date}, "
+            "{date_dash}, and {date_nodash}. Empty uses data_platform_client."
         ),
     )
     parser.add_argument(
         "--data-platform-base",
-        default=r"\\DC_TW\taiwan_stock\數據平台",
-        help="Legacy DataAPI base directory. Only used when --spot-input-csv-template is empty.",
+        default=DEFAULT_DATA_PLATFORM_BASE,
+        help="data_platform_client parquet-store root used when --spot-input-csv-template is empty.",
     )
     parser.add_argument(
         "--event-futures-parquet-dir",

@@ -28,6 +28,7 @@ from arbitrage.daily_pipeline import (  # noqa: E402,F401
     select_trade_dates,
 )
 from arbitrage.event_data import (  # noqa: E402,F401
+    DEFAULT_DATA_PLATFORM_BASE,
     DEFAULT_SPOT_INPUT_CSV_TEMPLATE,
     EventDataResult,
     build_event_data,

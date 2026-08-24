@@ -30,7 +30,7 @@ def default_notebook_args(**overrides: Any) -> Namespace:
         "tpex_daytrade_template": "/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv",
         "twse_daily_template": "/mnt/z/TWSE/每日資料/{ldate_nodash}.ftr",
         "tpex_daily_template": "/mnt/z/TPEX/每日資料/{ldate_nodash}.ftr",
-        "spot_input_csv_template": "/mnt/z/FubunData/tick_csv/twstock_{date_nodash}.csv",
+        "spot_input_csv_template": "",
         "data_platform_base": "/mnt/z/數據平台",
         "event_futures_parquet_dir": Path("/mnt/z/ticks_parquet_stock_future"),
         "session_end": "13:25:00",

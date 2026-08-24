@@ -99,7 +99,6 @@ poetry run python /home/zoufuc/hftbacktest/future_spot/scripts/run_hbt_daily_ful
   --tpex-daytrade-template '/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv' \
   --twse-daily-template '/mnt/z/TWSE/每日資料/{ldate_nodash}.ftr' \
   --tpex-daily-template '/mnt/z/TPEX/每日資料/{ldate_nodash}.ftr' \
-  --spot-input-csv-template '/mnt/z/FubunData/tick_csv/twstock_{date_nodash}.csv' \
   --data-platform-base '/mnt/z/數據平台' \
   --event-futures-parquet-dir '/mnt/z/ticks_parquet_stock_future' \
   --npz-compression uncompressed
@@ -133,22 +132,31 @@ The `/mnt/z/...` paths are needed when running from Linux/WSL. Windows-style
 paths such as `Z:\ticks_parquet_stock_future\...` are treated as literal file
 names by Linux Python and will not open correctly.
 
-Spot tick conversion currently uses daily CSV files such as:
+Spot tick conversion defaults to the `data_platform_client` parquet store at
+`/mnt/z/數據平台`. The converter gets a per-symbol Polars LazyFrame, applies the
+session filter before collection, and sends column arrays to the Numba event
+builder without materializing Python dictionaries.
+
+Daily CSV remains available as a fallback. To use a file such as:
 
 ```text
 /mnt/z/FubunData/tick_csv/twstock_20260521.csv
 ```
 
-This avoids the temporarily unavailable `data_platform_client` DataAPI path. The
-runner first splits each daily spot CSV into per-symbol files under:
+pass this option:
+
+```bash
+  --spot-input-csv-template '/mnt/z/FubunData/tick_csv/twstock_{date_nodash}.csv'
+```
+
+The runner then splits each daily spot CSV into per-symbol files under:
 
 ```text
 future_spot/output/.../spot_tick_csv_by_symbol/YYYYMMDD/
 ```
 
-Then each per-symbol CSV is converted to HBT `.npz`. If
-`--spot-input-csv-template` is set to an empty string, the runner falls back to
-the legacy DataAPI conversion path.
+Then each per-symbol CSV is converted to HBT `.npz`. Omitting
+`--spot-input-csv-template` keeps the faster DataAPI/Numba default.
 
 If a local `(venv)` raises this error:
 

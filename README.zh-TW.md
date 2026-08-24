@@ -48,7 +48,7 @@ python3 -m pip install -r requirements.txt
 
 ## 其他資料來源轉換
 
-股票資料的 DataAPI path 維持使用 `data_platform_client/data_stock/api`。ETF、零股、股票期貨則吃 `path.toml` 裡設定的 daily parquet root，後面共用同一套 event builder、hftbacktest setup 和策略程式。
+股票轉檔透過 `data_platform_client/data_stock/api` 讀 parquet store，先用 Polars LazyFrame 投影及過濾必要欄位，再把欄式 NumPy array 直接送入 Numba event builder。ETF、零股、股票期貨則吃 `path.toml` 裡設定的 daily parquet root，後面共用同一套 event builder、hftbacktest setup 和策略程式。
 
 股票 top-5 schema 對照：
 
@@ -61,7 +61,7 @@ python3 -m pip install -r requirements.txt
 
 ETF 和零股 parquet 只有 top-5 price，沒有 top-5 quantity。converter 預設用 `price_only_depth_qty=1.0`，讓 BBO / depth replay 可以跑起來；但只要策略結果跟 queue size 很有關，就要把它當成結構 replay 測試，不要當成真實 queue-volume model。
 
-Daily parquet 轉檔現在直接用欄式 NumPy array 配合 Numba 建立 event，不會先把每列變成 Python dict。轉檔摘要會分別印出讀檔、event 建立、時間線整理與 NPZ 寫入時間。NPZ 預設仍維持壓縮；如果磁碟空間足夠、比較重視寫入及後續載入速度，可以用 `--npz-compression uncompressed`，Python 呼叫則傳入 `npz_compression="uncompressed"`。
+DataAPI 與 daily parquet 轉檔現在都直接用欄式 NumPy array 配合 Numba 建立 event，不會先把每列變成 Python dict。轉檔摘要會分別印出讀檔、event 建立、時間線整理與 NPZ 寫入時間。NPZ 預設仍維持壓縮；如果磁碟空間足夠、比較重視寫入及後續載入速度，可以用 `--npz-compression uncompressed`，Python 呼叫則傳入 `npz_compression="uncompressed"`。
 
 期現套利 full-market runner 預設也使用 `--strategy-engine numba`。Numba
 會在 compiled loop 裡推進 HBT、讀兩腿 BBO、計價並掃過連續的 `HOLD`；

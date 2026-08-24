@@ -53,7 +53,7 @@ The current working notebook is `notebooks/hftbacktest_TWStock.ipynb`. The noteb
 
 ## Additional Source Converters
 
-The stock DataAPI path remains `data_platform_client/data_stock/api`. ETF, Odd Lot, and Stock Future use the daily parquet roots listed in `path.toml`, then share the same event builder, hftbacktest setup, and strategy code.
+Stock conversion reads the parquet store through `data_platform_client/data_stock/api` as a Polars LazyFrame. It projects and filters the required columns before collection, then feeds columnar NumPy arrays directly to the Numba event builder. ETF, Odd Lot, and Stock Future use the daily parquet roots listed in `path.toml`, then share the same event builder, hftbacktest setup, and strategy code.
 
 Column index check against the stock top-5 schema:
 
@@ -66,7 +66,7 @@ Column index check against the stock top-5 schema:
 
 ETF and Odd Lot parquet data only contain top-5 prices, not top-5 quantities. Their converters use `price_only_depth_qty=1.0` by default so BBO/depth replay can run, but queue-size-sensitive strategy output should be read as a structural replay test rather than a true queue-volume model.
 
-Daily-parquet conversion uses a columnar NumPy/Numba event builder rather than
+DataAPI and daily-parquet conversion use a columnar NumPy/Numba event builder rather than
 materializing one Python dictionary per source row. Conversion summaries print
 separate load, event-build, normalization, and write timings. NPZ output remains
 compressed by default; use `--npz-compression uncompressed` (or
