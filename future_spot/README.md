@@ -58,10 +58,18 @@ All options accepted by the existing full-market runner are accepted by this
 entrypoint. The lower-level core-only command remains available below.
 
 The optimized defaults use a `13:25:00` session end, six pair worker processes,
-and one periodic market sample per 60 strategy steps. Every non-HOLD signal row
-is still retained. Backtest reuse is protected by `backtest_manifest.json`,
+one periodic market sample per 60 strategy steps, and the Numba strategy scanner.
+The compiled scanner advances HBT, reads both BBOs, calculates pair pricing, and
+skips HOLD-only spans without constructing Python objects on every step. It
+returns to Python for signals, periodic market samples, risk checks, execution,
+and report rows. Every non-HOLD signal row is still retained. Backtest reuse is protected by `backtest_manifest.json`,
 which fingerprints result-affecting arguments, daily configs, event-file stats,
 and strategy/HBT implementation files.
+
+Use `--strategy-engine python` as the reference/fallback path. Numba currently
+supports only the default future/spot strategy; a custom `Strategy` must use the
+Python engine. The first pair handled by each worker includes JIT compilation;
+later pairs in the same worker reuse the compiled function.
 
 For a lightweight run that keeps summary CSVs and PNG figures:
 

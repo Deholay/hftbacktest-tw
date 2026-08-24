@@ -38,6 +38,7 @@ class FastPipelineTest(unittest.TestCase):
         self.assertEqual(args.session_end, "13:25:00")
         self.assertEqual(args.build_session_end, "13:25:00")
         self.assertEqual(args.record_market_every_steps, 60)
+        self.assertEqual(args.strategy_engine, "numba")
         self.assertGreaterEqual(args.workers, 1)
 
     def test_default_output_dir_tracks_dates_and_latency(self) -> None:

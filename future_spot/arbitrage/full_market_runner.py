@@ -953,6 +953,7 @@ HBT_RESULT_ARG_NAMES = (
     "session_end",
     "first_leg",
     "step_ms",
+    "strategy_engine",
     "order_latency_ms",
     "response_latency_ms",
     "feed_latency_offset_ms",
@@ -993,6 +994,7 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
     )
     implementation_paths = [
         ARBITRAGE_ROOT / "hbt_backtest.py",
+        ARBITRAGE_ROOT / "hbt_numba.py",
         ARBITRAGE_ROOT / "hbt_helpers.py",
         ARBITRAGE_ROOT / "strategy.py",
         ARBITRAGE_ROOT / "strategy_adapter.py",

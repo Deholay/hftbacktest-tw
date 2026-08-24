@@ -63,6 +63,12 @@ ETF 和零股 parquet 只有 top-5 price，沒有 top-5 quantity。converter 預
 
 Daily parquet 轉檔現在直接用欄式 NumPy array 配合 Numba 建立 event，不會先把每列變成 Python dict。轉檔摘要會分別印出讀檔、event 建立、時間線整理與 NPZ 寫入時間。NPZ 預設仍維持壓縮；如果磁碟空間足夠、比較重視寫入及後續載入速度，可以用 `--npz-compression uncompressed`，Python 呼叫則傳入 `npz_compression="uncompressed"`。
 
+期現套利 full-market runner 預設也使用 `--strategy-engine numba`。Numba
+會在 compiled loop 裡推進 HBT、讀兩腿 BBO、計價並掃過連續的 `HOLD`；
+只有遇到訊號、定期市場採樣或資料結束才回 Python。風控、下單、成交與
+報表仍沿用原邏輯。需要逐步除錯或使用自訂 Strategy 時，改用
+`--strategy-engine python`。
+
 ## 目前 Notebook Flow
 
 1. 把台股 L2 / top-5 data 轉成 hftbacktest event data。

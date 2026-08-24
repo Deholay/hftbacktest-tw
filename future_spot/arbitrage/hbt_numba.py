@@ -33,6 +33,8 @@ EFFECTIVE_TICK_COST_RATE = 0.004
 
 @njit(cache=True)
 def tw_stock_tick_size_numba(price: float) -> float:
+    if price < 0.0:
+        raise ValueError("price must be non-negative")
     if price < 10.0:
         return 0.01
     if price < 50.0:
@@ -48,6 +50,8 @@ def tw_stock_tick_size_numba(price: float) -> float:
 
 @njit(cache=True)
 def tw_stock_future_tick_size_numba(price: float, schedule_mode: int, timestamp_ns: int) -> float:
+    if price < 0.0:
+        raise ValueError("price must be non-negative")
     if price < 500.0:
         return tw_stock_tick_size_numba(price)
 
@@ -195,7 +199,9 @@ def signal_from_pricing_values(
     return SIGNAL_HOLD
 
 
-@njit(cache=True)
+# HBT's jitclass carries dynamic ctypes pointers, so Numba cannot persist this
+# dispatcher to disk. It still compiles once and is reused within each worker.
+@njit
 def scan_until_wakeup(
     hbt,
     step_ns: int,
@@ -266,10 +272,6 @@ def scan_until_wakeup(
             and math.isfinite(spot_ask)
             and math.isfinite(future_bid)
             and math.isfinite(future_ask)
-            and spot_bid > 0.0
-            and spot_ask > 0.0
-            and future_bid > 0.0
-            and future_ask > 0.0
         )
         if not valid_market:
             continue

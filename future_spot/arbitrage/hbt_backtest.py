@@ -40,8 +40,6 @@ from .hbt_rows import (
 )
 from .hbt_numba import (
     FUTURE_TICK_SCHEDULE_FROM_TIMESTAMP,
-    FUTURE_TICK_SCHEDULE_NEW,
-    FUTURE_TICK_SCHEDULE_OLD,
     SCAN_END_OF_DATA,
     SCAN_MAX_STEPS,
     SCAN_PERIODIC_RECORD,
@@ -56,7 +54,7 @@ from .hbt_types import HbtAssetConfig, HbtLegFill, HbtPairBacktestConfig
 from .models import PairMarket, Quote, Signal
 from .strategy import PairPricer, weighted_average
 from .strategy_adapter import FutureSpotPairStrategy, FutureSpotStrategyPayload, default_strategy
-from .ticks import STOCK_FUTURE_TICK_CHANGE_DATE, coerce_trade_date, pair_leg_tick_size
+from .ticks import pair_leg_tick_size
 from .utils import exit_quantity_multiplier
 
 
@@ -255,12 +253,9 @@ class HbtPairBacktester:
             raise ValueError("strategy_engine='numba' currently supports only the default future/spot strategy")
 
     def _future_tick_schedule_mode(self) -> int:
-        trade_date = coerce_trade_date(self.config.future.trade_date)
-        if trade_date is None:
-            return FUTURE_TICK_SCHEDULE_FROM_TIMESTAMP
-        if trade_date >= STOCK_FUTURE_TICK_CHANGE_DATE:
-            return FUTURE_TICK_SCHEDULE_NEW
-        return FUTURE_TICK_SCHEDULE_OLD
+        # PairPricer derives the schedule from Quote.raw, whose HBT timestamp is
+        # the current event time. Mirroring that source keeps both engines exact.
+        return FUTURE_TICK_SCHEDULE_FROM_TIMESTAMP
 
     def _market_from_numba_snapshot(self, scan_result) -> PairMarket | None:
         timestamp = int(scan_result[3])
