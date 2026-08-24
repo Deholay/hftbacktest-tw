@@ -61,6 +61,8 @@ python3 -m pip install -r requirements.txt
 
 ETF 和零股 parquet 只有 top-5 price，沒有 top-5 quantity。converter 預設用 `price_only_depth_qty=1.0`，讓 BBO / depth replay 可以跑起來；但只要策略結果跟 queue size 很有關，就要把它當成結構 replay 測試，不要當成真實 queue-volume model。
 
+Daily parquet 轉檔現在直接用欄式 NumPy array 配合 Numba 建立 event，不會先把每列變成 Python dict。轉檔摘要會分別印出讀檔、event 建立、時間線整理與 NPZ 寫入時間。NPZ 預設仍維持壓縮；如果磁碟空間足夠、比較重視寫入及後續載入速度，可以用 `--npz-compression uncompressed`，Python 呼叫則傳入 `npz_compression="uncompressed"`。
+
 ## 目前 Notebook Flow
 
 1. 把台股 L2 / top-5 data 轉成 hftbacktest event data。

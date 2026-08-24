@@ -38,11 +38,25 @@ from .hbt_helpers import (
 from .hbt_rows import (
     base_row,
 )
+from .hbt_numba import (
+    FUTURE_TICK_SCHEDULE_FROM_TIMESTAMP,
+    FUTURE_TICK_SCHEDULE_NEW,
+    FUTURE_TICK_SCHEDULE_OLD,
+    SCAN_END_OF_DATA,
+    SCAN_MAX_STEPS,
+    SCAN_PERIODIC_RECORD,
+    SCAN_SIGNAL,
+    SIGNAL_EXIT,
+    SIGNAL_HOLD,
+    SIGNAL_LONG,
+    SIGNAL_SHORT,
+    scan_until_wakeup,
+)
 from .hbt_types import HbtAssetConfig, HbtLegFill, HbtPairBacktestConfig
-from .models import PairMarket, Signal
+from .models import PairMarket, Quote, Signal
 from .strategy import PairPricer, weighted_average
-from .strategy_adapter import FutureSpotStrategyPayload, default_strategy
-from .ticks import pair_leg_tick_size
+from .strategy_adapter import FutureSpotPairStrategy, FutureSpotStrategyPayload, default_strategy
+from .ticks import STOCK_FUTURE_TICK_CHANGE_DATE, coerce_trade_date, pair_leg_tick_size
 from .utils import exit_quantity_multiplier
 
 
@@ -56,6 +70,7 @@ class HbtPairBacktester:
         self.config = config
         self.hbtpkg = hbtpkg or import_hftbacktest(workspace_root(config.spot.data))
         self.pricer = PairPricer()
+        self._custom_strategy = strategy is not None
         self.strategy = strategy or default_strategy()
         self.position = build_initial_position(config.pair)
         self.order_id = 1_000_000
@@ -63,61 +78,19 @@ class HbtPairBacktester:
         self.market_rows: list[dict[str, Any]] = []
         self.latency_rows: list[dict[str, Any]] = []
         self.resolved_tick_sizes: dict[str, float] = {}
+        self.scan_calls = 0
+        self.python_decisions = 0
 
     def run(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         hbt = self._build_backtest()
         try:
-            step = 0
-            last_market: PairMarket | None = None
-            last_pricing: Any | None = None
-            while True:
-                if self.config.max_steps is not None and step >= self.config.max_steps:
-                    break
-                if self.config.max_trades is not None and len(self.rows) >= self.config.max_trades:
-                    break
-                if hbt.elapse(self.config.step_ns) != 0:
-                    break
-                step += 1
-
-                market = self._current_market(hbt)
-                if market is None:
-                    continue
-                pricing = self.pricer.price(market)
-                last_market = market
-                last_pricing = pricing
-                decision = self.strategy.decide(
-                    StrategyContext(
-                        strategy_name=getattr(self.strategy, "name", self.strategy.__class__.__name__),
-                        timestamp_ns=int(hbt.current_timestamp),
-                        payload=FutureSpotStrategyPayload(
-                            pair=self.config.pair,
-                            market=market,
-                            pricing=pricing,
-                            position=self.position,
-                            enforce_risk_limits=self.config.enforce_risk_limits,
-                        ),
-                    )
-                )
-                signal = Signal(decision.action)
-                self._record_market_row(hbt, step, market, pricing, signal)
-                if signal == Signal.HOLD:
-                    continue
-                if not decision.should_execute:
-                    self._append_skip_row(hbt, step, signal, market, pricing, decision.reason)
-                    continue
-                self._execute_signal(hbt, step, signal, market, pricing)
-
-            if last_market is not None and last_pricing is not None:
-                last_recorded_step = self.market_rows[-1].get("step") if self.market_rows else None
-                if last_recorded_step != step:
-                    self._record_market_row(
-                        hbt,
-                        step,
-                        last_market,
-                        last_pricing,
-                        Signal.HOLD,
-                        force=True,
-                    )
+            engine = self.config.strategy_engine.strip().lower()
+            if engine == "python":
+                self._run_python(hbt)
+            elif engine == "numba":
+                self._run_numba(hbt)
+            else:
+                raise ValueError(f"strategy_engine must be 'python' or 'numba': {self.config.strategy_engine}")
             trades = pd.DataFrame(self.rows)
             summary = pd.DataFrame([self._summary_row(trades)])
             return trades, summary
@@ -125,6 +98,213 @@ class HbtPairBacktester:
             close = getattr(hbt, "close", None)
             if close is not None:
                 close()
+
+    def _run_python(self, hbt) -> None:
+        step = 0
+        last_market: PairMarket | None = None
+        last_pricing: Any | None = None
+        while True:
+            if self.config.max_steps is not None and step >= self.config.max_steps:
+                break
+            if self.config.max_trades is not None and len(self.rows) >= self.config.max_trades:
+                break
+            if hbt.elapse(self.config.step_ns) != 0:
+                break
+            step += 1
+
+            market = self._current_market(hbt)
+            if market is None:
+                continue
+            pricing = self.pricer.price(market)
+            last_market = market
+            last_pricing = pricing
+            self.python_decisions += 1
+            decision = self._strategy_decision(hbt, market, pricing)
+            signal = Signal(decision.action)
+            self._record_market_row(hbt, step, market, pricing, signal)
+            if signal == Signal.HOLD:
+                continue
+            if not decision.should_execute:
+                self._append_skip_row(hbt, step, signal, market, pricing, decision.reason)
+                continue
+            self._execute_signal(hbt, step, signal, market, pricing)
+
+        self._record_final_market(hbt, step, last_market, last_pricing)
+
+    def _run_numba(self, hbt) -> None:
+        self._validate_numba_strategy()
+        step = 0
+        last_market: PairMarket | None = None
+        last_pricing: Any | None = None
+        pair = self.config.pair
+        interval = self.config.record_market_every_steps or 0
+        position_codes = {
+            Signal.HOLD: SIGNAL_HOLD,
+            Signal.ENTER_LONG_SPOT_SHORT_FUTURE: SIGNAL_LONG,
+            Signal.ENTER_SHORT_SPOT_LONG_FUTURE: SIGNAL_SHORT,
+            Signal.EXIT: SIGNAL_EXIT,
+        }
+
+        while True:
+            if self.config.max_steps is not None and step >= self.config.max_steps:
+                break
+            if self.config.max_trades is not None and len(self.rows) >= self.config.max_trades:
+                break
+            remaining_steps = -1
+            if self.config.max_steps is not None:
+                remaining_steps = self.config.max_steps - step
+
+            self.scan_calls += 1
+            scan_result = scan_until_wakeup(
+                hbt,
+                self.config.step_ns,
+                step,
+                remaining_steps,
+                interval,
+                float(pair.spot_shares_per_pair),
+                float(pair.future_shares_per_pair),
+                float(pair.spot_tick_size or 0.0),
+                float(pair.future_tick_size or 0.0),
+                self._future_tick_schedule_mode(),
+                pair.entry_threshold_pct,
+                pair.exit_threshold_pct,
+                pair.stop_loss_pct,
+                pair.exit_tick_multiple,
+                pair.exit_tick_rule == "gte",
+                pair.min_effective_tick_multiple,
+                pair.allow_short_spot,
+                float(self.position.quantity),
+                position_codes.get(self.position.direction, SIGNAL_HOLD),
+                float("nan") if self.position.entry_basis_pct is None else self.position.entry_basis_pct,
+            )
+            reason = int(scan_result[0])
+            step = int(scan_result[1])
+            compiled_signal = int(scan_result[2])
+
+            if reason in (SCAN_END_OF_DATA, SCAN_MAX_STEPS):
+                market = self._market_from_numba_snapshot(scan_result)
+                if market is not None:
+                    last_market = market
+                    last_pricing = self.pricer.price(market)
+                break
+            if reason not in (SCAN_SIGNAL, SCAN_PERIODIC_RECORD):
+                raise RuntimeError(f"unexpected Numba scanner reason: {reason}")
+
+            market = self._current_market(hbt)
+            if market is None:
+                continue
+            pricing = self.pricer.price(market)
+            last_market = market
+            last_pricing = pricing
+            self.python_decisions += 1
+            decision = self._strategy_decision(hbt, market, pricing)
+            signal = Signal(decision.action)
+            expected_signal = self._signal_from_numba_code(compiled_signal)
+            if signal != expected_signal:
+                raise RuntimeError(
+                    "Numba/Python signal mismatch at "
+                    f"step={step}: numba={expected_signal.value}, python={signal.value}"
+                )
+            self._record_market_row(hbt, step, market, pricing, signal)
+            if signal == Signal.HOLD:
+                continue
+            if not decision.should_execute:
+                self._append_skip_row(hbt, step, signal, market, pricing, decision.reason)
+                continue
+            self._execute_signal(hbt, step, signal, market, pricing)
+
+        self._record_final_market(hbt, step, last_market, last_pricing)
+
+    def _strategy_decision(self, hbt, market: PairMarket, pricing: Any):
+        return self.strategy.decide(
+            StrategyContext(
+                strategy_name=getattr(self.strategy, "name", self.strategy.__class__.__name__),
+                timestamp_ns=int(hbt.current_timestamp),
+                payload=FutureSpotStrategyPayload(
+                    pair=self.config.pair,
+                    market=market,
+                    pricing=pricing,
+                    position=self.position,
+                    enforce_risk_limits=self.config.enforce_risk_limits,
+                ),
+            )
+        )
+
+    def _record_final_market(
+        self,
+        hbt,
+        step: int,
+        last_market: PairMarket | None,
+        last_pricing: Any | None,
+    ) -> None:
+        if last_market is None or last_pricing is None:
+            return
+        last_recorded_step = self.market_rows[-1].get("step") if self.market_rows else None
+        if last_recorded_step != step:
+            self._record_market_row(
+                hbt,
+                step,
+                last_market,
+                last_pricing,
+                Signal.HOLD,
+                force=True,
+            )
+
+    def _validate_numba_strategy(self) -> None:
+        if self._custom_strategy or not isinstance(self.strategy, FutureSpotPairStrategy):
+            raise ValueError("strategy_engine='numba' currently supports only the default future/spot strategy")
+
+    def _future_tick_schedule_mode(self) -> int:
+        trade_date = coerce_trade_date(self.config.future.trade_date)
+        if trade_date is None:
+            return FUTURE_TICK_SCHEDULE_FROM_TIMESTAMP
+        if trade_date >= STOCK_FUTURE_TICK_CHANGE_DATE:
+            return FUTURE_TICK_SCHEDULE_NEW
+        return FUTURE_TICK_SCHEDULE_OLD
+
+    def _market_from_numba_snapshot(self, scan_result) -> PairMarket | None:
+        timestamp = int(scan_result[3])
+        if timestamp < 0:
+            return None
+        values = [float(value) for value in scan_result[4:12]]
+        if not all(value == value for value in values):
+            return None
+        pair = self.config.pair
+        raw = {"exchtime": timestamp, "timestamp": timestamp, "source": "hbt"}
+        return PairMarket(
+            pair=pair,
+            spot=Quote(
+                symbol=pair.spot_symbol,
+                bid=values[0],
+                ask=values[1],
+                bid_size=values[2],
+                ask_size=values[3],
+                raw=raw,
+            ),
+            future=Quote(
+                symbol=pair.future_symbol,
+                bid=values[4],
+                ask=values[5],
+                bid_size=values[6],
+                ask_size=values[7],
+                raw=raw,
+            ),
+            trigger_source="hbt",
+            trigger_symbol=f"{pair.spot_symbol}/{pair.future_symbol}",
+        )
+
+    @staticmethod
+    def _signal_from_numba_code(code: int) -> Signal:
+        mapping = {
+            SIGNAL_HOLD: Signal.HOLD,
+            SIGNAL_LONG: Signal.ENTER_LONG_SPOT_SHORT_FUTURE,
+            SIGNAL_SHORT: Signal.ENTER_SHORT_SPOT_LONG_FUTURE,
+            SIGNAL_EXIT: Signal.EXIT,
+        }
+        try:
+            return mapping[int(code)]
+        except KeyError as exc:
+            raise RuntimeError(f"unknown Numba signal code: {code}") from exc
 
     def _build_backtest(self):
         spot_asset, spot_tick = self._build_asset(self.config.spot)
@@ -789,6 +969,9 @@ class HbtPairBacktester:
             "post_first_feed_poll_ns": self.config.post_first_feed_poll_ns,
             "spot_order_latency_ns": self.config.spot.order_entry_latency_ns,
             "future_order_latency_ns": self.config.future.order_entry_latency_ns,
+            "strategy_engine": self.config.strategy_engine,
+            "scan_calls": self.scan_calls,
+            "python_decisions": self.python_decisions,
         }
 
     def _next_order_id(self) -> int:

@@ -12,7 +12,7 @@ Input assumption:
     bid_price5,bid_volume5,sequence
 
 Output:
-    A compressed npz file with key "data", using HftBacktest event_dtype:
+    An npz file with key "data", using HftBacktest event_dtype:
     ev, exch_ts, local_ts, px, qty, order_id, ival, fval
 
 Important limitations:
@@ -35,6 +35,7 @@ import csv
 import importlib
 import math
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,6 +43,7 @@ from typing import Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from numba import njit
 
 
 DEPTH_EVENT = 1
@@ -371,6 +373,15 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Number of converted rows to use for replay QA. Default: 1000.",
     )
+    parser.add_argument(
+        "--npz-compression",
+        choices=("compressed", "uncompressed"),
+        default="compressed",
+        help=(
+            "NPZ storage mode. 'compressed' preserves the existing smaller output; "
+            "'uncompressed' writes and reloads faster but uses more disk. Default: compressed."
+        ),
+    )
     args = parser.parse_args()
     args.source_kind = normalize_source_kind(args.source_kind)
     input_modes = [args.data_api, bool(args.input_csv), args.daily_parquet]
@@ -616,24 +627,45 @@ def correct_event_order(data: np.ndarray) -> np.ndarray:
     if len(data) == 0:
         return data
 
-    sorted_exch_index = np.argsort(data["exch_ts"], kind="mergesort")
-    sorted_local_index = np.argsort(data["local_ts"], kind="mergesort")
-    out = np.zeros(len(data) * 2, dtype=EVENT_DTYPE)
+    exch_ordered = bool(np.all(data["exch_ts"][1:] >= data["exch_ts"][:-1]))
+    local_ordered = bool(np.all(data["local_ts"][1:] >= data["local_ts"][:-1]))
+    if exch_ordered and local_ordered:
+        out = data.copy()
+        out["ev"] |= np.uint64(EXCH_EVENT | LOCAL_EVENT)
+        return out
 
+    sorted_exch_index = np.argsort(data["exch_ts"], kind="stable")
+    sorted_local_index = np.argsort(data["local_ts"], kind="stable")
+    out = np.empty(len(data) * 2, dtype=EVENT_DTYPE)
+    out_rn = _merge_event_order(data, sorted_exch_index, sorted_local_index, out)
+    return out[:out_rn]
+
+
+@njit(cache=True)
+def _merge_event_order(
+    data: np.ndarray,
+    sorted_exch_index: np.ndarray,
+    sorted_local_index: np.ndarray,
+    out: np.ndarray,
+) -> int:
+    """Merge exchange/local event streams in compiled code for the uncommon reordered case."""
     out_rn = 0
     exch_rn = 0
     local_rn = 0
+    data_len = len(data)
 
-    while exch_rn < len(data) or local_rn < len(data):
-        sorted_exch = data[sorted_exch_index[exch_rn]] if exch_rn < len(data) else None
-        sorted_local = data[sorted_local_index[local_rn]] if local_rn < len(data) else None
-
-        if sorted_exch is not None and sorted_local is not None:
+    while exch_rn < data_len or local_rn < data_len:
+        if exch_rn < data_len and local_rn < data_len:
+            sorted_exch = data[sorted_exch_index[exch_rn]]
+            sorted_local = data[sorted_local_index[local_rn]]
+            px_equal = sorted_exch["px"] == sorted_local["px"] or (
+                np.isnan(sorted_exch["px"]) and np.isnan(sorted_local["px"])
+            )
             same_event = (
                 sorted_exch["exch_ts"] == sorted_local["exch_ts"]
                 and sorted_exch["local_ts"] == sorted_local["local_ts"]
                 and sorted_exch["ev"] == sorted_local["ev"]
-                and sorted_exch["px"] == sorted_local["px"]
+                and px_equal
                 and sorted_exch["qty"] == sorted_local["qty"]
             )
             if same_event:
@@ -642,33 +674,28 @@ def correct_event_order(data: np.ndarray) -> np.ndarray:
                 out_rn += 1
                 exch_rn += 1
                 local_rn += 1
-                continue
-
-            if sorted_exch["exch_ts"] <= sorted_local["exch_ts"]:
+            elif sorted_exch["exch_ts"] <= sorted_local["exch_ts"]:
                 out[out_rn] = sorted_exch
                 out[out_rn]["ev"] |= EXCH_EVENT
                 out_rn += 1
                 exch_rn += 1
-                continue
-
-            out[out_rn] = sorted_local
-            out[out_rn]["ev"] |= LOCAL_EVENT
-            out_rn += 1
-            local_rn += 1
-            continue
-
-        if sorted_exch is not None:
-            out[out_rn] = sorted_exch
+            else:
+                out[out_rn] = sorted_local
+                out[out_rn]["ev"] |= LOCAL_EVENT
+                out_rn += 1
+                local_rn += 1
+        elif exch_rn < data_len:
+            out[out_rn] = data[sorted_exch_index[exch_rn]]
             out[out_rn]["ev"] |= EXCH_EVENT
             out_rn += 1
             exch_rn += 1
         else:
-            out[out_rn] = sorted_local
+            out[out_rn] = data[sorted_local_index[local_rn]]
             out[out_rn]["ev"] |= LOCAL_EVENT
             out_rn += 1
             local_rn += 1
 
-    return out[:out_rn]
+    return out_rn
 
 
 def validate_event_order(data: np.ndarray) -> None:
@@ -740,6 +767,10 @@ class ConversionStats:
     best_ask_mismatches: int = 0
     trade_qty_mismatches: int = 0
     qa_rows_checked: int = 0
+    load_seconds: float = 0.0
+    event_build_seconds: float = 0.0
+    normalize_seconds: float = 0.0
+    write_seconds: float = 0.0
 
     def observe_time(self, exch_ts: int, local_ts: int) -> None:
         latency = local_ts - exch_ts
@@ -826,7 +857,7 @@ def daily_parquet_columns(levels: int) -> list[str]:
     return columns
 
 
-def row_iter_from_daily_parquet(args: argparse.Namespace) -> Iterator[dict[str, object]]:
+def load_daily_parquet_frame(args: argparse.Namespace):
     try:
         import polars as pl
     except ImportError as exc:
@@ -864,7 +895,437 @@ def row_iter_from_daily_parquet(args: argparse.Namespace) -> Iterator[dict[str, 
     sort_columns = [column for column in ("exchtime", "localtime", "sequence") if column in df.columns]
     if sort_columns:
         df = df.sort(sort_columns)
-    yield from df.to_dicts()
+    return df
+
+
+def row_iter_from_daily_parquet(args: argparse.Namespace) -> Iterator[dict[str, object]]:
+    """Compatibility row iterator; the converter itself uses the columnar fast path."""
+    yield from load_daily_parquet_frame(args).to_dicts()
+
+
+def _float_column(df, name: str, default: float = math.nan) -> np.ndarray:
+    """Return a contiguous float64 column without materializing Python row dictionaries."""
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise RuntimeError("daily parquet input requires polars") from exc
+
+    if name not in df.columns:
+        return np.full(df.height, default, dtype=np.float64)
+    series = df.get_column(name)
+    if series.dtype == pl.String:
+        series = series.str.replace_all(",", "")
+    series = series.cast(pl.Float64, strict=False).fill_null(default)
+    # Polars may expose a read-only Arrow-backed view; the converter normalizes
+    # missing values in a few columns, so return an owned writable array.
+    return np.array(series.to_numpy(), dtype=np.float64, copy=True, order="C")
+
+
+def _float_matrix(df, names: list[str]) -> np.ndarray:
+    if not names:
+        return np.empty((df.height, 0), dtype=np.float64)
+    return np.ascontiguousarray(np.column_stack([_float_column(df, name) for name in names]))
+
+
+def _numeric_timestamp_array_to_ns(values: np.ndarray, unit: str) -> np.ndarray:
+    """Vectorized equivalent of numeric timestamp parsing used by the row converter."""
+    values = np.asarray(values)
+    if np.issubdtype(values.dtype, np.integer):
+        source = values.astype(np.int64, copy=False)
+        out = source.copy()
+        if unit == "ns":
+            return out
+        if unit == "us":
+            return out * 1_000
+        if unit == "ms":
+            return out * 1_000_000
+        if unit == "s":
+            return out * 1_000_000_000
+        abs_values = np.abs(source)
+        out[abs_values < 100_000_000_000] *= 1_000_000_000
+        us_mask = (abs_values >= 100_000_000_000_000) & (abs_values < 100_000_000_000_000_000)
+        out[us_mask] *= 1_000
+        ms_mask = (abs_values >= 100_000_000_000) & (abs_values < 100_000_000_000_000)
+        out[ms_mask] *= 1_000_000
+        return out
+
+    source = values.astype(np.float64, copy=False)
+    if unit == "ns":
+        scale = np.ones(len(source), dtype=np.float64)
+    elif unit == "us":
+        scale = np.full(len(source), 1_000.0)
+    elif unit == "ms":
+        scale = np.full(len(source), 1_000_000.0)
+    elif unit == "s":
+        scale = np.full(len(source), 1_000_000_000.0)
+    else:
+        abs_values = np.abs(source)
+        scale = np.ones(len(source), dtype=np.float64)
+        scale[abs_values < 1e11] = 1_000_000_000.0
+        scale[(abs_values >= 1e11) & (abs_values < 1e14)] = 1_000_000.0
+        scale[(abs_values >= 1e14) & (abs_values < 1e17)] = 1_000.0
+    return (source * scale).astype(np.int64)
+
+
+def _timestamp_column_to_ns(
+    df,
+    name: str,
+    args: argparse.Namespace,
+    fallback: np.ndarray | None = None,
+) -> np.ndarray:
+    """Convert a Polars timestamp column while keeping numeric data vectorized."""
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise RuntimeError("daily parquet input requires polars") from exc
+
+    if name not in df.columns:
+        if fallback is None:
+            raise ValueError(f"daily parquet source missing timestamp column: {name}")
+        return fallback.copy()
+
+    series = df.get_column(name)
+    missing = series.is_null().to_numpy()
+    dtype = series.dtype
+    if dtype.is_integer():
+        values = series.fill_null(0).to_numpy()
+        result = _numeric_timestamp_array_to_ns(values, args.timestamp_unit)
+    elif dtype.is_float():
+        values = series.fill_null(0.0).to_numpy()
+        result = _numeric_timestamp_array_to_ns(values, args.timestamp_unit)
+    elif dtype.is_temporal():
+        if dtype == pl.Date:
+            result = series.cast(pl.Datetime("ns")).cast(pl.Int64).fill_null(0).to_numpy()
+        else:
+            result = series.dt.cast_time_unit("ns").cast(pl.Int64).fill_null(0).to_numpy()
+        result = np.asarray(result, dtype=np.int64)
+    else:
+        tz = ZoneInfo(args.timezone)
+        parsed: list[int] = []
+        missing_list: list[bool] = []
+        for value in series.to_list():
+            is_missing = value is None or str(value).strip() == ""
+            missing_list.append(is_missing)
+            parsed.append(0 if is_missing else parse_timestamp(value, args.timestamp_unit, args.date, tz))
+        result = np.asarray(parsed, dtype=np.int64)
+        missing = np.asarray(missing_list, dtype=bool)
+
+    if fallback is not None:
+        # The legacy row path falls back for None, empty strings, and numeric zero.
+        missing = missing | (result == 0)
+        result[missing] = fallback[missing]
+    elif np.any(missing):
+        raise ValueError(f"daily parquet timestamp column {name!r} contains null values")
+    return np.ascontiguousarray(result, dtype=np.int64)
+
+
+@njit(cache=True)
+def _write_event(
+    out: np.ndarray,
+    out_rn: int,
+    ev: int,
+    exch_ts: int,
+    local_ts: int,
+    px: float,
+    qty: float,
+) -> int:
+    out[out_rn]["ev"] = ev
+    out[out_rn]["exch_ts"] = exch_ts
+    out[out_rn]["local_ts"] = local_ts
+    out[out_rn]["px"] = px
+    out[out_rn]["qty"] = qty
+    out[out_rn]["order_id"] = 0
+    out[out_rn]["ival"] = 0
+    out[out_rn]["fval"] = 0.0
+    return out_rn + 1
+
+
+@njit(cache=True)
+def _aggregate_depth_side(
+    prices: np.ndarray,
+    quantities: np.ndarray,
+    row: int,
+    volume_scale: float,
+    price_only_depth_qty: float,
+    use_price_only_depth_qty: bool,
+    ascending: bool,
+    work_prices: np.ndarray,
+    work_quantities: np.ndarray,
+) -> int:
+    count = 0
+    for level in range(prices.shape[1]):
+        px = prices[row, level]
+        qty = quantities[row, level]
+        if (not np.isfinite(qty)) and use_price_only_depth_qty and np.isfinite(px) and px > 0.0:
+            qty = price_only_depth_qty
+        qty *= volume_scale
+        if not (np.isfinite(px) and px > 0.0 and np.isfinite(qty) and qty > 0.0):
+            continue
+
+        found = -1
+        for index in range(count):
+            if work_prices[index] == px:
+                found = index
+                break
+        if found >= 0:
+            work_quantities[found] += qty
+        else:
+            work_prices[count] = px
+            work_quantities[count] = qty
+            count += 1
+
+    # Top-5 is tiny; insertion sort avoids allocating a temporary array for every source row.
+    for index in range(1, count):
+        px = work_prices[index]
+        qty = work_quantities[index]
+        cursor = index - 1
+        while cursor >= 0 and (
+            (ascending and work_prices[cursor] > px)
+            or ((not ascending) and work_prices[cursor] < px)
+        ):
+            work_prices[cursor + 1] = work_prices[cursor]
+            work_quantities[cursor + 1] = work_quantities[cursor]
+            cursor -= 1
+        work_prices[cursor + 1] = px
+        work_quantities[cursor + 1] = qty
+    return count
+
+
+@njit(cache=True)
+def _fill_events_from_columns(
+    out: np.ndarray,
+    exch_ts: np.ndarray,
+    local_ts: np.ndarray,
+    total_volume: np.ndarray,
+    last_price: np.ndarray,
+    bid_prices: np.ndarray,
+    bid_quantities: np.ndarray,
+    ask_prices: np.ndarray,
+    ask_quantities: np.ndarray,
+    volume_scale: float,
+    price_only_depth_qty: float,
+    use_price_only_depth_qty: bool,
+    emit_trades: bool,
+    trade_side_code: int,
+    emit_depth: bool,
+    qa_sample_rows: int,
+) -> tuple[int, int, int, float, int, int, int]:
+    out_rn = 0
+    trade_events = 0
+    depth_events = 0
+    opening_jump_qty = 0.0
+    best_bid_mismatches = 0
+    best_ask_mismatches = 0
+    qa_rows_checked = 0
+    previous_total_volume = 0
+    has_previous_volume = False
+    previous_bid = np.nan
+    previous_ask = np.nan
+    previous_last_price = np.nan
+    replay_best_bid = np.nan
+    replay_best_ask = np.nan
+
+    levels = bid_prices.shape[1]
+    work_prices = np.empty(levels, dtype=np.float64)
+    work_quantities = np.empty(levels, dtype=np.float64)
+
+    for row in range(len(exch_ts)):
+        if emit_trades and has_previous_volume:
+            delta_volume = total_volume[row] - previous_total_volume
+            px = last_price[row]
+            if delta_volume > 0 and np.isfinite(px) and px > 0.0:
+                qty = delta_volume * volume_scale
+                if previous_total_volume == 0:
+                    opening_jump_qty += qty
+                if trade_side_code == 1:
+                    side = BUY_EVENT
+                elif trade_side_code == -1:
+                    side = SELL_EVENT
+                elif np.isfinite(previous_ask) and px >= previous_ask:
+                    side = BUY_EVENT
+                elif np.isfinite(previous_bid) and px <= previous_bid:
+                    side = SELL_EVENT
+                elif np.isfinite(previous_last_price) and px < previous_last_price:
+                    side = SELL_EVENT
+                else:
+                    side = BUY_EVENT
+                out_rn = _write_event(
+                    out, out_rn, TRADE_EVENT | side, exch_ts[row], local_ts[row], px, qty
+                )
+                trade_events += 1
+
+        if emit_depth:
+            bid_count = _aggregate_depth_side(
+                bid_prices,
+                bid_quantities,
+                row,
+                volume_scale,
+                price_only_depth_qty,
+                use_price_only_depth_qty,
+                False,
+                work_prices,
+                work_quantities,
+            )
+            if bid_count > 0:
+                out_rn = _write_event(
+                    out,
+                    out_rn,
+                    DEPTH_CLEAR_EVENT | BUY_EVENT,
+                    exch_ts[row],
+                    local_ts[row],
+                    work_prices[bid_count - 1],
+                    0.0,
+                )
+                depth_events += 1
+                for index in range(bid_count):
+                    out_rn = _write_event(
+                        out,
+                        out_rn,
+                        DEPTH_SNAPSHOT_EVENT | BUY_EVENT,
+                        exch_ts[row],
+                        local_ts[row],
+                        work_prices[index],
+                        work_quantities[index],
+                    )
+                    depth_events += 1
+                replay_best_bid = work_prices[0]
+
+            ask_count = _aggregate_depth_side(
+                ask_prices,
+                ask_quantities,
+                row,
+                volume_scale,
+                price_only_depth_qty,
+                use_price_only_depth_qty,
+                True,
+                work_prices,
+                work_quantities,
+            )
+            if ask_count > 0:
+                out_rn = _write_event(
+                    out,
+                    out_rn,
+                    DEPTH_CLEAR_EVENT | SELL_EVENT,
+                    exch_ts[row],
+                    local_ts[row],
+                    work_prices[ask_count - 1],
+                    0.0,
+                )
+                depth_events += 1
+                for index in range(ask_count):
+                    out_rn = _write_event(
+                        out,
+                        out_rn,
+                        DEPTH_SNAPSHOT_EVENT | SELL_EVENT,
+                        exch_ts[row],
+                        local_ts[row],
+                        work_prices[index],
+                        work_quantities[index],
+                    )
+                    depth_events += 1
+                replay_best_ask = work_prices[0]
+
+        if qa_rows_checked < qa_sample_rows:
+            expected_bid = bid_prices[row, 0]
+            expected_ask = ask_prices[row, 0]
+            if (
+                np.isfinite(expected_bid)
+                and expected_bid > 0.0
+                and (not np.isfinite(replay_best_bid) or abs(replay_best_bid - expected_bid) > 1e-9)
+            ):
+                best_bid_mismatches += 1
+            if (
+                np.isfinite(expected_ask)
+                and expected_ask > 0.0
+                and (not np.isfinite(replay_best_ask) or abs(replay_best_ask - expected_ask) > 1e-9)
+            ):
+                best_ask_mismatches += 1
+            qa_rows_checked += 1
+
+        previous_total_volume = total_volume[row]
+        has_previous_volume = True
+        previous_bid = bid_prices[row, 0]
+        previous_ask = ask_prices[row, 0]
+        previous_last_price = last_price[row]
+
+    return (
+        out_rn,
+        trade_events,
+        depth_events,
+        opening_jump_qty,
+        best_bid_mismatches,
+        best_ask_mismatches,
+        qa_rows_checked,
+    )
+
+
+def build_events_from_parquet_frame(
+    df,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, ConversionStats]:
+    """Build events from column arrays, avoiding per-row dictionaries and event tuples."""
+    stats = ConversionStats(input_rows=df.height, converted_rows=df.height)
+    if df.height == 0:
+        return np.empty(0, dtype=EVENT_DTYPE), stats
+
+    started = time.perf_counter()
+    exch_ts = _timestamp_column_to_ns(df, "exchtime", args)
+    local_ts = _timestamp_column_to_ns(df, "localtime", args, fallback=exch_ts)
+    total_volume_float = _float_column(df, "total_volume", default=0.0)
+    total_volume_float[~np.isfinite(total_volume_float)] = 0.0
+    total_volume = np.ascontiguousarray(total_volume_float.astype(np.int64))
+    last_price = _float_column(df, "last_price")
+    bid_prices = _float_matrix(df, [f"bid_price{level}" for level in range(1, args.levels + 1)])
+    ask_prices = _float_matrix(df, [f"ask_price{level}" for level in range(1, args.levels + 1)])
+    bid_quantities = _float_matrix(df, [f"bid_volume{level}" for level in range(1, args.levels + 1)])
+    ask_quantities = _float_matrix(df, [f"ask_volume{level}" for level in range(1, args.levels + 1)])
+
+    max_events_per_row = 2 * args.levels + 3
+    raw = np.empty(df.height * max_events_per_row, dtype=EVENT_DTYPE)
+    trade_side_code = {"buy": 1, "sell": -1, "infer": 0, "none": 0}[args.trade_side]
+    price_only_depth_qty = 0.0 if args.price_only_depth_qty is None else args.price_only_depth_qty
+    (
+        output_rows,
+        stats.trade_events,
+        stats.depth_events,
+        stats.opening_jump_qty,
+        stats.best_bid_mismatches,
+        stats.best_ask_mismatches,
+        stats.qa_rows_checked,
+    ) = _fill_events_from_columns(
+        raw,
+        exch_ts,
+        local_ts,
+        total_volume,
+        last_price,
+        bid_prices,
+        bid_quantities,
+        ask_prices,
+        ask_quantities,
+        args.volume_scale,
+        price_only_depth_qty,
+        args.price_only_depth_qty is not None,
+        not args.no_trades and args.trade_side != "none",
+        trade_side_code,
+        not args.no_depth,
+        args.qa_sample_rows,
+    )
+    stats.event_build_seconds = time.perf_counter() - started
+    stats.raw_events = output_rows
+
+    stats.first_exch_ts = int(np.min(exch_ts))
+    stats.last_exch_ts = int(np.max(exch_ts))
+    latency = local_ts - exch_ts
+    stats.min_feed_latency = int(np.min(latency))
+    stats.max_feed_latency = int(np.max(latency))
+
+    started = time.perf_counter()
+    data = correct_local_timestamp(raw[:output_rows], args.base_latency_ns)
+    data = correct_event_order(data)
+    validate_event_order(data)
+    stats.normalize_seconds = time.perf_counter() - started
+    stats.output_events = len(data)
+    return data, stats
 
 
 def build_events_from_rows(
@@ -1003,18 +1464,32 @@ def print_summary(stats: ConversionStats, output: Path) -> None:
     print(f"best_bid_mismatches={stats.best_bid_mismatches}")
     print(f"best_ask_mismatches={stats.best_ask_mismatches}")
     print(f"trade_qty_mismatches={stats.trade_qty_mismatches}")
+    print(f"load_seconds={stats.load_seconds:.6f}")
+    print(f"event_build_seconds={stats.event_build_seconds:.6f}")
+    print(f"normalize_seconds={stats.normalize_seconds:.6f}")
+    print(f"write_seconds={stats.write_seconds:.6f}")
     print(f"output={output}")
 
 
 def convert(args: argparse.Namespace) -> np.ndarray:
+    load_started = time.perf_counter()
     if args.data_api:
         rows = row_iter_from_data_api(args)
+        load_seconds = 0.0  # The lazy row iterator performs its load during event building.
+        build_started = time.perf_counter()
+        data, stats = build_events_from_rows(rows, args)
+        stats.event_build_seconds = time.perf_counter() - build_started
     elif args.daily_parquet:
-        rows = row_iter_from_daily_parquet(args)
+        frame = load_daily_parquet_frame(args)
+        load_seconds = time.perf_counter() - load_started
+        data, stats = build_events_from_parquet_frame(frame, args)
     else:
         rows = row_iter_from_csv(args)
-
-    data, stats = build_events_from_rows(rows, args)
+        load_seconds = 0.0  # CSV reading is lazy and included in event_build_seconds.
+        build_started = time.perf_counter()
+        data, stats = build_events_from_rows(rows, args)
+        stats.event_build_seconds = time.perf_counter() - build_started
+    stats.load_seconds = load_seconds
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     prices = data["px"]
@@ -1024,7 +1499,9 @@ def convert(args: argparse.Namespace) -> np.ndarray:
     event_kind_mask = np.uint64(~EVENT_FLAG_MASK & np.iinfo(np.uint64).max)
     kinds = data["ev"].astype(np.uint64, copy=False) & event_kind_mask
     latency = data["local_ts"] - data["exch_ts"]
-    np.savez_compressed(
+    save_npz = np.savez if getattr(args, "npz_compression", "compressed") == "uncompressed" else np.savez_compressed
+    write_started = time.perf_counter()
+    save_npz(
         args.output,
         data=data,
         min_price=np.asarray([min_price], dtype=np.float64),
@@ -1040,6 +1517,7 @@ def convert(args: argparse.Namespace) -> np.ndarray:
         ),
         trade_events=np.asarray([int(np.sum(kinds == TRADE_EVENT))], dtype=np.int64),
     )
+    stats.write_seconds = time.perf_counter() - write_started
     print_summary(stats, args.output)
     return data
 
@@ -1093,6 +1571,7 @@ def convert_tw_stock_to_npz(
     no_depth: bool = False,
     no_trades: bool = False,
     qa_sample_rows: int = 1000,
+    npz_compression: str = "compressed",
 ) -> tuple[Path, np.ndarray]:
     """Convert one Taiwan top-5 symbol/time window to an HftBacktest npz file."""
     root = Path.cwd() if workspace_root is None else workspace_root
@@ -1108,6 +1587,8 @@ def convert_tw_stock_to_npz(
         daily_parquet_dir = daily_parquet_dir or default_daily_parquet_dir(root, source_kind, path_config)
     if price_only_depth_qty is None and source_kind in PRICE_ONLY_DEPTH_SOURCE_KINDS:
         price_only_depth_qty = 1.0
+    if npz_compression not in {"compressed", "uncompressed"}:
+        raise ValueError("npz_compression must be 'compressed' or 'uncompressed'")
 
     tz = ZoneInfo(timezone_name)
     start_exch_ts = parse_timestamp(start_time, timestamp_unit, start_date, tz) if start_time else None
@@ -1151,6 +1632,7 @@ def convert_tw_stock_to_npz(
         start_exch_ts=start_exch_ts,
         end_exch_ts=end_exch_ts,
         qa_sample_rows=qa_sample_rows,
+        npz_compression=npz_compression,
     )
     data = convert(args)
     return output_path, data

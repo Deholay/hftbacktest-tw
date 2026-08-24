@@ -66,6 +66,13 @@ Column index check against the stock top-5 schema:
 
 ETF and Odd Lot parquet data only contain top-5 prices, not top-5 quantities. Their converters use `price_only_depth_qty=1.0` by default so BBO/depth replay can run, but queue-size-sensitive strategy output should be read as a structural replay test rather than a true queue-volume model.
 
+Daily-parquet conversion uses a columnar NumPy/Numba event builder rather than
+materializing one Python dictionary per source row. Conversion summaries print
+separate load, event-build, normalization, and write timings. NPZ output remains
+compressed by default; use `--npz-compression uncompressed` (or
+`npz_compression="uncompressed"` in Python) when faster writes and subsequent
+loads matter more than disk usage.
+
 ## Current Notebook Flow
 
 1. Convert TW stock L2/top-5 data into hftbacktest event data.

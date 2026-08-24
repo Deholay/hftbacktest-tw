@@ -1,5 +1,6 @@
 # Core numeric/data stack.
 numpy>=2.0,<2.3
+numba>=0.61
 pandas>=2.2
 pyarrow>=15
 polars>=1.0

@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("output/hbt_pair_backtest"))
     parser.add_argument("--first-leg", choices=["stock", "future"], default="future")
     parser.add_argument("--step-ms", type=float, default=1000.0)
+    parser.add_argument(
+        "--strategy-engine",
+        choices=["numba", "python"],
+        default="numba",
+        help="Numba scans HOLD-only spans in compiled code; Python is the reference/fallback engine.",
+    )
     parser.add_argument("--order-latency-ms", type=float, default=0.0)
     parser.add_argument("--response-latency-ms", type=float, default=0.0)
     parser.add_argument("--feed-latency-offset-ms", type=float, default=0.0)
@@ -93,6 +99,7 @@ def main() -> None:
         flatten_on_second_leg_failure=not args.no_flatten,
         second_leg_profit_check=not args.no_second_leg_profit_check,
         record_market_every_steps=args.record_market_every_steps,
+        strategy_engine=args.strategy_engine,
     )
 
     backtester = HbtPairBacktester(run_config)

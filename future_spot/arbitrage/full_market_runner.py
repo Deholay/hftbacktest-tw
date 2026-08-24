@@ -118,6 +118,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rebuild-event-data", action="store_true")
     parser.add_argument("--conversion-qa-sample-rows", type=int, default=1000)
     parser.add_argument(
+        "--npz-compression",
+        choices=("compressed", "uncompressed"),
+        default="compressed",
+        help="Use uncompressed for faster event-file writes and reloads at the cost of disk space.",
+    )
+    parser.add_argument(
         "--spot-input-csv-template",
         default=DEFAULT_SPOT_INPUT_CSV_TEMPLATE,
         help=(
@@ -139,6 +145,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--first-leg", choices=("stock", "future"), default="future")
     parser.add_argument("--step-ms", type=float, default=1000.0)
+    parser.add_argument(
+        "--strategy-engine",
+        choices=("numba", "python"),
+        default="numba",
+        help="Numba scans HOLD-only spans in compiled code; Python is the reference/fallback engine.",
+    )
     parser.add_argument("--order-latency-ms", type=float, default=0.0)
     parser.add_argument("--response-latency-ms", type=float, default=0.0)
     parser.add_argument("--feed-latency-offset-ms", type=float, default=0.0)
@@ -545,6 +557,7 @@ def ensure_spot_events(args: argparse.Namespace, symbol: str, trade_date: str) -
             data_platform_base=args.data_platform_base,
             levels=5,
             qa_sample_rows=args.conversion_qa_sample_rows,
+            npz_compression=args.npz_compression,
         )
         return EventDataResult(path, "generated")
     except Exception as exc:
@@ -713,6 +726,7 @@ def ensure_future_events(args: argparse.Namespace, symbol: str, trade_date: str)
             daily_parquet_dir=args.event_futures_parquet_dir,
             levels=5,
             qa_sample_rows=args.conversion_qa_sample_rows,
+            npz_compression=args.npz_compression,
         )
         return EventDataResult(path, "generated")
     except Exception as exc:
@@ -1140,6 +1154,7 @@ def build_pair_hbt_config(
         flatten_on_second_leg_failure=not args.no_flatten,
         second_leg_profit_check=not args.no_second_leg_profit_check,
         record_market_every_steps=None if args.record_market_every_steps <= 0 else args.record_market_every_steps,
+        strategy_engine=getattr(args, "strategy_engine", "numba"),
     )
 
 

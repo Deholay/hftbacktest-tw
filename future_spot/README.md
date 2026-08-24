@@ -93,8 +93,13 @@ poetry run python /home/zoufuc/hftbacktest/future_spot/scripts/run_hbt_daily_ful
   --tpex-daily-template '/mnt/z/TPEX/每日資料/{ldate_nodash}.ftr' \
   --spot-input-csv-template '/mnt/z/FubunData/tick_csv/twstock_{date_nodash}.csv' \
   --data-platform-base '/mnt/z/數據平台' \
-  --event-futures-parquet-dir '/mnt/z/ticks_parquet_stock_future'
+  --event-futures-parquet-dir '/mnt/z/ticks_parquet_stock_future' \
+  --npz-compression uncompressed
 ```
+
+`uncompressed` trades larger event files for faster conversion writes and
+faster repeated HftBacktest loads. Omit the option to keep smaller compressed
+NPZ files.
 
 For latency observation, add non-zero order latency:
 
