@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from arbitrage import daily_pipeline, event_data, hbt_pipeline, reporting
+from arbitrage import daily_pipeline, hbt_pipeline, reporting
 from arbitrage.daily_pipeline import DailyPairRecord
 
 try:  # Package import (future_spot.test) and direct script/notebook import.
@@ -41,30 +41,26 @@ def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
     args = prepare_args(args)
     trade_dates = daily_pipeline.select_trade_dates(args.calendar, args.start_date, args.end_date)
 
-    records, build_status = daily_pipeline.build_daily_pair_records(args, trade_dates)
+    base_records, build_status = daily_pipeline.build_daily_pair_records(args, trade_dates)
+    outputs = hbt_pipeline.execute_hbt_runs(args, base_records, trade_dates)
+    records = outputs.records
+    event_paths = outputs.event_paths
+    pair_results = outputs.pair_results
+    summary = outputs.summary
+    trades = outputs.trades
+    market = outputs.market
+    latency = outputs.latency
+    run_errors = outputs.run_errors
+    conversion_status = outputs.conversion_status
+    settings = outputs.settings
     pair_universe = daily_pipeline.pair_universe_frame(records)
     _write_frames(args.output_dir, {
         "daily_config_build_status": build_status,
         "daily_pair_universe": pair_universe,
+        "conversion_status": conversion_status,
+        "hbt_settings": settings,
+        "position_carry_status": outputs.position_carry_status,
     })
-
-    cache_hit = hbt_pipeline.hbt_cache_is_valid(args, records)
-    if cache_hit:
-        logging.info("valid result manifest found; skip event preparation and NPZ audit")
-        event_paths = {}
-        conversion_status = hbt_pipeline.read_csv_if_exists(args.output_dir / "conversion_status.csv")
-        settings = hbt_pipeline.read_csv_if_exists(args.output_dir / "hbt_settings.csv")
-    else:
-        event_paths, conversion_status = event_data.build_event_data(args, records)
-        settings = hbt_pipeline.hbt_settings_frame(args, records, event_paths)
-        _write_frames(args.output_dir, {
-            "conversion_status": conversion_status,
-            "hbt_settings": settings,
-        })
-
-    pair_results, summary, trades, market, latency, run_errors = hbt_pipeline.run_or_load_backtests(
-        args, records, event_paths
-    )
     if args.post_first_feed_wait != "none" and not summary.empty and "post_first_feed_wait" not in summary.columns:
         raise RuntimeError(
             "Loaded incompatible cached results: summary is missing post_first_feed_wait. "
@@ -78,7 +74,7 @@ def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
         "run_errors": run_errors,
     }
     _write_frames(args.output_dir, core_frames)
-    if not cache_hit:
+    if not outputs.cache_hit:
         manifest = hbt_pipeline.write_hbt_manifest(args, records)
         logging.info("wrote backtest manifest to %s", manifest)
 
@@ -100,8 +96,10 @@ def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
         "run_errors": run_errors,
         "entry_exit_all": entry_exit_all,
         "entry_exit_index": entry_exit_index,
+        "position_carry_status": outputs.position_carry_status,
     }
     logging.info("core backtest outputs saved to %s", args.output_dir)
+    hbt_pipeline.raise_for_expiry_position_errors(args, outputs.position_carry_status)
     return BacktestArtifacts(args, trade_dates, records, event_paths, pair_results, frames)
 
 

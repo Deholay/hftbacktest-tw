@@ -30,6 +30,8 @@ Fast defaults:
   signal row is retained;
 - existing event NPZ files bypass daily CSV splitting;
 - a parameter/input/code manifest validates cached HBT results before reuse.
+- final positions are restored on the next trade day by default; held contracts
+  stay in the universe until exit, with no automatic futures rollover.
 
 Useful controls:
 
@@ -44,4 +46,10 @@ python future_spot/test/run_full_backtest.py \
 
 # Force a valid-cache bypass after intentional strategy/config changes.
 python future_spot/test/run_full_backtest.py --rebuild-hbt-results
+
+# Legacy independent pair/day HBT with no position carry.
+python future_spot/test/run_full_backtest.py --no-carry-positions
+
+# Disable futures/spot leverage in the capital replay (100% capital per leg).
+python future_spot/test/run_full_backtest.py --no-leverage
 ```

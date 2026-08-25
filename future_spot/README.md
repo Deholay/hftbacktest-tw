@@ -19,6 +19,7 @@ Key files:
 - `entry_exit_index.csv`: per-pair entry/exit row counts.
 - `market_all_daily_pairs.csv`: sampled market state and signal hits.
 - `latency_all_daily_pairs.csv`: long-format local / spot exchange / future exchange latency events.
+- `position_carry_status.csv`: initial/final quantity, universe source, expiry date, and next-day carry audit.
 - `run_errors.csv`: run errors; should be empty for a clean run.
 
 Notebook/test runner:
@@ -52,6 +53,24 @@ The complete workflow, including report CSV and PNG generation, is:
 
 ```bash
 python future_spot/test/run_full_backtest.py --start-date 2026-05-21 --end-date 2026-05-26
+```
+
+Cross-day position carry is enabled by default. Dates run sequentially, pairs
+within a date still use `--workers`, and any held old contract is added back to
+the next day's universe. The runner never rolls an old contract into the new
+front month; a residual position on the expiry date is an error. Use
+`--no-carry-positions` only to reproduce the legacy independent pair/day mode.
+
+The capital replay defaults to NT$50M with 20% futures margin and 40% spot own
+funds. Toggle the financing assumptions without changing the market-data/HBT
+inputs:
+
+```bash
+# Leveraged capital replay (default).
+python future_spot/test/run_full_backtest.py --leverage
+
+# Both futures and spot consume 100% own capital.
+python future_spot/test/run_full_backtest.py --no-leverage
 ```
 
 All options accepted by the existing full-market runner are accepted by this

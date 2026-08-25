@@ -43,6 +43,10 @@ from scripts.io_utils import (  # noqa: E402
     write_parquet,
 )
 from arbitrage.config import load_config  # noqa: E402
+from arbitrage.capital import (  # noqa: E402
+    CapitalAllocationConfig,
+    build_capital_constraint_outputs,
+)
 from arbitrage.hbt_backtest import (  # noqa: E402
     HbtAssetConfig,
     HbtPairBacktestConfig,
@@ -50,6 +54,13 @@ from arbitrage.hbt_backtest import (  # noqa: E402
 )
 from arbitrage.hbt_helpers import hbt_asset_audit  # noqa: E402
 from arbitrage.models import PairConfig, Signal  # noqa: E402
+from arbitrage.position_carry import (  # noqa: E402
+    PositionKey,
+    PositionSnapshot,
+    futures_contract_expiry_date,
+    position_key,
+    snapshot_from_summary_row,
+)
 from build_arbitrage_config_from_date import (  # noqa: E402
     BuildArbitrageConfigResult,
     build_arbitrage_config_from_date,
@@ -74,6 +85,8 @@ class DailyPairRecord:
     run_key: str
     pair: PairConfig
     config_path: Path
+    universe_source: str = "selected"
+    carried_from_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +94,22 @@ class EventDataResult:
     path: Path | None
     status: str
     error: str | None = None
+
+
+@dataclass
+class HbtRunOutputs:
+    records: list[DailyPairRecord]
+    event_paths: dict[str, dict[str, Path]]
+    pair_results: dict[str, dict[str, pd.DataFrame]]
+    summary: pd.DataFrame
+    trades: pd.DataFrame
+    market: pd.DataFrame
+    latency: pd.DataFrame
+    run_errors: pd.DataFrame
+    conversion_status: pd.DataFrame
+    settings: pd.DataFrame
+    position_carry_status: pd.DataFrame
+    cache_hit: bool
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -182,6 +211,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-second-leg-adjusted-basis-pct", type=float, default=None)
     parser.add_argument("--no-second-leg-profit-check", action="store_true")
     parser.add_argument("--no-flatten", action="store_true")
+    parser.add_argument(
+        "--carry-positions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Carry final pair positions into the next trade day and keep held contracts in the daily universe. "
+            "Use --no-carry-positions for independent pair/day runs."
+        ),
+    )
+
+    parser.add_argument(
+        "--total-capital",
+        type=float,
+        default=50_000_000.0,
+        help="Shared futures/spot own-capital budget used by the saved-fill capital replay.",
+    )
+    parser.add_argument(
+        "--futures-margin-rate",
+        type=float,
+        default=0.20,
+        help="Futures initial-margin assumption used by the capital replay.",
+    )
+    parser.add_argument(
+        "--spot-equity-rate",
+        type=float,
+        default=0.40,
+        help="Spot own-funds ratio after margin financing used by the capital replay.",
+    )
+    parser.add_argument(
+        "--leverage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable the configured futures margin and spot financing ratios. "
+            "Use --no-leverage to charge 100%% capital to both legs."
+        ),
+    )
 
     parser.add_argument("--skip-entry-exit-by-pair", action="store_true")
     parser.add_argument("--skip-detailed-reports", action="store_true")
@@ -208,33 +274,24 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     trade_dates = select_trade_dates(args.calendar, args.start_date, args.end_date)
-    records, build_status = build_daily_pair_records(args, trade_dates)
+    base_records, build_status = build_daily_pair_records(args, trade_dates)
     write_csv(build_status, args.output_dir / "daily_config_build_status.csv")
+    outputs = execute_hbt_runs(args, base_records, trade_dates)
+    records = outputs.records
     pair_universe = pair_universe_frame(records)
     write_csv(pair_universe, args.output_dir / "daily_pair_universe.csv")
-
-    cache_hit = hbt_cache_is_valid(args, records)
-    if cache_hit:
-        logging.info("valid result manifest found; skip event preparation and NPZ audit")
-        event_paths = {}
-        conversion_status = read_csv_if_exists(args.output_dir / "conversion_status.csv")
-        settings = read_csv_if_exists(args.output_dir / "hbt_settings.csv")
-    else:
-        event_paths, conversion_status = build_event_data(args, records)
-        write_csv(conversion_status, args.output_dir / "conversion_status.csv")
-        settings = hbt_settings_frame(args, records, event_paths)
-        write_csv(settings, args.output_dir / "hbt_settings.csv")
-
-    pair_results, summary, trades, market, latency, run_errors = run_or_load_backtests(args, records, event_paths)
-    write_csv(summary, args.output_dir / "summary_all_daily_pairs.csv")
-    write_csv(trades, args.output_dir / "trades_all_daily_pairs.csv")
-    write_csv(market, args.output_dir / "market_all_daily_pairs.csv")
-    write_csv(latency, args.output_dir / "latency_all_daily_pairs.csv")
-    write_csv(run_errors, args.output_dir / "run_errors.csv")
-    if not cache_hit:
+    write_csv(outputs.conversion_status, args.output_dir / "conversion_status.csv")
+    write_csv(outputs.settings, args.output_dir / "hbt_settings.csv")
+    write_csv(outputs.position_carry_status, args.output_dir / "position_carry_status.csv")
+    write_csv(outputs.summary, args.output_dir / "summary_all_daily_pairs.csv")
+    write_csv(outputs.trades, args.output_dir / "trades_all_daily_pairs.csv")
+    write_csv(outputs.market, args.output_dir / "market_all_daily_pairs.csv")
+    write_csv(outputs.latency, args.output_dir / "latency_all_daily_pairs.csv")
+    write_csv(outputs.run_errors, args.output_dir / "run_errors.csv")
+    if not outputs.cache_hit:
         write_hbt_manifest(args, records)
 
-    entry_exit_by_pair, entry_exit_all, entry_exit_index = build_entry_exit_outputs(pair_results, records)
+    entry_exit_by_pair, entry_exit_all, entry_exit_index = build_entry_exit_outputs(outputs.pair_results, records)
     write_csv(entry_exit_all, args.output_dir / "entry_exit_all_daily_pairs.csv")
     write_csv(entry_exit_index, args.output_dir / "entry_exit_index.csv")
     if not args.skip_entry_exit_by_pair:
@@ -244,11 +301,12 @@ def main() -> int:
         "done dates=%s daily_pairs=%s ready_pairs=%s completed_pairs=%s errors=%s output=%s",
         len(trade_dates),
         len(records),
-        len(event_paths),
-        len(pair_results),
-        len(run_errors),
+        len(outputs.event_paths),
+        len(outputs.pair_results),
+        len(outputs.run_errors),
         args.output_dir,
     )
+    raise_for_expiry_position_errors(args, outputs.position_carry_status)
     return 0
 
 
@@ -470,11 +528,321 @@ def pair_universe_frame(records: list[DailyPairRecord]) -> pd.DataFrame:
                 "spot_order_qty": record.pair.spot_order_qty,
                 "future_order_qty": record.pair.future_order_qty,
                 "future_pnl_multiplier": record.pair.future_pnl_multiplier,
+                "initial_quantity": record.pair.initial_position.quantity,
+                "initial_direction": record.pair.initial_position.direction.value,
+                "universe_source": record.universe_source,
+                "carried_from_date": record.carried_from_date,
                 "daily_config_path": str(record.config_path),
             }
             for record in records
         ]
     )
+
+
+def execute_hbt_runs(
+    args: argparse.Namespace,
+    base_records: list[DailyPairRecord],
+    trade_dates: list[str],
+) -> HbtRunOutputs:
+    """Run independent daily HBTs or the date-sequential position-carry workflow."""
+
+    if not getattr(args, "carry_positions", True):
+        cache_hit = hbt_cache_is_valid(args, base_records)
+        if cache_hit:
+            logging.info("valid result manifest found; skip event preparation and NPZ audit")
+            event_paths: dict[str, dict[str, Path]] = {}
+            conversion_status = read_csv_if_exists(args.output_dir / "conversion_status.csv")
+            settings = read_csv_if_exists(args.output_dir / "hbt_settings.csv")
+        else:
+            event_paths, conversion_status = build_event_data(args, base_records)
+            settings = hbt_settings_frame(args, base_records, event_paths)
+        pair_results, summary, trades, market, latency, run_errors = run_or_load_backtests(
+            args, base_records, event_paths
+        )
+        return HbtRunOutputs(
+            records=base_records,
+            event_paths=event_paths,
+            pair_results=pair_results,
+            summary=summary,
+            trades=trades,
+            market=market,
+            latency=latency,
+            run_errors=run_errors,
+            conversion_status=conversion_status,
+            settings=settings,
+            position_carry_status=pd.DataFrame(),
+            cache_hit=cache_hit,
+        )
+
+    cached_summary = read_csv_if_exists(args.output_dir / "summary_all_daily_pairs.csv")
+    try:
+        cached_records, reconstructed_status = reconstruct_position_carry_records(
+            base_records,
+            trade_dates,
+            cached_summary,
+            load_calendar_trade_dates(args.calendar),
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        logging.info("cached carry state cannot be reconstructed: %s", exc)
+        cached_records, reconstructed_status = [], pd.DataFrame()
+    cache_hit = bool(cached_records) and hbt_cache_is_valid(args, cached_records)
+    if cache_hit:
+        logging.info("valid continuous-position result manifest found; reuse saved HBT results")
+        pair_results, summary, trades, market, latency, run_errors = run_or_load_backtests(
+            args, cached_records, {}
+        )
+        carry_status = read_csv_if_exists(args.output_dir / "position_carry_status.csv")
+        if carry_status.empty:
+            carry_status = reconstructed_status
+        return HbtRunOutputs(
+            records=cached_records,
+            event_paths={},
+            pair_results=pair_results,
+            summary=summary,
+            trades=trades,
+            market=market,
+            latency=latency,
+            run_errors=run_errors,
+            conversion_status=read_csv_if_exists(args.output_dir / "conversion_status.csv"),
+            settings=read_csv_if_exists(args.output_dir / "hbt_settings.csv"),
+            position_carry_status=carry_status,
+            cache_hit=True,
+        )
+
+    return run_backtests_with_position_carry(args, base_records, trade_dates)
+
+
+def run_backtests_with_position_carry(
+    args: argparse.Namespace,
+    base_records: list[DailyPairRecord],
+    trade_dates: list[str],
+) -> HbtRunOutputs:
+    """Run dates in order while retaining same-day pair parallelism."""
+
+    base_by_date: dict[str, list[DailyPairRecord]] = {
+        trade_date: [record for record in base_records if record.trade_date == trade_date]
+        for trade_date in trade_dates
+    }
+    calendar_trade_dates = load_calendar_trade_dates(args.calendar)
+    carry: dict[PositionKey, PositionSnapshot] = {}
+    all_records: list[DailyPairRecord] = []
+    all_event_paths: dict[str, dict[str, Path]] = {}
+    all_pair_results: dict[str, dict[str, pd.DataFrame]] = {}
+    summary_frames: list[pd.DataFrame] = []
+    trade_frames: list[pd.DataFrame] = []
+    market_frames: list[pd.DataFrame] = []
+    latency_frames: list[pd.DataFrame] = []
+    error_frames: list[pd.DataFrame] = []
+    conversion_frames: list[pd.DataFrame] = []
+    settings_frames: list[pd.DataFrame] = []
+    carry_frames: list[pd.DataFrame] = []
+
+    for trade_date in trade_dates:
+        date_records = augment_records_with_position_carry(base_by_date.get(trade_date, []), carry, trade_date)
+        logging.info(
+            "continuous HBT date=%s selected=%s carried=%s total=%s",
+            trade_date,
+            len(base_by_date.get(trade_date, [])),
+            sum(record.universe_source != "selected" for record in date_records),
+            len(date_records),
+        )
+        event_paths, conversion_status = build_event_data(args, date_records)
+        settings = hbt_settings_frame(args, date_records, event_paths)
+        pair_results, summary, trades, market, latency, run_errors = run_backtests(
+            args, date_records, event_paths
+        )
+        carry, carry_status, expiry_errors = advance_position_carry(
+            carry,
+            date_records,
+            summary,
+            calendar_trade_dates,
+        )
+
+        all_records.extend(date_records)
+        all_event_paths.update(event_paths)
+        all_pair_results.update(pair_results)
+        summary_frames.append(summary)
+        trade_frames.append(trades)
+        market_frames.append(market)
+        latency_frames.append(latency)
+        error_frames.extend((run_errors, expiry_errors))
+        conversion_frames.append(conversion_status)
+        settings_frames.append(settings)
+        carry_frames.append(carry_status)
+
+    return HbtRunOutputs(
+        records=all_records,
+        event_paths=all_event_paths,
+        pair_results=all_pair_results,
+        summary=concat_frames(summary_frames),
+        trades=concat_frames(trade_frames),
+        market=concat_frames(market_frames),
+        latency=concat_frames(latency_frames),
+        run_errors=concat_frames(error_frames),
+        conversion_status=concat_frames(conversion_frames),
+        settings=concat_frames(settings_frames),
+        position_carry_status=concat_frames(carry_frames),
+        cache_hit=False,
+    )
+
+
+def augment_records_with_position_carry(
+    base_records: list[DailyPairRecord],
+    carry: dict[PositionKey, PositionSnapshot],
+    trade_date: str,
+) -> list[DailyPairRecord]:
+    """Restore selected held pairs and append held pairs absent from today's universe."""
+
+    augmented: list[DailyPairRecord] = []
+    selected_keys: set[PositionKey] = set()
+    for record in base_records:
+        key = position_key(record.pair.spot_symbol, record.pair.future_symbol)
+        selected_keys.add(key)
+        snapshot = carry.get(key)
+        if snapshot is None:
+            augmented.append(record)
+            continue
+        augmented.append(
+            replace(
+                record,
+                pair=snapshot.restored_pair(record.pair),
+                universe_source="selected+carried",
+                carried_from_date=snapshot.source_trade_date,
+            )
+        )
+
+    for key, snapshot in sorted(carry.items(), key=lambda item: item[0]):
+        if key in selected_keys:
+            continue
+        pair = snapshot.restored_pair()
+        augmented.append(
+            DailyPairRecord(
+                trade_date=trade_date,
+                run_key=pair_run_key(trade_date, pair.name),
+                pair=pair,
+                config_path=snapshot.config_path,
+                universe_source="carried_position",
+                carried_from_date=snapshot.source_trade_date,
+            )
+        )
+    return augmented
+
+
+def advance_position_carry(
+    previous: dict[PositionKey, PositionSnapshot],
+    records: list[DailyPairRecord],
+    summary: pd.DataFrame,
+    calendar_trade_dates: list[str],
+) -> tuple[dict[PositionKey, PositionSnapshot], pd.DataFrame, pd.DataFrame]:
+    """Create next-day snapshots and reject residual positions at contract expiry."""
+
+    summary_by_key = {
+        str(row.run_key): row
+        for row in summary.itertuples(index=False)
+        if hasattr(row, "run_key")
+    }
+    next_carry: dict[PositionKey, PositionSnapshot] = {}
+    audit_rows: list[dict[str, Any]] = []
+    error_rows: list[dict[str, Any]] = []
+
+    for record in records:
+        key = position_key(record.pair.spot_symbol, record.pair.future_symbol)
+        prior = previous.get(key)
+        row = summary_by_key.get(record.run_key)
+        snapshot = prior if row is None else snapshot_from_summary_row(row, record)
+        expiry_date = futures_contract_expiry_date(
+            record.pair.future_symbol,
+            record.trade_date,
+            calendar_trade_dates,
+        )
+        expired_with_position = bool(
+            snapshot is not None and expiry_date is not None and record.trade_date >= expiry_date
+        )
+
+        if expired_with_position:
+            status = "expiry_position_remaining"
+            error_rows.append(
+                run_error_row(
+                    record,
+                    f"open position remained on/after futures expiry {expiry_date}; position was not rolled",
+                )
+            )
+        elif row is None and prior is not None:
+            status = "carried_without_result"
+            next_carry[key] = prior
+        elif row is None:
+            status = "no_result"
+        elif snapshot is None:
+            status = "closed"
+        else:
+            status = "carried_forward"
+            next_carry[key] = snapshot
+
+        initial = record.pair.initial_position
+        audit_rows.append(
+            {
+                "trade_date": record.trade_date,
+                "run_key": record.run_key,
+                "pair_name": record.pair.name,
+                "spot_symbol": record.pair.spot_symbol,
+                "future_symbol": record.pair.future_symbol,
+                "universe_source": record.universe_source,
+                "carried_from_date": record.carried_from_date,
+                "initial_quantity": initial.quantity,
+                "initial_direction": initial.direction.value,
+                "final_quantity": 0 if snapshot is None else snapshot.quantity,
+                "final_direction": Signal.HOLD.value if snapshot is None else snapshot.direction.value,
+                "expiry_date": expiry_date,
+                "is_expiry_date": expiry_date == record.trade_date,
+                "carry_to_next_date": key in next_carry,
+                "status": status,
+            }
+        )
+
+    return next_carry, pd.DataFrame(audit_rows), pd.DataFrame(error_rows)
+
+
+def reconstruct_position_carry_records(
+    base_records: list[DailyPairRecord],
+    trade_dates: list[str],
+    summary: pd.DataFrame,
+    calendar_trade_dates: list[str],
+) -> tuple[list[DailyPairRecord], pd.DataFrame]:
+    """Rebuild the dynamic universe from saved summaries for cache validation."""
+
+    if summary.empty or "trade_date" not in summary.columns:
+        return [], pd.DataFrame()
+    base_by_date = {
+        trade_date: [record for record in base_records if record.trade_date == trade_date]
+        for trade_date in trade_dates
+    }
+    summary_dates = summary["trade_date"].astype(str).str.slice(0, 10)
+    carry: dict[PositionKey, PositionSnapshot] = {}
+    all_records: list[DailyPairRecord] = []
+    audit_frames: list[pd.DataFrame] = []
+    for trade_date in trade_dates:
+        records = augment_records_with_position_carry(base_by_date.get(trade_date, []), carry, trade_date)
+        day_summary = summary.loc[summary_dates.eq(trade_date)].copy()
+        carry, audit, _ = advance_position_carry(carry, records, day_summary, calendar_trade_dates)
+        all_records.extend(records)
+        audit_frames.append(audit)
+    return all_records, concat_frames(audit_frames)
+
+
+def load_calendar_trade_dates(calendar_path: Path) -> list[str]:
+    calendar_frame = pd.read_csv(calendar_path, dtype=str)
+    return [normalize_date(value) for value in calendar_frame["trade_dates"].dropna().astype(str)]
+
+
+def raise_for_expiry_position_errors(args: argparse.Namespace, carry_status: pd.DataFrame) -> None:
+    if getattr(args, "continue_on_error", False) or carry_status.empty or "status" not in carry_status.columns:
+        return
+    violations = carry_status.loc[carry_status["status"].eq("expiry_position_remaining")]
+    if not violations.empty:
+        contracts = ", ".join(
+            f"{row.future_symbol}@{row.trade_date}" for row in violations.itertuples(index=False)
+        )
+        raise RuntimeError(f"positions remained at futures expiry (no rollover performed): {contracts}")
 
 
 def build_event_data(
@@ -945,7 +1313,7 @@ def hbt_result_csvs_exist(output_dir: Path) -> bool:
     return all(paths[name].exists() for name in required)
 
 
-HBT_CACHE_SCHEMA_VERSION = 2
+HBT_CACHE_SCHEMA_VERSION = 3
 HBT_MANIFEST_NAME = "backtest_manifest.json"
 HBT_RESULT_ARG_NAMES = (
     "start_date",
@@ -973,6 +1341,7 @@ HBT_RESULT_ARG_NAMES = (
     "min_second_leg_adjusted_basis_pct",
     "no_second_leg_profit_check",
     "no_flatten",
+    "carry_positions",
 )
 
 
@@ -999,6 +1368,7 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
         ARBITRAGE_ROOT / "hbt_helpers.py",
         ARBITRAGE_ROOT / "strategy.py",
         ARBITRAGE_ROOT / "strategy_adapter.py",
+        ARBITRAGE_ROOT / "position_carry.py",
         Path(__file__),
     ]
     return {
@@ -1703,6 +2073,7 @@ def build_cash_roi_outputs(
     trades: pd.DataFrame,
     market: pd.DataFrame,
     records: list[DailyPairRecord],
+    capital_config: CapitalAllocationConfig | None = None,
 ) -> dict[str, pd.DataFrame]:
     pair_cash_settings = pair_cash_settings_frame(records)
     filled_trades = filled_trade_frame(trades, pair_cash_settings)
@@ -1712,11 +2083,13 @@ def build_cash_roi_outputs(
         market,
         stuck_outputs["stuck_cash_by_pair"],
     )
+    capital_outputs = build_capital_constraint_outputs(filled_trades, capital_config)
     return {
         "pair_cash_settings": pair_cash_settings,
         "filled_trades": filled_trades,
         **stuck_outputs,
         **roi_outputs,
+        **capital_outputs,
     }
 
 

@@ -16,6 +16,7 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from .capital import CapitalAllocationConfig, build_capital_constraint_outputs
 from .result_replot import PlotInterval, daily_performance, load_precomputed_summary
 
 
@@ -36,6 +37,12 @@ def build_backtest_report(
     output_dirs: Iterable[str | Path],
     intervals: Sequence[PlotInterval | Mapping[str, object]],
     output_dir: str | Path,
+    *,
+    total_capital: float = 50_000_000.0,
+    futures_margin_rate: float = 0.20,
+    spot_equity_rate: float = 0.40,
+    leverage: bool = True,
+    carry_positions: bool = False,
 ) -> BacktestReportResult:
     """建立報告指標、QA 表格與標準 MCP 報告 artifact。"""
     roots = [Path(path).expanduser().resolve() for path in output_dirs]
@@ -48,12 +55,39 @@ def build_backtest_report(
     raw_stuck = _load_csvs(roots, "reports/daily_stuck_cash.csv")
     raw_pair_roi = _load_csvs(roots, "reports/pair_roi_including_open.csv")
     raw_build_status = _load_csvs(roots, "daily_config_build_status.csv")
+    raw_filled_trades = _load_report_tables(roots, "reports/filled_trades")
+    raw_carry_status = pd.DataFrame()
+    if carry_positions:
+        missing_carry = [root for root in roots if not (root / "position_carry_status.csv").exists()]
+        if missing_carry:
+            raise FileNotFoundError(
+                "carry_positions=True requires continuous-run position_carry_status.csv; "
+                f"rerun these outputs with --carry-positions: {missing_carry}"
+            )
+        raw_carry_status = _load_csvs(roots, "position_carry_status.csv")
 
     summary, summary_excluded = _scope_frame(raw_summary, normalized_intervals)
     roi, _ = _scope_frame(raw_roi, normalized_intervals)
     stuck, _ = _scope_frame(raw_stuck, normalized_intervals)
     pair_roi, _ = _scope_frame(raw_pair_roi, normalized_intervals)
     build_status, _ = _scope_frame(raw_build_status, normalized_intervals, apply_exclusions=False)
+    filled_trades, _ = _scope_frame(raw_filled_trades, normalized_intervals)
+    carry_status = (
+        _scope_frame(raw_carry_status, normalized_intervals)[0]
+        if not raw_carry_status.empty
+        else pd.DataFrame()
+    )
+
+    capital_config = CapitalAllocationConfig(
+        total_capital=total_capital,
+        futures_margin_rate=futures_margin_rate,
+        spot_equity_rate=spot_equity_rate,
+        leverage=leverage,
+        carry_positions=carry_positions,
+    )
+    capital_outputs = build_capital_constraint_outputs(filled_trades, capital_config)
+    capital_summary = capital_outputs["capital_constraint_summary"]
+    daily_capital = capital_outputs["daily_capital_constraint"]
 
     daily = _build_daily_performance(summary, roi, stuck)
     monthly = _build_monthly_performance(summary, roi, stuck, normalized_intervals)
@@ -68,7 +102,51 @@ def build_backtest_report(
         excluded=excluded,
         coverage=coverage,
     )
+    capital_row = capital_summary.iloc[0]
+    validation = pd.concat(
+        [
+            validation,
+            pd.DataFrame(
+                [
+                    {
+                        "檢查項目": "5,000 萬資金上限",
+                        "狀態": "通過" if float(capital_row["peak_capital_utilization"]) <= 1.0 + 1e-12 else "失敗",
+                        "證據": f"資金重播使用率峰值：{float(capital_row['peak_capital_utilization']):.2%}",
+                        "重要性": "高",
+                    },
+                    {
+                        "檢查項目": "資金重播範圍",
+                        "狀態": "通過" if carry_positions else "注意",
+                        "證據": (
+                            "HBT 與資金占用均跨交易日延續"
+                            if carry_positions
+                            else "pair/day 獨立 HBT，資金每日重設"
+                        ),
+                        "重要性": "高",
+                    },
+                    {
+                        "檢查項目": "期貨到期日殘倉",
+                        "狀態": (
+                            "通過"
+                            if carry_status.empty
+                            or not carry_status["status"].eq("expiry_position_remaining").any()
+                            else "失敗"
+                        ),
+                        "證據": (
+                            "未發現到期日殘倉"
+                            if carry_status.empty
+                            or not carry_status["status"].eq("expiry_position_remaining").any()
+                            else "position_carry_status.csv 發現到期日殘倉"
+                        ),
+                        "重要性": "高",
+                    },
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
     headline = _build_headline(daily, roi, stuck, monthly, excluded, coverage)
+    headline.update(_capital_headline(capital_summary))
     pnl_components = _monthly_pnl_components(monthly)
     position_outcomes = _monthly_position_outcomes(monthly)
 
@@ -82,6 +160,9 @@ def build_backtest_report(
         "excluded_dates": excluded,
         "coverage": coverage,
         "validation_checks": validation,
+        "capital_constraint_summary": capital_summary,
+        "daily_capital_constraint": daily_capital,
+        "position_carry_status": carry_status,
     }
     for name, frame in frames.items():
         frame.to_csv(destination / f"{name}.csv", index=False)
@@ -123,6 +204,59 @@ def _load_csvs(roots: Sequence[Path], relative_path: str) -> pd.DataFrame:
         raise ValueError(f"{relative_path} is missing trade_date")
     combined["trade_date"] = pd.to_datetime(combined["trade_date"], errors="raise").dt.normalize()
     return combined
+
+
+def _load_report_tables(roots: Sequence[Path], relative_stem: str) -> pd.DataFrame:
+    """Load one detailed report table per output root, preferring Parquet."""
+    frames: list[pd.DataFrame] = []
+    for root in roots:
+        parquet_path = root / f"{relative_stem}.parquet"
+        csv_path = root / f"{relative_stem}.csv"
+        if parquet_path.exists() and parquet_path.stat().st_size:
+            frame = pd.read_parquet(parquet_path)
+        elif csv_path.exists() and csv_path.stat().st_size:
+            frame = pd.read_csv(csv_path)
+        else:
+            continue
+        frame = frame.copy()
+        frame["source_output_dir"] = str(root)
+        frames.append(frame)
+    if not frames:
+        raise FileNotFoundError(
+            f"No readable {relative_stem}.parquet or {relative_stem}.csv under configured output directories"
+        )
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    if "trade_date" not in combined.columns:
+        raise ValueError(f"{relative_stem} is missing trade_date")
+    combined["trade_date"] = pd.to_datetime(combined["trade_date"], errors="raise").dt.normalize()
+    return combined
+
+
+def _capital_headline(summary: pd.DataFrame) -> dict[str, object]:
+    if summary.empty:
+        return {}
+    row = summary.iloc[0]
+    return {
+        "capital_total": float(row["total_capital"]),
+        "futures_margin_rate": float(row["futures_margin_rate"]),
+        "spot_equity_rate": float(row["spot_equity_rate"]),
+        "effective_futures_margin_rate": float(row["effective_futures_margin_rate"]),
+        "effective_spot_equity_rate": float(row["effective_spot_equity_rate"]),
+        "leverage": bool(row["leverage"]),
+        "carry_positions": bool(row["carry_positions"]),
+        "futures_capital_limit": float(row["futures_capital_limit"]),
+        "spot_capital_limit": float(row["spot_capital_limit"]),
+        "matched_notional_limit": float(row["matched_notional_limit"]),
+        "capital_candidate_entries": int(row["candidate_entries"]),
+        "capital_accepted_entries": int(row["accepted_entries"]),
+        "capital_rejected_entries": int(row["rejected_entries"]),
+        "capital_entry_acceptance_rate": float(row["entry_acceptance_rate"]),
+        "capital_filtered_realized_pnl": float(row["capital_filtered_realized_pnl"]),
+        "capital_filtered_realized_roi": float(row["capital_filtered_realized_roi"]),
+        "capital_peak_used": float(row["peak_total_capital"]),
+        "capital_peak_utilization": float(row["peak_capital_utilization"]),
+        "capital_replay_scope": str(row["replay_scope"]),
+    }
 
 
 def _scope_frame(
@@ -413,6 +547,8 @@ def _build_artifact(
             str(relative_root / "reports/daily_roi_including_open.csv"),
             str(relative_root / "reports/daily_stuck_cash.csv"),
             str(relative_root / "reports/pair_roi_including_open.csv"),
+            str(relative_root / "reports/filled_trades.parquet"),
+            str(relative_root / "reports/filled_trades.csv"),
             str(relative_root / "daily_config_build_status.csv"),
         ])
     source_tables.extend([
@@ -424,6 +560,8 @@ def _build_artifact(
         "future_spot/output/backtest_report_202601_202607/symbol_performance.csv",
         "future_spot/output/backtest_report_202601_202607/excluded_dates.csv",
         "future_spot/output/backtest_report_202601_202607/coverage.csv",
+        "future_spot/output/backtest_report_202601_202607/capital_constraint_summary.csv",
+        "future_spot/output/backtest_report_202601_202607/daily_capital_constraint.csv",
     ])
     exclusion_text = ", ".join(date for interval in intervals for date in interval.excluded_dates)
     sources = [
@@ -447,6 +585,12 @@ def _build_artifact(
                     "Sharpe proxy＝sqrt(252) × active-day 進場現金總 ROI 平均值／active-day 進場現金總 ROI 樣本標準差；無風險利率設為 0。",
                     "已實現 PnL 為 ROI 報表中已成交 EXIT 的實現損益；未平倉鎖定損益依既有報表邏輯估算尚未結束的 pair-run。",
                     "完成率＝既有現金報表中的已成交 EXIT 筆數／已成交股票多方進場筆數。",
+                    (
+                        "資金約束重播＝以 NT$50M 共用自有資金，依成交時間接受或拒絕候選進場；"
+                        f"有效期貨／現股資金率為 {headline['effective_futures_margin_rate']:.0%}／"
+                        f"{headline['effective_spot_equity_rate']:.0%}，"
+                        + ("部位與資金占用跨日延續。" if headline["carry_positions"] else "資金帳於每日開始重設。")
+                    ),
                 ],
                 "tables_used": source_tables,
             },
@@ -455,11 +599,19 @@ def _build_artifact(
 
     h = headline
     title = "期現套利回測報告：2026 年 1–7 月"
+    leverage_text = (
+        f"期貨 {h['effective_futures_margin_rate']:.0%} 保證金與現股 "
+        f"{h['effective_spot_equity_rate']:.0%} 自備款"
+        if h["leverage"]
+        else "期貨與現股皆以 100% 自有資金"
+    )
+    carry_text = "跨日連續持倉" if h["carry_positions"] else "逐日獨立候選"
     executive = (
         "## Executive Summary｜執行摘要\n\n"
         f"- **排除異常日期後，策略以累計 NT${h['entry_cash_out']/1_000_000_000:.2f}B 的股票進場現金產生 NT${h['total_pnl_including_open']/1_000_000:.1f}M 總 PnL，資金周轉 ROI 為 {h['total_roi']:.2%}。** 此數值不是投資組合 CAGR，也不是固定初始本金報酬率。\n"
         f"- **已實現 PnL 僅 NT${h['realized_pnl']/1_000_000:.1f}M；總 PnL 中有 {h['open_pnl_share']:.1%} 來自未平倉鎖定損益。** 因此整體結果高度依賴回測結束時仍未平倉的 {h['open_pair_runs']:,.0f} 個 pair-run。\n"
         f"- **active-day 年化 Sharpe proxy 為 {h['sharpe_proxy']:.2f}，但不是標準權益曲線 Sharpe。** {h['active_roi_days']} 個 active ROI 日全部為正，且每日報酬以當日進場現金正規化，而非固定投資組合 NAV。\n"
+        f"- **NT$50M 資金篩選只接受 {h['capital_entry_acceptance_rate']:.1%} 的候選進場。** 採 {leverage_text}，期貨資金上限約 NT${h['futures_capital_limit']/1_000_000:.1f}M、現股資金上限約 NT${h['spot_capital_limit']/1_000_000:.1f}M。\n"
         f"- **整體可信度評估為「可分享，但須附帶限制說明」。** 報告排除 7 個缺 tick 異常日期，另有 {h['config_error_days']} 個嘗試交易日發生設定錯誤，因此不是完整且不中斷的 1–7 月樣本。"
     )
     open_section = (
@@ -478,7 +630,11 @@ def _build_artifact(
         "這種異常平滑的路徑在用於資金配置前，應加入強制平倉、期貨保證金、不利出場滑價，以及連續固定本金權益曲線進行壓力測試。"
     )
     capital_section = (
-        "## 超過半數進場 pair-run 在回測結束時仍未平倉\n\n"
+        "## 5,000 萬共用資金會直接淘汰超額候選單\n\n"
+        f"資金模型採 {leverage_text}，將 NT$50M 分為期貨 NT${h['futures_capital_limit']/1_000_000:.1f}M、現股 NT${h['spot_capital_limit']/1_000_000:.1f}M，對應約 NT${h['matched_notional_limit']/1_000_000:.1f}M 的配對名目上限。"
+        f"在既有成交候選中接受 {h['capital_accepted_entries']:,.0f} 筆、因資金不足拒絕 {h['capital_rejected_entries']:,.0f} 筆。"
+        f"這是{carry_text}的資金候選重播；未平倉部位不計入資金篩選後的已實現 ROI。"
+        "\n\n"
         f"現金報表記錄 {h['entries']:,.0f} 次進場與 {h['exits']:,.0f} 次出場，完成率為 {h['completion_rate']:.1%}。"
         f"單日股票進場現金峰值達 NT${h['peak_daily_entry_cash']/1_000_000:.1f}M，單日卡住現金峰值達 NT${h['peak_daily_stuck_cash']/1_000_000:.1f}M。"
         "因此主要營運限制是資金占用期間與出場容量，而不只是進場訊號的帳面獲利能力。"
@@ -503,6 +659,7 @@ def _build_artifact(
             {"id": "sharpe", "dataset": "headline_metrics", "sourceId": "filtered_backtest_metrics", "description": "active-day ROI 年化代理值；無風險利率為 0。", "metrics": [{"label": "Sharpe proxy", "field": "sharpe_proxy", "format": "number"}, {"label": "有效交易日", "field": "active_roi_days", "format": "number"}]},
             {"id": "open_share", "dataset": "headline_metrics", "sourceId": "filtered_backtest_metrics", "description": "總 PnL 中由未平倉鎖定部位貢獻的比例。", "metrics": [{"label": "未平倉 PnL 占比", "field": "open_pnl_share", "format": "percent"}, {"label": "未平倉 pair-run", "field": "open_pair_runs", "format": "compact"}]},
             {"id": "completion", "dataset": "headline_metrics", "sourceId": "filtered_backtest_metrics", "description": "現金報表中已成交出場筆數除以已成交股票多方進場筆數。", "metrics": [{"label": "完成率", "field": "completion_rate", "format": "percent"}, {"label": "進場次數", "field": "entries", "format": "compact"}]},
+            {"id": "capital_limit", "dataset": "headline_metrics", "sourceId": "filtered_backtest_metrics", "description": "NT$50M 共用資金，期貨保證金 20%、現股自備款 40%的逐日候選重播。", "metrics": [{"label": "候選進場接受率", "field": "capital_entry_acceptance_rate", "format": "percent"}, {"label": "配對名目上限（NT$）", "field": "matched_notional_limit", "format": "compact"}]},
         ],
         "charts": [
             {
@@ -565,7 +722,7 @@ def _build_artifact(
         "blocks": [
             {"id": "title", "type": "markdown", "body": f"# {title}", "layout": "full"},
             {"id": "executive", "type": "markdown", "body": executive, "layout": "full", "sourceId": "filtered_backtest_metrics"},
-            {"id": "headline_strip", "type": "metric-strip", "cardIds": ["total_pnl", "turnover_roi", "sharpe", "open_share", "completion"], "layout": "full"},
+            {"id": "headline_strip", "type": "metric-strip", "cardIds": ["total_pnl", "turnover_roi", "capital_limit", "sharpe", "open_share", "completion"], "layout": "full"},
             {"id": "open_narrative", "type": "markdown", "body": open_section, "layout": "full", "sourceId": "filtered_backtest_metrics"},
             {"id": "open_chart", "type": "chart", "chartId": "monthly_pnl_components", "layout": "full"},
             {"id": "roi_narrative", "type": "markdown", "body": roi_section, "layout": "full", "sourceId": "filtered_backtest_metrics"},
@@ -581,9 +738,9 @@ def _build_artifact(
             {"id": "data_narrative", "type": "markdown", "body": data_section, "layout": "full", "sourceId": "filtered_backtest_metrics"},
             {"id": "coverage_table_block", "type": "table", "tableId": "coverage_table", "layout": "full"},
             {"id": "exclusion_table_block", "type": "table", "tableId": "exclusion_table", "layout": "full"},
-            {"id": "recommendations", "type": "markdown", "body": "## 建議的下一步\n\n1. 建立納入期貨保證金、閒置現金與每日市值評價的連續固定本金權益曲線。\n2. 對所有未平倉 pair-run 強制平倉或延長持有期間，重新計算已實現 ROI、Sharpe、最大回撤與 profit factor。\n3. 在比較策略版本前，對出場滑價、排隊成交、延遲、手續費、交易稅與缺 tick 處理進行壓力測試。\n4. 修復 7 個 config-error 日期，只補跑缺失分區，再以相同排除條件重新生成本報告。", "layout": "full"},
-            {"id": "questions", "type": "markdown", "body": "## 待確認問題\n\n- 應以多少固定本金與何種期貨保證金政策定義可投資的投資組合報酬？\n- 未平倉 pair-run 通常持續多久，其實際出場損益分布如何？\n- 在保守的強制平倉與市場衝擊假設下，正的 active-day ROI 是否仍可維持？\n- 異常日期應修復後恢復納入，還是永久排除？", "layout": "full"},
-            {"id": "caveats", "type": "markdown", "body": "## 限制與假設\n\n- 結果是過濾後的回測快照，不代表實盤績效。\n- 資金周轉 ROI 使用累計股票多方進場現金加股票手續費；不含期貨保證金，也沒有固定投資組合 NAV。\n- Sharpe 是以 252 日年化、無風險利率 0 計算的 active-day ROI proxy，並非由連續投資組合權益曲線計算。\n- 總 PnL 包含未平倉鎖定損益，但該部分尚未現金實現。\n- 7 個異常日期與 7 個 config-error 日期降低資料連續性與可比性。\n- 報告尚未納入基準指標、信賴區間、容量模型或樣本外切分。", "layout": "full", "sourceId": "filtered_backtest_metrics"},
+            {"id": "recommendations", "type": "markdown", "body": "## 建議的下一步\n\n1. 以跨日固定本金權益曲線重新計算 Sharpe、最大回撤與 profit factor。\n2. 檢查到期日殘倉稽核，確認舊合約均於到期日出清。\n3. 加入融資利息、期貨每日結算損益、追繳門檻與安全緩衝，再做容量壓力測試。\n4. 修復 config-error 日期，只補跑缺失分區，再以相同排除條件重新生成本報告。", "layout": "full"},
+            {"id": "questions", "type": "markdown", "body": "## 待確認問題\n\n- 未平倉 pair-run 通常持續多久，其實際出場損益分布如何？\n- 融資利率、期貨每日結算緩衝與追繳安全線應採用哪些實際帳戶條件？\n- 在保守的強制平倉與市場衝擊假設下，正的 active-day ROI 是否仍可維持？\n- 異常日期應修復後恢復納入，還是永久排除？", "layout": "full"},
+            {"id": "caveats", "type": "markdown", "body": f"## 限制與假設\n\n- 結果是過濾後的回測快照，不代表實盤績效。\n- 舊資金周轉 ROI 使用累計股票多方進場現金加股票手續費；新的資金篩選另以 NT$50M 與 {leverage_text} 計算，兩者不可混用。\n- 資金約束採 {carry_text}重播。\n- Sharpe 是以 252 日年化、無風險利率 0 計算的 active-day ROI proxy，並非由連續投資組合權益曲線計算。\n- 總 PnL 包含未平倉鎖定損益，但該部分尚未現金實現。\n- 異常日期與 config-error 日期會降低資料連續性與可比性。", "layout": "full", "sourceId": "filtered_backtest_metrics"},
         ],
     }
     snapshot = {
@@ -599,6 +756,8 @@ def _build_artifact(
             "top_symbols": _records(frames["symbol_performance"].head(10)),
             "coverage": _records(frames["coverage"]),
             "excluded_dates": _records(frames["excluded_dates"]),
+            "capital_constraint_summary": _records(frames["capital_constraint_summary"]),
+            "daily_capital_constraint": _records(frames["daily_capital_constraint"]),
         },
     }
     return {"surface": "report", "manifest": manifest, "snapshot": snapshot, "sources": sources}

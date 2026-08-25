@@ -59,7 +59,7 @@
     "spot_order_qty": 2000,
     "future_order_qty": 1,
     "future_pnl_multiplier": 2000,
-    "entry_threshold_pct": 0.013,
+    "entry_threshold_pct": 0.008,
     "exit_threshold_pct": 0.004,
     "exit_tick_multiple": 2,
     "exit_tick_rule": "lte",

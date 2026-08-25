@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from arbitrage import reporting
+from arbitrage.capital import capital_allocation_config_from_args
 try:  # Package import (future_spot.test) and direct script/notebook import.
     from .backtest_pipeline import BacktestArtifacts
 except ImportError:  # pragma: no cover - exercised by direct script execution
@@ -33,6 +34,8 @@ DETAILED_REPORTS = {
     "stuck_cash_by_pair",
     "roi_by_pair",
     "open_lots",
+    "capital_constraint_events",
+    "capital_constraint_open_lots",
 }
 
 
@@ -47,7 +50,12 @@ def build_report_tables(artifacts: BacktestArtifacts) -> ReportArtifacts:
     symbol_profit = _symbol_profit(summary)
     pair_profit = _pair_profit(summary, pair_universe)
     failure = reporting.build_second_leg_failure_outputs(summary, trades, market, window_rows=10)
-    cash_roi = reporting.build_cash_roi_outputs(trades, market, artifacts.records)
+    cash_roi = reporting.build_cash_roi_outputs(
+        trades,
+        market,
+        artifacts.records,
+        capital_allocation_config_from_args(artifacts.args),
+    )
     latency_summary, latency_event_counts = _latency_tables(latency)
 
     frames = {

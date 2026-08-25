@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .capital import CapitalAllocationConfig, build_capital_constraint_outputs
+
 from .full_market_runner import (
     SECOND_LEG_FAILURE_STATUSES,
     add_execution_latency_columns,

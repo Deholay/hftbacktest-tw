@@ -42,6 +42,11 @@ def default_notebook_args(**overrides: Any) -> Namespace:
         "post_first_feed_poll_ms": 10.0,
         "record_market_every_steps": 60,
         "rebuild_hbt_results": False,
+        "carry_positions": True,
+        "total_capital": 50_000_000.0,
+        "futures_margin_rate": 0.20,
+        "spot_equity_rate": 0.40,
+        "leverage": True,
     }
     defaults.update(overrides)
     for name, value in defaults.items():
