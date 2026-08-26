@@ -33,7 +33,7 @@ def save_report_plots(
         "pair_profit_scatter": lambda: _pair_profit_scatter(reports.frame("pair_profit")),
         "stuck_cash": lambda: _stuck_cash(reports.frame("daily_stuck_cash"), reports.frame("top_stuck_cash_pairs")),
         "roi_including_open": lambda: _roi(reports.frame("daily_roi_including_open"), reports.frame("pair_roi_including_open")),
-        "latency_timelines": lambda: _latency(artifacts.frame("latency"), reports.selected_pair),
+        "latency_timelines": lambda: _latency(reports.frame("latency_plot_sample"), reports.selected_pair),
     }
     paths: dict[str, Path] = {}
     for name, build in builders.items():

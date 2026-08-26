@@ -32,6 +32,9 @@ Fast defaults:
 - a parameter/input/code manifest validates cached HBT results before reuse.
 - final positions are restored on the next trade day by default; held contracts
   stay in the universe until exit, with no automatic futures rollover.
+- reports release the multi-GB trade/market/latency frames and aggregate their
+  persisted CSVs in 25,000-row batches; summary mode omits large diagnostic
+  detail tables by default.
 
 Useful controls:
 
@@ -41,8 +44,13 @@ python future_spot/test/run_full_backtest.py --workers 1 --max-pairs 5
 
 # Keep summary CSVs and figures, but skip large detailed tables and per-pair CSVs.
 python future_spot/test/run_full_backtest.py \
-  --skip-detailed-reports \
+  --report-mode summary \
   --skip-entry-exit-by-pair
+
+# Build detailed failure/capital tables while retaining bounded CSV reads.
+python future_spot/test/run_full_backtest.py \
+  --report-mode full \
+  --report-chunk-rows 25000
 
 # Force a valid-cache bypass after intentional strategy/config changes.
 python future_spot/test/run_full_backtest.py --rebuild-hbt-results

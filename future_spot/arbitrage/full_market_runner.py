@@ -181,9 +181,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="numba",
         help="Numba scans HOLD-only spans in compiled code; Python is the reference/fallback engine.",
     )
-    parser.add_argument("--order-latency-ms", type=float, default=0.0)
-    parser.add_argument("--response-latency-ms", type=float, default=0.0)
-    parser.add_argument("--feed-latency-offset-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--order-latency-ms",
+        type=float,
+        default=0.0,
+        help="Fallback order-entry latency for both legs when a leg-specific value is omitted.",
+    )
+    parser.add_argument(
+        "--response-latency-ms",
+        type=float,
+        default=0.0,
+        help="Fallback order-response latency for both legs when a leg-specific value is omitted.",
+    )
+    parser.add_argument(
+        "--feed-latency-offset-ms",
+        type=float,
+        default=0.0,
+        help="Fallback market-feed offset for both legs when a leg-specific value is omitted.",
+    )
+    parser.add_argument("--spot-order-latency-ms", type=float, default=None)
+    parser.add_argument("--spot-response-latency-ms", type=float, default=None)
+    parser.add_argument("--spot-feed-latency-offset-ms", type=float, default=None)
+    parser.add_argument("--future-order-latency-ms", type=float, default=None)
+    parser.add_argument("--future-response-latency-ms", type=float, default=None)
+    parser.add_argument("--future-feed-latency-offset-ms", type=float, default=None)
     parser.add_argument("--second-leg-delay-ms", type=float, default=0.0)
     parser.add_argument("--post-first-feed-wait", choices=("none", "spot", "future", "any", "both"), default="none")
     parser.add_argument("--post-first-feed-timeout-ms", type=float, default=0.0)
@@ -251,6 +272,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--skip-entry-exit-by-pair", action="store_true")
     parser.add_argument("--skip-detailed-reports", action="store_true")
+    parser.add_argument(
+        "--low-memory-reports",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Release large in-memory result frames and build reports from CSV chunks.",
+    )
+    parser.add_argument(
+        "--report-mode",
+        choices=("summary", "full"),
+        default="summary",
+        help="Summary omits large diagnostic detail tables; full builds them from bounded chunks.",
+    )
+    parser.add_argument(
+        "--report-chunk-rows",
+        type=int,
+        default=25_000,
+        help="Rows per CSV batch while building low-memory reports.",
+    )
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument(
         "--detailed-report-format",
@@ -324,22 +363,56 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
         return args.output_dir if args.output_dir.is_absolute() else (PROJECT_ROOT / args.output_dir).resolve()
     start = normalize_date(args.start_date).replace("-", "")
     end = normalize_date(args.end_date).replace("-", "")
-    order_latency = _output_name_number(getattr(args, "order_latency_ms", 0.0))
-    response_latency = _output_name_number(getattr(args, "response_latency_ms", 0.0))
-    feed_latency = _output_name_number(getattr(args, "feed_latency_offset_ms", 0.0))
-    if order_latency == response_latency == feed_latency:
-        latency_suffix = f"latency_{order_latency}ms"
-    else:
-        latency_suffix = (
-            f"order_{order_latency}ms_response_{response_latency}ms_"
-            f"feed_{feed_latency}ms"
+    spot_latency = leg_latency_ms(args, "spot")
+    future_latency = leg_latency_ms(args, "future")
+    has_leg_specific_latency = any(
+        getattr(args, name, None) is not None
+        for name in (
+            "spot_order_latency_ms",
+            "spot_response_latency_ms",
+            "spot_feed_latency_offset_ms",
+            "future_order_latency_ms",
+            "future_response_latency_ms",
+            "future_feed_latency_offset_ms",
         )
+    )
+    if has_leg_specific_latency:
+        future_order, future_response, future_feed = map(_output_name_number, future_latency)
+        spot_order, spot_response, spot_feed = map(_output_name_number, spot_latency)
+        latency_suffix = (
+            f"future_order_{future_order}ms_response_{future_response}ms_feed_{future_feed}ms_"
+            f"spot_order_{spot_order}ms_response_{spot_response}ms_feed_{spot_feed}ms"
+        )
+    else:
+        order_latency, response_latency, feed_latency = map(_output_name_number, spot_latency)
+        if order_latency == response_latency == feed_latency:
+            latency_suffix = f"latency_{order_latency}ms"
+        else:
+            latency_suffix = (
+                f"order_{order_latency}ms_response_{response_latency}ms_"
+                f"feed_{feed_latency}ms"
+            )
     return PROJECT_ROOT / "output" / f"hbt_daily_full_market_{start}_{end}_{latency_suffix}"
 
 
 def _output_name_number(value: float) -> str:
     """Format a numeric setting as a filesystem-safe, compact token."""
     return f"{float(value):g}".replace("-", "neg").replace(".", "p")
+
+
+def leg_latency_ms(args: argparse.Namespace, leg: str) -> tuple[float, float, float]:
+    """Return effective order, response, and feed latency for one market leg."""
+    if leg not in {"spot", "future"}:
+        raise ValueError(f"Unsupported latency leg: {leg!r}")
+    values = []
+    for specific_name, fallback_name in (
+        (f"{leg}_order_latency_ms", "order_latency_ms"),
+        (f"{leg}_response_latency_ms", "response_latency_ms"),
+        (f"{leg}_feed_latency_offset_ms", "feed_latency_offset_ms"),
+    ):
+        specific = getattr(args, specific_name, None)
+        values.append(float(getattr(args, fallback_name, 0.0) if specific is None else specific))
+    return values[0], values[1], values[2]
 
 
 def select_trade_dates(calendar_path: Path, start_date: str, end_date: str) -> list[str]:
@@ -1134,6 +1207,7 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
     tick_size, summary = audit_cache[audit_key]
     if configured_tick is not None:
         tick_size = configured_tick
+    order_latency_ms, response_latency_ms, feed_latency_offset_ms = leg_latency_ms(args, leg)
     hbt_config = BacktestConfig(
         data=data_path,
         contract_size=contract_size,
@@ -1141,7 +1215,7 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
         lot_size=1.0,
         maker_fee=0.0,
         taker_fee=0.0,
-        order_latency_ns=ms_to_ns(args.order_latency_ms),
+        order_latency_ns=ms_to_ns(order_latency_ms),
         queue_model=args.queue_model,
     )
     return {
@@ -1155,8 +1229,8 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
         "tick_size": hbt_config.tick_size,
         "lot_size": hbt_config.lot_size,
         "order_latency_ns": hbt_config.order_latency_ns,
-        "response_latency_ns": ms_to_ns(args.response_latency_ms),
-        "feed_latency_offset_ns": ms_to_ns(args.feed_latency_offset_ms),
+        "response_latency_ns": ms_to_ns(response_latency_ms),
+        "feed_latency_offset_ns": ms_to_ns(feed_latency_offset_ms),
         "second_leg_delay_ns": ms_to_ns(args.second_leg_delay_ms),
         "post_first_feed_wait": getattr(args, "post_first_feed_wait", "none"),
         "post_first_feed_timeout_ns": ms_to_ns(getattr(args, "post_first_feed_timeout_ms", 0.0)),
@@ -1313,7 +1387,7 @@ def hbt_result_csvs_exist(output_dir: Path) -> bool:
     return all(paths[name].exists() for name in required)
 
 
-HBT_CACHE_SCHEMA_VERSION = 3
+HBT_CACHE_SCHEMA_VERSION = 4
 HBT_MANIFEST_NAME = "backtest_manifest.json"
 HBT_RESULT_ARG_NAMES = (
     "start_date",
@@ -1326,6 +1400,12 @@ HBT_RESULT_ARG_NAMES = (
     "order_latency_ms",
     "response_latency_ms",
     "feed_latency_offset_ms",
+    "spot_order_latency_ms",
+    "spot_response_latency_ms",
+    "spot_feed_latency_offset_ms",
+    "future_order_latency_ms",
+    "future_response_latency_ms",
+    "future_feed_latency_offset_ms",
     "second_leg_delay_ms",
     "post_first_feed_wait",
     "post_first_feed_timeout_ms",
@@ -1489,6 +1569,8 @@ def build_pair_hbt_config(
 ) -> HbtPairBacktestConfig:
     pair = pair_with_overrides(args, pair)
     tick_sizes = getattr(args, "hbt_tick_sizes", {})
+    spot_order_ms, spot_response_ms, spot_feed_ms = leg_latency_ms(args, "spot")
+    future_order_ms, future_response_ms, future_feed_ms = leg_latency_ms(args, "future")
     return HbtPairBacktestConfig(
         pair=pair,
         spot=HbtAssetConfig(
@@ -1498,9 +1580,9 @@ def build_pair_hbt_config(
             trade_date=trade_date,
             tick_size=pair.spot_tick_size or tick_sizes.get(str(paths["spot"])),
             contract_size=1000.0,
-            order_entry_latency_ns=ms_to_ns(args.order_latency_ms),
-            order_response_latency_ns=ms_to_ns(args.response_latency_ms),
-            feed_latency_offset_ns=ms_to_ns(args.feed_latency_offset_ms),
+            order_entry_latency_ns=ms_to_ns(spot_order_ms),
+            order_response_latency_ns=ms_to_ns(spot_response_ms),
+            feed_latency_offset_ns=ms_to_ns(spot_feed_ms),
             queue_model=args.queue_model,
         ),
         future=HbtAssetConfig(
@@ -1510,9 +1592,9 @@ def build_pair_hbt_config(
             trade_date=trade_date,
             tick_size=pair.future_tick_size or tick_sizes.get(str(paths["future"])),
             contract_size=float(pair.future_pnl_multiplier),
-            order_entry_latency_ns=ms_to_ns(args.order_latency_ms),
-            order_response_latency_ns=ms_to_ns(args.response_latency_ms),
-            feed_latency_offset_ns=ms_to_ns(args.feed_latency_offset_ms),
+            order_entry_latency_ns=ms_to_ns(future_order_ms),
+            order_response_latency_ns=ms_to_ns(future_response_ms),
+            feed_latency_offset_ns=ms_to_ns(future_feed_ms),
             queue_model=args.queue_model,
         ),
         first_leg=args.first_leg,
@@ -1751,14 +1833,23 @@ def build_second_leg_failure_outputs(
     trades: pd.DataFrame,
     market: pd.DataFrame,
     window_rows: int = 10,
+    include_windows: bool = True,
 ) -> dict[str, pd.DataFrame]:
     failed_pairs = second_leg_failed_pairs(summary)
     failed_trades = second_leg_failed_trades(trades)
     failure_by_date = second_leg_failure_by_date(failed_pairs, failed_trades)
     failure_by_status = second_leg_failure_by_status(failed_trades)
     failure_by_pair = second_leg_failure_by_pair(failed_pairs, failed_trades)
-    failure_trade_windows = second_leg_failure_trade_windows(trades, failed_trades, window_rows=window_rows)
-    failure_market_tick_windows = second_leg_failure_market_tick_windows(market, failed_trades, window_rows=window_rows)
+    failure_trade_windows = (
+        second_leg_failure_trade_windows(trades, failed_trades, window_rows=window_rows)
+        if include_windows
+        else pd.DataFrame()
+    )
+    failure_market_tick_windows = (
+        second_leg_failure_market_tick_windows(market, failed_trades, window_rows=window_rows)
+        if include_windows
+        else pd.DataFrame()
+    )
     return {
         "failure_overview": second_leg_failure_overview(failed_pairs, failed_trades, failure_market_tick_windows),
         "failed_pairs": failed_pairs,
@@ -2074,6 +2165,7 @@ def build_cash_roi_outputs(
     market: pd.DataFrame,
     records: list[DailyPairRecord],
     capital_config: CapitalAllocationConfig | None = None,
+    include_capital_details: bool = True,
 ) -> dict[str, pd.DataFrame]:
     pair_cash_settings = pair_cash_settings_frame(records)
     filled_trades = filled_trade_frame(trades, pair_cash_settings)
@@ -2083,7 +2175,11 @@ def build_cash_roi_outputs(
         market,
         stuck_outputs["stuck_cash_by_pair"],
     )
-    capital_outputs = build_capital_constraint_outputs(filled_trades, capital_config)
+    capital_outputs = build_capital_constraint_outputs(
+        filled_trades,
+        capital_config,
+        include_details=include_capital_details,
+    )
     return {
         "pair_cash_settings": pair_cash_settings,
         "filled_trades": filled_trades,

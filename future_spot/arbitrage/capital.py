@@ -63,6 +63,8 @@ class CapitalAllocationConfig:
 def build_capital_constraint_outputs(
     filled_trades: pd.DataFrame,
     config: CapitalAllocationConfig | None = None,
+    *,
+    include_details: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Replay candidate fills under a shared capital limit.
 
@@ -194,35 +196,37 @@ def build_capital_constraint_outputs(
             peak_spot_used = max(peak_spot_used, spot_used)
             peak_futures_used = max(peak_futures_used, futures_used)
             peak_total_used = max(peak_total_used, total_used)
-            event_rows.append(
-                {
-                    "trade_date": trade_date,
-                    "capital_event_timestamp": getattr(row, "capital_event_timestamp", np.nan),
-                    "run_key": row.run_key,
-                    "pair_name": row.pair_name,
-                    "spot_symbol": row.spot_symbol,
-                    "future_symbol": row.future_symbol,
-                    "signal": signal,
-                    "capital_action": action,
-                    "capital_reason": reason,
-                    "spot_capital_used": spot_used,
-                    "futures_capital_used": futures_used,
-                    "total_capital_used": total_used,
-                    "capital_headroom": cfg.total_capital - total_used,
-                    "spot_capital_utilization": spot_used / cfg.spot_capital_limit,
-                    "futures_capital_utilization": futures_used / cfg.futures_capital_limit,
-                    "total_capital_utilization": total_used / cfg.total_capital,
-                    "released_spot_capital": released_spot,
-                    "released_futures_capital": released_futures,
-                    "realized_pnl": event_realized_pnl,
-                }
-            )
+            if include_details:
+                event_rows.append(
+                    {
+                        "trade_date": trade_date,
+                        "capital_event_timestamp": getattr(row, "capital_event_timestamp", np.nan),
+                        "run_key": row.run_key,
+                        "pair_name": row.pair_name,
+                        "spot_symbol": row.spot_symbol,
+                        "future_symbol": row.future_symbol,
+                        "signal": signal,
+                        "capital_action": action,
+                        "capital_reason": reason,
+                        "spot_capital_used": spot_used,
+                        "futures_capital_used": futures_used,
+                        "total_capital_used": total_used,
+                        "capital_headroom": cfg.total_capital - total_used,
+                        "spot_capital_utilization": spot_used / cfg.spot_capital_limit,
+                        "futures_capital_utilization": futures_used / cfg.futures_capital_limit,
+                        "total_capital_utilization": total_used / cfg.total_capital,
+                        "released_spot_capital": released_spot,
+                        "released_futures_capital": released_futures,
+                        "realized_pnl": event_realized_pnl,
+                    }
+                )
 
         ending_open_lots = 0
         for queue in open_lots.values():
-            for lot in queue:
-                ending_open_lots += 1
-                open_rows.append({"trade_date": trade_date, **lot})
+            ending_open_lots += len(queue)
+            if include_details:
+                for lot in queue:
+                    open_rows.append({"trade_date": trade_date, **lot})
         daily_rows.append(
             {
                 "trade_date": trade_date,

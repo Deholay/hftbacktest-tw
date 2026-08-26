@@ -16,8 +16,15 @@ for _path in (TEST_ROOT, PROJECT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT / "scripts")
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from arbitrage.full_market_runner import attach_entry_signals, parse_args, resolve_output_dir
+from arbitrage.full_market_runner import (
+    attach_entry_signals,
+    build_pair_hbt_config,
+    leg_latency_ms,
+    parse_args,
+    resolve_output_dir,
+)
 from arbitrage.hbt_helpers import hbt_asset_audit, infer_hbt_asset_tick_size
+from arbitrage.models import PairConfig
 from scripts.io_utils import write_parquet
 
 
@@ -41,6 +48,9 @@ class FastPipelineTest(unittest.TestCase):
         self.assertEqual(args.strategy_engine, "numba")
         self.assertEqual(args.spot_input_csv_template, "")
         self.assertEqual(args.data_platform_base, "/mnt/z/數據平台")
+        self.assertTrue(args.low_memory_reports)
+        self.assertEqual(args.report_mode, "summary")
+        self.assertEqual(args.report_chunk_rows, 25_000)
         self.assertGreaterEqual(args.workers, 1)
 
     def test_default_output_dir_tracks_dates_and_latency(self) -> None:
@@ -57,6 +67,66 @@ class FastPipelineTest(unittest.TestCase):
             resolve_output_dir(args).name,
             "hbt_daily_full_market_20260601_20260630_latency_10ms",
         )
+
+    def test_leg_latency_uses_common_values_as_fallback(self) -> None:
+        args = parse_args(
+            [
+                "--order-latency-ms", "2",
+                "--response-latency-ms", "3",
+                "--feed-latency-offset-ms", "4",
+            ]
+        )
+        self.assertEqual(leg_latency_ms(args, "spot"), (2.0, 3.0, 4.0))
+        self.assertEqual(leg_latency_ms(args, "future"), (2.0, 3.0, 4.0))
+
+    def test_leg_latency_overrides_and_output_dir_are_separate(self) -> None:
+        args = parse_args(
+            [
+                "--start-date", "2026-01-01",
+                "--end-date", "2026-07-31",
+                "--future-order-latency-ms", "1",
+                "--future-response-latency-ms", "1",
+                "--future-feed-latency-offset-ms", "0",
+                "--spot-order-latency-ms", "1",
+                "--spot-response-latency-ms", "35",
+                "--spot-feed-latency-offset-ms", "0",
+            ]
+        )
+        self.assertEqual(leg_latency_ms(args, "future"), (1.0, 1.0, 0.0))
+        self.assertEqual(leg_latency_ms(args, "spot"), (1.0, 35.0, 0.0))
+        self.assertEqual(
+            resolve_output_dir(args).name,
+            "hbt_daily_full_market_20260101_20260731_"
+            "future_order_1ms_response_1ms_feed_0ms_"
+            "spot_order_1ms_response_35ms_feed_0ms",
+        )
+
+        pair = PairConfig(
+            name="2330_TXF",
+            spot_symbol="2330",
+            future_symbol="TXF",
+            spot_shares_per_pair=1000,
+            future_shares_per_pair=1000,
+            spot_order_qty=1,
+            future_order_qty=1,
+            future_pnl_multiplier=1000,
+            entry_threshold_pct=0.1,
+            exit_threshold_pct=0.0,
+            stop_loss_pct=1.0,
+            spot_tick_size=1.0,
+            future_tick_size=1.0,
+        )
+        config = build_pair_hbt_config(
+            args,
+            pair,
+            {"spot": Path("spot.npz"), "future": Path("future.npz")},
+        )
+        self.assertEqual(config.future.order_entry_latency_ns, 1_000_000)
+        self.assertEqual(config.future.order_response_latency_ns, 1_000_000)
+        self.assertEqual(config.future.feed_latency_offset_ns, 0)
+        self.assertEqual(config.spot.order_entry_latency_ns, 1_000_000)
+        self.assertEqual(config.spot.order_response_latency_ns, 35_000_000)
+        self.assertEqual(config.spot.feed_latency_offset_ns, 0)
 
     def test_tick_inference_and_audit_use_vectorized_min_price(self) -> None:
         data = np.zeros(3, dtype=EVENT_DTYPE)

@@ -114,6 +114,21 @@ class CapitalAllocationTest(unittest.TestCase):
         self.assertEqual(daily["ending_open_lots"].tolist(), [1, 0])
         self.assertEqual(outputs["capital_constraint_summary"].iloc[0]["replay_scope"], "continuous_position_candidate_replay")
 
+    def test_summary_replay_omits_large_detail_frames(self) -> None:
+        trades = pd.DataFrame(
+            [
+                _trade(timestamp=1, signal="ENTER_LONG_SPOT_SHORT_FUTURE"),
+                _trade(timestamp=2, signal="EXIT", spot_price=101.0, future_price=101.0),
+            ]
+        )
+
+        outputs = build_capital_constraint_outputs(trades, include_details=False)
+
+        self.assertTrue(outputs["capital_constraint_events"].empty)
+        self.assertTrue(outputs["capital_constraint_open_lots"].empty)
+        self.assertEqual(outputs["capital_constraint_summary"].iloc[0]["accepted_entries"], 1)
+        self.assertEqual(outputs["capital_constraint_summary"].iloc[0]["accepted_exits"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

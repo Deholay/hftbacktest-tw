@@ -103,6 +103,12 @@ Large detailed report tables use Parquet by default. Use
 `--workers 1` for serial debugging and `--rebuild-hbt-results` to explicitly
 bypass a valid cache.
 
+Report generation defaults to `--low-memory-reports --report-mode summary`:
+the persisted trade, market, and latency CSVs are reduced in 25,000-row
+batches after their multi-GB in-memory frames are released. Use
+`--report-mode full` when failure windows and per-event capital diagnostics are
+required; batch size remains configurable with `--report-chunk-rows`.
+
 Run from the Poetry project under `data_platform_client`:
 
 ```bash
@@ -127,12 +133,20 @@ poetry run python /home/zoufuc/hftbacktest/future_spot/scripts/run_hbt_daily_ful
 faster repeated HftBacktest loads. Omit the option to keep smaller compressed
 NPZ files.
 
-For latency observation, add non-zero order latency:
+Latency can be configured independently for the futures and spot legs. For
+example, the observed OMS paths can be approximated with:
 
 ```bash
-  --order-latency-ms 5 \
-  --response-latency-ms 5
+  --future-order-latency-ms 1 \
+  --future-response-latency-ms 1 \
+  --future-feed-latency-offset-ms 0 \
+  --spot-order-latency-ms 1 \
+  --spot-response-latency-ms 35 \
+  --spot-feed-latency-offset-ms 0
 ```
+
+The original `--order-latency-ms`, `--response-latency-ms`, and
+`--feed-latency-offset-ms` options remain available as shared fallbacks.
 
 To force the second-leg decision to wait for a fresh post-first-leg feed, add:
 

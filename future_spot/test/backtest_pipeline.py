@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 from argparse import Namespace
 from dataclasses import dataclass
@@ -34,6 +35,13 @@ class BacktestArtifacts:
 
     def frame(self, name: str) -> pd.DataFrame:
         return self.frames[name]
+
+    def release_large_frames(self) -> None:
+        """Drop report inputs that can be streamed back from the persisted CSVs."""
+        for name in ("trades", "market", "latency", "entry_exit_all"):
+            self.frames[name] = pd.DataFrame()
+        self.pair_results.clear()
+        gc.collect()
 
 
 def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
