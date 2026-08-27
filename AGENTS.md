@@ -1,169 +1,219 @@
-# Agent Notes
+# Agent Guide
 
-## Project
+## Mission
 
-Taiwan stock top-5 L2 / market-by-price experiments using `hftbacktest`.
+This repository supports Taiwan market-microstructure research with
+`hftbacktest`. It has two related surfaces:
 
-The main notebook is `notebooks/hftbacktest_TWStock.ipynb`. Keep it as a thin
-runner: reusable logic belongs in `scripts/`.
+1. Root stock/ETF/odd-lot/futures converters and notebook experiments.
+2. The `future_spot` full-market stock-future/spot arbitrage backtest, capital
+   replay, and reporting pipeline.
 
-Root `scripts/` is the cross-strategy library layer. Strategy folders such as
-`future_spot/` should implement adapters and domain behavior on top of root
-interfaces/helpers, not redefine project-wide contracts.
+Preserve reproducibility and market-data semantics. Do not make a backtest look
+cleaner by silently dropping dates, pairs, errors, open positions, or capital
+constraints.
 
-## Key Files
+## Architecture boundaries
 
-- `notebooks/hftbacktest_TWStock.ipynb`
-  Runnable experiment wrapper. Current sample uses `0050`, `2026-02-23`,
-  `09:30:00` to `10:00:00`.
-
-- `scripts/tw_stock_data_to_npz.py`
-  Converts Taiwan stock top-5 rows into hftbacktest event `.npz` data.
-  DataAPI access should come from `data_platform_client/data_stock/api`, not the
-  older `data_platform/data_stock/api`.
-
-- `scripts/tw_stock_hftbacktest.py`
-  Shared `BacktestConfig`, hftbacktest asset setup, package import isolation,
-  state helpers, and BBO helpers.
-
-- `scripts/tw_stock_strategies.py`
-  Strategy runners and DataFrame summary helpers.
-
-- `scripts/strategy_api.py`
-  Project-wide strategy interface: `StrategyContext`, `StrategyDecision`,
-  `Strategy`, `StrategyRunner`, and lightweight registry helpers.
-
-- `scripts/hbt_types.py`, `scripts/hbt_common.py`, `scripts/io_utils.py`
-  Cross-strategy HBT dataclasses, queue/order/latency/fill helpers, and small
-  CSV/DataFrame/time helpers.
-
-- `requirements.txt`
-  Shared Python dependencies for notebooks and retained HBT runners. Optional
-  live/provider SDKs are not pinned here.
-
-- `notebooks/hbt_strategy_interface_example.ipynb`
-  Root-level template showing how future strategy notebooks should import the
-  root strategy interface plus a concrete strategy adapter.
-
-- `future_spot/`
-  Taiwan stock-future / spot arbitrage strategy implementation. Treat
-  `future_spot/arbitrage/` as domain implementation and `future_spot/scripts/`
-  as thin CLI entrypoints for that strategy only.
-
-- `README.md`
-  Human-facing summary of current strategy work, event conversion caveats, and
-  validation commands.
-
-## Current Strategies
-
-- Strategy 1: aggressive BBO fill sanity test.
-- Strategy 2: passive bid1/ask1 queue model comparison.
-- Strategy 3: simple fixed-level passive order, e.g. `side="sell"`, `level=5`,
-  larger quantity, longer window.
-
-Strategy output should be DataFrames. Prefer compact summary DataFrames in the
-notebook and keep detailed raw output available as separate variables.
-
-## Strategy Interface Rules
-
-- Put cross-strategy contracts and reusable HBT utilities in root `scripts/`.
-- Put strategy-specific models, pricing, risk, config parsing, output schemas,
-  and adapters inside the strategy folder.
-- `future_spot` implements `scripts.strategy_api` through
+- Root `scripts/` is the cross-strategy library layer.
+- `scripts/strategy_api.py` owns project-wide strategy contracts:
+  `StrategyContext`, `StrategyDecision`, `Strategy`, `StrategyRunner`, and the
+  lightweight registry.
+- `scripts/hbt_types.py`, `scripts/hbt_common.py`, and `scripts/io_utils.py` own
+  strategy-neutral HBT types, execution helpers, and I/O helpers.
+- Strategy folders own domain models, pricing, risk, execution, config parsing,
+  output schemas, and adapters.
+- `future_spot` implements the root strategy interface in
   `future_spot/arbitrage/strategy_adapter.py`.
-- Do not make future strategies import `future_spot` for reusable behavior.
-  Promote clean, strategy-neutral helpers to root `scripts/` first.
-- Cross-strategy example notebooks belong in root `notebooks/`; strategy-specific
-  reports can live under the strategy folder.
+- Never make a new strategy family import `future_spot` for reusable behavior.
+  Promote clean, domain-neutral code to root `scripts/` first.
+- Keep notebooks thin. Reusable conversion, execution, analytics, and plotting
+  logic belongs in Python modules.
+- Keep `future_spot/scripts/` as thin CLI entrypoints. Business logic belongs
+  in `future_spot/arbitrage/`.
 
-## Data Platform Dependency
+## Project map
 
-Use `data_platform_client` as the data platform dependency for conversion.
+### Root library and notebooks
 
-- `tw_stock_data_to_npz.py` defaults to
-  `data_platform_client/data_stock/api`.
-- Do not switch conversion back to `data_platform/data_stock/api`.
-- The older `data_platform` API path has cast all columns to `Int64` in the
-  past, which truncates ETF decimal prices such as `77.95` to `77`.
-- If a notebook still emits only integer prices, restart the kernel or reload
-  `scripts.tw_stock_data_to_npz`; stale imports can keep using the old path.
+- `scripts/tw_stock_data_to_npz.py`: source rows to HftBacktest event arrays or
+  `.npz` files.
+- `scripts/tw_stock_hftbacktest.py`: `BacktestConfig`, asset setup, import
+  isolation, state, and BBO helpers.
+- `scripts/tw_stock_strategies.py`: stock notebook strategies and DataFrame
+  summary helpers.
+- `notebooks/hftbacktest_TWStock.ipynb`: current stock sample (`0050`,
+  `2026-02-23`, `09:30:00`-`10:00:00`).
+- `notebooks/hftbacktest_TWETF.ipynb`,
+  `notebooks/hftbacktest_TWOddLot.ipynb`, and
+  `notebooks/hftbacktest_TWStockFuture.ipynb`: daily-parquet runners.
+- `notebooks/hbt_strategy_interface_example.ipynb`: cross-strategy adapter
+  example.
 
-For 0050 with `tick_size = 0.05`, a healthy converted sample should contain
-fractional prices such as `77.90`, `77.95`, `78.00`, `78.05`, not only `77`
-and `78`.
+### Futures/spot implementation
 
-## HftBacktest Depth Rules
+- `future_spot/test/run_full_backtest.py`: supported one-command HBT + reports
+  + PNG entrypoint.
+- `future_spot/arbitrage/full_market_runner.py`: CLI definition and compatibility
+  implementation.
+- `future_spot/arbitrage/daily_pipeline.py`: date selection, daily universe,
+  config, and path resolution.
+- `future_spot/arbitrage/event_data.py`: source resolution, per-symbol event
+  conversion, and reuse audit.
+- `future_spot/arbitrage/hbt_pipeline.py`: pair configs, execution, cache, and
+  result loading.
+- `future_spot/arbitrage/hbt_backtest.py`: pair-level HBT and latency capture.
+- `future_spot/arbitrage/hbt_numba.py`: optimized default strategy scanner.
+- `future_spot/arbitrage/position_carry.py`: cross-date position restoration and
+  expiry handling.
+- `future_spot/arbitrage/capital.py`: shared-capital candidate replay.
+- `future_spot/arbitrage/reporting.py` and `future_spot/test/report_tables.py`:
+  persisted analytical tables.
+- `future_spot/test/report_plots.py`: saved PNG reports.
+- `future_spot/arbitrage/backtest_report.py` and
+  `future_spot/arbitrage/result_replot.py`: filtered/durable report generation
+  and result replotting.
 
-hftbacktest `HashMapMarketDepth` stores depth by integer tick index.
+## Non-negotiable data rules
 
-- `depth.best_ask` is a float price.
-- `depth.best_ask_tick` is an integer tick.
-- `depth.ask_qty_at_tick(tick)` expects an integer tick, not a float price.
-- Convert price to tick with `round(price / tick_size)`.
+### Data platform
 
-For `tick_size = 0.05`:
+Use `data_platform_client/data_stock/api` for stock conversion. Do not switch
+back to `data_platform/data_stock/api`; that older path has cast all columns to
+`Int64` and truncated decimal ETF prices.
 
-```python
-price = 77.10
-tick = round(price / 0.05)
-qty = depth.ask_qty_at_tick(tick)
-```
+For `0050` with `tick_size = 0.05`, healthy converted prices include `77.90`,
+`77.95`, `78.00`, and `78.05`. Output containing only `77` and `78` indicates a
+wrong or stale conversion import. Restart the notebook kernel or reload
+`scripts.tw_stock_data_to_npz` before diagnosing downstream HBT behavior.
 
-Do not pass `77.10` directly into `ask_qty_at_tick`.
+### HftBacktest input
 
-## TW Top-5 Data Rules
-
-The source data is market-by-price, not market-by-order.
-
-- Same-price top-5 rows must be aggregated before emitting depth snapshot
-  events.
-- The backtest cannot recover individual orders at the same price.
-- Queue position at the same price must be modeled by hftbacktest queue models.
-- `level=5` means the fifth non-empty price level, not the fifth order at the
-  same price.
-
-## Conversion Notes
-
-`tw_stock_data_to_npz.py` emits event rows:
+HftBacktest accepts an `.npz` containing key `data` or an in-memory NumPy event
+array with this dtype layout:
 
 ```text
 ev, exch_ts, local_ts, px, qty, order_id, ival, fval
 ```
 
-hftbacktest can consume either:
+It does not accept raw provider rows. Each top-5 source row is converted by
+clearing the visible range, inserting aggregated snapshot levels, and
+optionally inferring trades from `total_volume` deltas. Source trade side is not
+explicit and is inferred from the previous BBO by default.
 
-- an `.npz` file path containing key `data`, or
-- an in-memory NumPy event array with the same hftbacktest event dtype.
+### Top-5 market-by-price semantics
 
-It cannot consume raw data platform rows directly. Raw top-5 rows must first be
-converted into hftbacktest events, even if the result is passed in memory instead
-of saved as `.npz`.
+- The source is market-by-price, not market-by-order.
+- Aggregate repeated prices across top-5 fields before emitting snapshots.
+- Individual same-price orders and exact queue position are unrecoverable.
+- Queue position must be represented by an explicit HftBacktest queue model.
+- `level=5` means the fifth distinct non-empty price, never the fifth order at
+  one price.
+- ETF and odd-lot feeds have top-5 prices but no top-5 quantities. Their default
+  `price_only_depth_qty=1.0` output is suitable for structural replay, not
+  queue-size inference.
 
-Each source top-5 row is converted as:
+### Tick-index depth API
 
-1. Clear visible price range.
-2. Insert aggregated snapshot levels.
-3. Optionally infer trade events from `total_volume` deltas.
+`HashMapMarketDepth` stores quantity by integer tick:
 
-Trade side is not explicit in the source; the converter infers it from previous
-BBO by default.
-
-## Validation
-
-Use:
-
-```powershell
-python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py
+```python
+price = 77.10
+tick = round(price / tick_size)
+qty = depth.ask_qty_at_tick(tick)
 ```
 
-When debugging missing `ask5` / `bid5`, check both:
+`depth.best_ask` is a float price, `depth.best_ask_tick` is an integer, and
+`ask_qty_at_tick`/`bid_qty_at_tick` require the integer. Never pass a float price
+to a quantity-at-tick method.
 
-1. Source or converted events contain five distinct price levels.
-2. `BacktestConfig.tick_size` matches the symbol's actual price grid.
+## Futures/spot behavior to preserve
 
-Do not infer tick size from already-suspect or rounded event output.
+- The default adapter is `FutureSpotPairStrategy`; a custom strategy must still
+  implement the root `scripts.strategy_api` contract.
+- The Numba engine is the optimized default. Keep the Python engine as the
+  behavioral reference and custom-strategy fallback.
+- Dates execute sequentially when carry is enabled; pairs within each date may
+  execute in worker processes.
+- Carry held contracts into the next trading day's universe. Never roll an old
+  futures position into a new front month implicitly.
+- A residual position on expiry must be explicit in carry/report output and
+  treated according to the configured expiry policy.
+- Futures are the default first leg. Re-check the second-leg condition after the
+  first fill and apply the configured flatten action when it fails.
+- Latency is independent per leg: feed offset, order entry, and response. Shared
+  latency flags are fallbacks only.
+- `--post-first-feed-wait spot` means the second-leg decision waits until the
+  spot feed advances after the first future response. A timeout records
+  `POST_FIRST_FEED_TIMEOUT` and triggers configured first-leg risk handling.
+- The shared-capital replay must operate on saved fill candidates in timestamp
+  order. Report candidate, accepted, and rejected entries separately.
+- `--leverage` applies configured futures margin and spot own-funds ratios;
+  `--no-leverage` charges 100% capital to both legs. Never describe one mode as
+  the other.
 
-For 0050 conversion sanity checks, inspect the produced event prices:
+Default strategy parameters come from
+`future_spot/arbitrage_config_base.json`; command-line overrides take
+precedence. Do not place credentials in this file. Optional live/provider SDKs
+are intentionally absent from `requirements.txt`.
+
+## Exclusions, errors, and reporting
+
+- Known incomplete-tick dates and expiry-residual run keys are explicit defaults
+  in `future_spot/arbitrage/full_market_runner.py`. An exclusion must affect
+  config building, conversion, HBT, reports, plots, and capital replay
+  consistently.
+- Preserve an audit of every exclusion. Do not add a new exclusion simply to
+  improve reported PnL.
+- Always inspect `run_errors.csv`; a generated chart does not imply a clean run.
+- Realized portfolio ROI is capital-constrained realized PnL divided by starting
+  own capital. Do not include open-position marks unless the metric is clearly
+  labeled as including open positions.
+- Profit is recognized on matched exit dates. State the effective plotted date
+  range when it differs from the requested backtest range.
+- Report discarded/residual open lots alongside performance metrics.
+- `backtest_manifest.json` fingerprints result-defining arguments, daily
+  configs, event-file stats, and strategy/HBT sources. Keep cache validation
+  conservative when adding result-affecting inputs.
+- Low-memory summary reports read persisted CSVs in bounded chunks. Do not
+  reintroduce multi-GB in-memory concatenation into the default report path.
+- `future_spot/output/` is generated and git-ignored. When a result must appear
+  in repository documentation, copy only the selected final artifact into a
+  tracked documentation asset path and record its run assumptions.
+
+## Output expectations
+
+- Strategy and report tables should be DataFrames.
+- Notebook cells should display compact summary DataFrames and retain detailed
+  frames under separate variables.
+- A complete full-market output includes summary, trade, entry/exit, market,
+  latency, carry, settings, conversion, error, and manifest artifacts.
+- Detailed reports default to Parquet; use CSV only when explicitly required.
+- `--report-mode summary` is the bounded default. `full` is for diagnostic
+  tables, not routine runs.
+
+## Change workflow
+
+1. Read the nearest implementation, tests, and manifest/report consumer before
+   editing a result-defining path.
+2. Keep changes inside the correct architectural layer.
+3. Add or update focused tests for conversion, execution, position carry,
+   capital replay, report streaming, cache invalidation, or exclusions as
+   applicable.
+4. Preserve unrelated user changes and generated outputs.
+5. Run focused tests first, then compile every retained Python entrypoint.
+6. Inspect `git diff --check` and the final diff for accidental output files,
+   secrets, or undocumented changes to assumptions.
+
+Validation baseline:
+
+```bash
+python3 -m pytest -q tests future_spot/test
+python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py future_spot/test/*.py
+git diff --check
+```
+
+For `0050` conversion sanity checks:
 
 ```python
 data = np.load(DATA_FILE)["data"]
@@ -171,5 +221,5 @@ unique_px = np.unique(data["px"][np.isfinite(data["px"]) & (data["px"] > 0)])
 print(unique_px[:20])
 ```
 
-If the output only has `[77., 78.]` for a 0.05-tick window, the conversion path
-is wrong or stale.
+If the prices are only `[77., 78.]` for a `0.05`-tick window, fix the conversion
+path or stale import before changing strategy or depth logic.

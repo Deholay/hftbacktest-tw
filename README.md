@@ -1,227 +1,222 @@
-﻿# TW Stock HftBacktest Notes
+# Taiwan Market Microstructure Backtesting
 
-[繁體中文](README.zh-TW.md)
+Research tooling for Taiwan stock, ETF, odd-lot, and stock-future market data,
+built on [`hftbacktest`](https://github.com/nkaz001/hftbacktest). The repository
+converts Taiwan top-5 market-by-price feeds into HftBacktest events, provides a
+small cross-strategy API, and implements a full-market stock-future/spot
+arbitrage workflow with latency, position carry, capital replay, and reports.
 
-This repo contains Taiwan stock L2 / top-5 market-by-price experiments built on `hftbacktest`.
+The main research path is `future_spot/`. The root notebooks remain useful for
+conversion checks, queue-model experiments, and new strategy prototypes.
 
-## Project Architecture
+## Backtest result
 
-- `scripts/` owns reusable project-level interfaces and shared HBT helpers.
-- `scripts/strategy_api.py` is the public strategy integration contract for new
-  strategy families.
-- `future_spot/` is one concrete strategy implementation: Taiwan stock-future /
-  spot arbitrage.
-- Future strategy folders should implement adapters against
-  `scripts.strategy_api` instead of depending on `future_spot`.
-- `future_spot/scripts/` contains thin CLI entrypoints for the `future_spot`
-  strategy only. Reusable code should live in root `scripts/` or in the
-  strategy package that owns the domain behavior.
+The latest retained portfolio report covers the requested range
+**2026-01-01 through 2026-07-31**. Dates with recognized PnL in the chart run
+from **2026-01-08 through 2026-07-30** because PnL is recognized only when both
+legs have a matched exit.
 
-See `STRATEGY_GUIDANCE.md` and `notebooks/hbt_strategy_interface_example.ipynb`
-for the adapter contract and notebook/CLI usage.
+| Metric | Result |
+| --- | ---: |
+| Realized PnL | NT$7,069,581.38 |
+| ROI on NT$50M starting capital | 14.14% |
+| Peak capital in use | NT$49,779,287.42 (99.56%) |
+| Candidate / accepted entries | 8,206 / 4,185 (51.00%) |
+| Capital-rejected entries | 4,021 across 29 days |
+| Accepted exits | 4,179 |
 
-## Setup
+![Futures/spot realized portfolio overview](docs/assets/futures-spot-portfolio-overview-20260101-20260731.png)
 
-Install the shared Python dependencies from the repository root:
+This is a simulated research result, not live performance. It uses a shared
+NT$50M capital replay with leverage disabled: spot and futures are each charged
+at 100% of notional and limited to NT$25M. Open-position marks are excluded.
+Seven incomplete-tick dates and eight expiry-residual pair runs are excluded;
+the capital replay removes six additional expiry residual lots. The run also
+records two missing-event-data errors on 2026-07-10. Exact inputs, exclusions,
+latency settings, and code fingerprints are preserved in the run's
+`backtest_manifest.json`.
+
+The source output is:
+
+```text
+future_spot/output/hbt_daily_full_market_20260101_20260731_future_order_1ms_response_1ms_feed_0ms_spot_order_1ms_response_35ms_feed_0ms/
+```
+
+## Quick start
+
+Use Python 3.11+ and install the shared research dependencies from the
+repository root:
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-`requirements.txt` installs `hftbacktest` from pip along with the core
-numeric/notebook stack. Optional live-trading dependencies such as `fubon_neo`
-are not pinned because the current retained workflow is offline HBT research.
+Run a small serial smoke test before starting a full-market job:
 
-The current working notebook is `notebooks/hftbacktest_TWStock.ipynb`. The notebook is intentionally thin: data conversion, hftbacktest setup, and strategy logic live in `scripts/` so notebook cells mostly run functions and display DataFrames.
-
-## Key Files
-
-- `scripts/tw_stock_data_to_npz.py`: converts Taiwan stock top-5 rows into hftbacktest event `.npz` files.
-- `scripts/tw_stock_hftbacktest.py`: shared hftbacktest config, asset setup, BBO/state helpers, and package import isolation.
-- `scripts/tw_stock_strategies.py`: strategy runners and DataFrame summary helpers.
-- `scripts/strategy_api.py`: root strategy context/decision protocols and optional registry.
-- `scripts/hbt_types.py`: HBT asset/fill dataclasses that are not tied to one strategy family.
-- `scripts/hbt_common.py`: generic HBT queue/order/latency/fill helpers.
-- `scripts/io_utils.py`: generic CSV/DataFrame/time conversion helpers.
-- `future_spot/`: futures/spot arbitrage implementation of the root strategy interface.
-- `notebooks/hbt_strategy_interface_example.ipynb`: root-level template for new strategy notebooks.
-- `requirements.txt`: shared Python dependencies for notebooks and retained HBT runners.
-- `notebooks/hftbacktest_TWStock.ipynb`: runnable experiment wrapper.
-- `notebooks/hftbacktest_TWETF.ipynb`: ETF daily parquet runner.
-- `notebooks/hftbacktest_TWOddLot.ipynb`: odd-lot daily parquet runner.
-- `notebooks/hftbacktest_TWStockFuture.ipynb`: stock-future daily parquet runner.
-
-## Additional Source Converters
-
-Stock conversion reads the parquet store through `data_platform_client/data_stock/api` as a Polars LazyFrame. It projects and filters the required columns before collection, then feeds columnar NumPy arrays directly to the Numba event builder. ETF, Odd Lot, and Stock Future use the daily parquet roots listed in `path.toml`, then share the same event builder, hftbacktest setup, and strategy code.
-
-The futures/spot full-market runner batches stock-future conversion by trading
-date: it scans the daily futures parquet once for all missing symbols, then
-writes the usual per-symbol NPZ files sequentially so event arrays do not
-accumulate in memory.
-
-Column index check against the stock top-5 schema:
-
-| Source | Same as stock? | Relevant column layout | Converter |
-| --- | --- | --- | --- |
-| Stock | Yes | `ask_price1`/`ask_volume1` start at stock schema indexes 16/17. | `convert_tw_stock_to_npz` |
-| ETF | No | 23 columns; `ask_price1` index 7, `bid_price1` index 8; no per-level volume columns. | `convert_tw_etf_to_npz` |
-| Odd Lot | No | Same 23-column price-only layout as ETF; `symbol` may be stored as an integer, so `0050` also matches `50`. | `convert_tw_odd_lot_to_npz` |
-| Stock Future | No | 40 columns; `ask_price1`/`ask_volume1`/`bid_price1`/`bid_volume1` start at indexes 7/8/9/10. | `convert_tw_stock_future_to_npz` |
-
-ETF and Odd Lot parquet data only contain top-5 prices, not top-5 quantities. Their converters use `price_only_depth_qty=1.0` by default so BBO/depth replay can run, but queue-size-sensitive strategy output should be read as a structural replay test rather than a true queue-volume model.
-
-DataAPI and daily-parquet conversion use a columnar NumPy/Numba event builder rather than
-materializing one Python dictionary per source row. Conversion summaries print
-separate load, event-build, normalization, and write timings. NPZ output remains
-compressed by default; use `--npz-compression uncompressed` (or
-`npz_compression="uncompressed"` in Python) when faster writes and subsequent
-loads matter more than disk usage.
-
-## Current Notebook Flow
-
-1. Convert TW stock L2/top-5 data into hftbacktest event data.
-2. Build `BacktestConfig`.
-3. Run Strategy 1, Strategy 2, and Strategy 3.
-4. Display compact DataFrame summaries.
-
-Current sample config:
-
-```python
-SYMBOL = "0050"
-START_DATE = "2026-02-23"
-END_DATE = START_DATE
-START_TIME = "09:30:00"
-END_TIME = "10:00:00"
-TICK_SIZE = 0.05
+```bash
+python3 future_spot/test/run_full_backtest.py \
+  --start-date 2026-05-21 \
+  --end-date 2026-05-21 \
+  --workers 1 \
+  --max-pairs 5
 ```
 
-`TICK_SIZE` is explicit because hftbacktest depth is keyed by tick index. Do not infer it from already-converted event samples if the conversion is under review.
+The retained January-July run used the following result-defining execution and
+capital settings in addition to the date range and data paths:
 
-## Strategies
-
-### Strategy 1: Aggressive BBO Fill
-
-`run_aggressive_fill_strategy`
-
-- Buys at best ask.
-- Sells at best bid.
-- Expected to fill immediately by design.
-- Used as a sanity check for event replay, order submission, timestamps, and accounting fields.
-
-Output includes order side, price, execution price/quantity, send order time, fill time, position, balance, equity, and trade counters.
-
-### Strategy 2: Passive Bid1 / Ask1 Queue Model Comparison
-
-`run_queue_model_comparison`
-
-- Places passive buy at bid1 and passive sell at ask1.
-- Runs multiple queue models, currently `risk_adverse` and `log_prob`.
-- Compares fill timestamps and `queue_model_fill_delta_ns`.
-- Records `send_order_time` and `fill_time` so zero fill deltas are easier to diagnose.
-
-### Strategy 3: Simple Fixed Level Passive Order
-
-`run_level_queue_model_comparison`
-
-- Current simplified form targets one fixed book level, e.g. `side="sell"`, `level=5`.
-- Uses a larger quantity and longer window than Strategy 2.
-- Returns both requested `level` and observed `actual_level`.
-
-`actual_level` matters because the visible book may not contain the requested fifth distinct price level. If fewer levels exist, the strategy falls back to the deepest visible level and records that actual level explicitly.
-
-## HftBacktest Depth Model Notes
-
-hftbacktest `HashMapMarketDepth` stores book depth by integer tick index.
-
-Important API behavior:
-
-```python
-depth.best_ask          # float price
-depth.best_ask_tick     # integer tick
-depth.ask_qty_at_tick   # expects integer tick, not float price
+```bash
+python3 future_spot/test/run_full_backtest.py \
+  --start-date 2026-01-01 \
+  --end-date 2026-07-31 \
+  --future-order-latency-ms 1 \
+  --future-response-latency-ms 1 \
+  --future-feed-latency-offset-ms 0 \
+  --spot-order-latency-ms 1 \
+  --spot-response-latency-ms 35 \
+  --spot-feed-latency-offset-ms 0 \
+  --post-first-feed-wait spot \
+  --post-first-feed-timeout-ms 5000 \
+  --no-leverage
 ```
 
-For a stock with `tick_size = 0.05`:
+The default data paths target Linux/WSL mounts under `/mnt/z`. Supply the
+`--futures-parquet-template`, daily TWSE/TPEX templates, and
+`--data-platform-base` arguments when your storage layout differs. See
+[`future_spot/README.md`](future_spot/README.md) for the complete command and
+runner controls.
 
-```python
-price = 77.10
-tick = round(price / 0.05)  # 1542
-qty = depth.ask_qty_at_tick(tick)
-```
+## How the repository is organized
 
-Do not call `depth.ask_qty_at_tick(77.10)`. That passes a price into an API that expects a tick index.
+| Path | Responsibility |
+| --- | --- |
+| `scripts/strategy_api.py` | Project-wide `StrategyContext`, `StrategyDecision`, `Strategy`, and runner contracts. |
+| `scripts/hbt_types.py` | Strategy-neutral HBT asset and fill dataclasses. |
+| `scripts/hbt_common.py` | Shared queue, order, latency, and fill helpers. |
+| `scripts/io_utils.py` | Small DataFrame, CSV, and time helpers. |
+| `scripts/tw_stock_data_to_npz.py` | Taiwan top-5 rows to HftBacktest event arrays or `.npz`. |
+| `scripts/tw_stock_hftbacktest.py` | Shared stock backtest configuration, asset setup, state, and BBO helpers. |
+| `scripts/tw_stock_strategies.py` | Stock notebook strategies and DataFrame summaries. |
+| `future_spot/arbitrage/` | Futures/spot pricing, risk, execution, HBT, carry, capital, and reporting implementation. |
+| `future_spot/scripts/` | Thin futures/spot command-line entrypoints. |
+| `future_spot/test/run_full_backtest.py` | Complete backtest plus report-table and PNG generation. |
+| `notebooks/` | Thin experiment runners and the cross-strategy integration example. |
 
-Strategy 3 scans from `best_ask_tick` or `best_bid_tick` and checks `ask_qty_at_tick` / `bid_qty_at_tick` for non-empty levels.
+Cross-strategy behavior belongs in root `scripts/`. A strategy folder owns only
+its domain models, pricing, risk, execution, configuration, and output schema.
+New strategy families should implement `scripts.strategy_api` rather than
+importing reusable behavior from `future_spot`. See
+[`STRATEGY_GUIDANCE.md`](STRATEGY_GUIDANCE.md) and
+[`notebooks/hbt_strategy_interface_example.ipynb`](notebooks/hbt_strategy_interface_example.ipynb).
 
-## TW Top-5 Data Caveats
+## Futures/spot workflow
 
-The TW source data is top-5 market-by-price data, not market-by-order data.
+The full-market runner performs one reproducible pipeline:
 
-Implications:
+1. Select trading dates and construct the eligible stock-future/spot universe.
+2. Convert source market data into per-symbol HftBacktest event files.
+3. Replay every pair with independent feed, order, and response latency per leg.
+4. Carry open positions across trading dates without silently rolling futures
+   contracts.
+5. Replay saved fills against one shared capital budget.
+6. Write audit CSVs, report tables, and PNG figures.
 
-- It can model visible aggregate depth per price level.
-- It cannot recover individual order queue positions inside the same price.
-- Queue position must be estimated by hftbacktest queue models.
-- Same-price top-5 rows must be aggregated before emitting hftbacktest depth snapshot events.
+The default strategy enters long spot / short future when the configured basis,
+effective-tick, and visible-size rules pass. Futures are submitted first by
+default. The second leg is re-evaluated after the first fill; the retained run
+waits for a fresh spot feed before making that decision. If the second leg
+fails, the configured risk action attempts to flatten the first leg.
 
-The converter now aggregates same-price visible rows:
+The Numba engine is the optimized default. Use `--strategy-engine python` for a
+reference/debug path or for a custom strategy implementation. Pair processes
+run in parallel, while dates remain sequential when position carry is enabled.
+`backtest_manifest.json` prevents reuse of cached HBT results when arguments,
+daily configs, event files, or strategy/HBT source files have changed.
 
-```text
-ask_price2 = 77.10, ask_volume2 = 20
-ask_price3 = 77.10, ask_volume3 = 30
+### Important outputs
 
-emitted depth at 77.10 = 50
-```
+Each full run writes these files under its output directory:
 
-This avoids multiple same-price snapshot events overwriting each other in hftbacktest depth.
+- `summary_all_daily_pairs.csv`: pair/day status, positions, and realized PnL.
+- `trades_all_daily_pairs.csv`: order and execution events.
+- `entry_exit_all_daily_pairs.csv`: compact signal/execution audit.
+- `market_all_daily_pairs.csv`: sampled market and non-HOLD signal states.
+- `latency_all_daily_pairs.csv`: local, spot-exchange, and futures-exchange
+  timing events.
+- `position_carry_status.csv`: initial/final positions, expiry, and next-day
+  carry status.
+- `run_errors.csv`: pair failures or missing inputs; inspect it for every run.
+- `reports/`: capital, ROI, failure, latency, and profit tables.
+- `figures/`: portfolio, performance, latency, and capital charts.
 
-## Event Conversion Notes
+For a smaller report footprint, use `--report-mode summary` and
+`--skip-entry-exit-by-pair`. Detailed tables default to Parquet. Use
+`--report-mode full` only when per-event failure and capital diagnostics are
+needed.
 
-`tw_stock_data_to_npz.py` emits hftbacktest event rows with:
+## Event conversion and market-data limits
+
+Raw provider rows are not valid HftBacktest input. They must be converted to an
+event array with fields:
 
 ```text
 ev, exch_ts, local_ts, px, qty, order_id, ival, fval
 ```
 
-Each source row is treated as a top-5 book image:
+Stock conversion must use `data_platform_client/data_stock/api`. The older
+`data_platform/data_stock/api` path has previously coerced every column to
+`Int64`, truncating decimal ETF prices. For `0050` at a `0.05` tick, healthy
+events contain prices such as `77.90`, `77.95`, `78.00`, and `78.05`.
 
-1. Clear the visible top-5 price range for each side.
-2. Insert aggregated snapshot levels.
-3. Optionally infer trade events from `total_volume` deltas.
+Taiwan top-5 data is market-by-price, not market-by-order:
 
-Trade side is not explicit in the source fields. The converter infers side from the previous BBO by default.
+- same-price levels must be aggregated before snapshot events are emitted;
+- individual orders and exact queue positions cannot be reconstructed;
+- queue position is therefore a model assumption;
+- `level=5` means the fifth non-empty price level, not a fifth order at one
+  price;
+- trade side is inferred from the previous BBO when it is absent from source
+  data.
 
-## Validation Commands
+ETF and odd-lot daily parquet feeds contain top-5 prices without top-5 sizes.
+Their converter inserts `price_only_depth_qty=1.0` by default, so those replays
+are structural BBO/depth checks rather than reliable queue-volume simulations.
 
-Compile the changed scripts:
-
-```powershell
-python -m py_compile scripts/tw_stock_data_to_npz.py scripts/tw_stock_strategies.py
-```
-
-Quick synthetic check for float price preservation and same-price aggregation:
+HftBacktest depth is keyed by integer tick index. Convert prices before querying
+quantity:
 
 ```python
-from scripts.tw_stock_data_to_npz import iter_depth_events, event_kind, DEPTH_SNAPSHOT_EVENT, SELL_EVENT
-
-row = {
-    "ask_price1": "77.05", "ask_volume1": "10",
-    "ask_price2": "77.10", "ask_volume2": "20",
-    "ask_price3": "77.10", "ask_volume3": "30",
-}
-
-events = list(iter_depth_events(row, 1, 1, 3, 1.0))
-asks = [
-    (px, qty)
-    for ev, _, _, px, qty, *_ in events
-    if ev & SELL_EVENT and event_kind(ev) == DEPTH_SNAPSHOT_EVENT
-]
-print(asks)
+price = 77.10
+tick = round(price / 0.05)
+qty = depth.ask_qty_at_tick(tick)
 ```
 
-Expected output:
+Passing `77.10` directly to `ask_qty_at_tick` is incorrect; the method expects
+the integer tick (`1542` in this example).
 
-```text
-[(77.05, 10.0), (77.1, 50.0)]
+## Notebook experiments
+
+The notebooks are intentionally thin runners:
+
+- `hftbacktest_TWStock.ipynb`: stock conversion and three queue/fill sanity
+  strategies.
+- `hftbacktest_TWETF.ipynb`: ETF daily-parquet replay.
+- `hftbacktest_TWOddLot.ipynb`: odd-lot daily-parquet replay.
+- `hftbacktest_TWStockFuture.ipynb`: stock-future daily-parquet replay.
+- `hbt_strategy_interface_example.ipynb`: adapter template for a new strategy
+  family.
+
+Reusable logic belongs in Python modules. Notebook output should favor compact
+summary DataFrames while retaining detailed frames in separate variables.
+
+## Validation
+
+Run the focused test suite and compile every retained Python entrypoint:
+
+```bash
+python3 -m pytest -q tests future_spot/test
+python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py future_spot/test/*.py
 ```
+
+When debugging missing `ask5` or `bid5`, verify both the number of distinct
+levels in source/events and the symbol's real tick size. Do not infer tick size
+from output that is already suspected of rounding or conversion errors.
