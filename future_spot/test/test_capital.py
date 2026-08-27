@@ -114,6 +114,28 @@ class CapitalAllocationTest(unittest.TestCase):
         self.assertEqual(daily["ending_open_lots"].tolist(), [1, 0])
         self.assertEqual(outputs["capital_constraint_summary"].iloc[0]["replay_scope"], "continuous_position_candidate_replay")
 
+    def test_excluded_expiry_run_discards_carried_lot_without_profit(self) -> None:
+        entry = _trade(timestamp=1, signal="ENTER_LONG_SPOT_SHORT_FUTURE")
+        late_exit = _trade(timestamp=2, signal="EXIT", spot_price=101.0, future_price=101.0)
+        late_exit["trade_date"] = "2026-01-04"
+        late_exit["run_key"] = "2026-01-04::2330_CDF"
+
+        outputs = build_capital_constraint_outputs(
+            pd.DataFrame([entry, late_exit]),
+            CapitalAllocationConfig(carry_positions=True),
+            excluded_run_keys=["2026-01-03::2330_CDF"],
+        )
+        daily = outputs["daily_capital_constraint"].set_index(
+            outputs["daily_capital_constraint"]["trade_date"].dt.strftime("%Y-%m-%d")
+        )
+        summary = outputs["capital_constraint_summary"].iloc[0]
+
+        self.assertEqual(daily.loc["2026-01-03", "discarded_open_lots"], 1)
+        self.assertEqual(daily.loc["2026-01-03", "ending_open_lots"], 0)
+        self.assertEqual(daily.loc["2026-01-04", "ignored_unmatched_exits"], 1)
+        self.assertEqual(summary["discarded_open_lots"], 1)
+        self.assertEqual(summary["capital_filtered_realized_pnl"], 0.0)
+
     def test_summary_replay_omits_large_detail_frames(self) -> None:
         trades = pd.DataFrame(
             [

@@ -55,6 +55,11 @@ The current working notebook is `notebooks/hftbacktest_TWStock.ipynb`. The noteb
 
 Stock conversion reads the parquet store through `data_platform_client/data_stock/api` as a Polars LazyFrame. It projects and filters the required columns before collection, then feeds columnar NumPy arrays directly to the Numba event builder. ETF, Odd Lot, and Stock Future use the daily parquet roots listed in `path.toml`, then share the same event builder, hftbacktest setup, and strategy code.
 
+The futures/spot full-market runner batches stock-future conversion by trading
+date: it scans the daily futures parquet once for all missing symbols, then
+writes the usual per-symbol NPZ files sequentially so event arrays do not
+accumulate in memory.
+
 Column index check against the stock top-5 schema:
 
 | Source | Same as stock? | Relevant column layout | Converter |

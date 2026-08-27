@@ -170,6 +170,11 @@ Spot tick conversion defaults to the `data_platform_client` parquet store at
 session filter before collection, and sends column arrays to the Numba event
 builder without materializing Python dictionaries.
 
+For stock futures, the full-market runner scans each daily parquet once for all
+missing symbols, then builds and writes one symbol NPZ at a time. Existing NPZ
+files are skipped before the batch scan, and event arrays are released between
+symbols to keep peak memory bounded.
+
 Daily CSV remains available as a fallback. To use a file such as:
 
 ```text

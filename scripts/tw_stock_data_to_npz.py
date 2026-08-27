@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Mapping
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -854,7 +854,13 @@ def daily_parquet_columns(levels: int) -> list[str]:
     return columns
 
 
-def _collect_source_frame(lf, args: argparse.Namespace, *, filter_symbol: bool):
+def _collect_source_frame(
+    lf,
+    args: argparse.Namespace,
+    *,
+    filter_symbol: bool,
+    symbols: Iterable[str] | None = None,
+):
     try:
         import polars as pl
     except ImportError as exc:
@@ -874,12 +880,24 @@ def _collect_source_frame(lf, args: argparse.Namespace, *, filter_symbol: bool):
     selected_columns = [column for column in daily_parquet_columns(args.levels) if column in schema_names]
     lf = lf.select(selected_columns)
 
-    if filter_symbol:
+    requested_symbols = None if symbols is None else [str(symbol) for symbol in symbols]
+    if filter_symbol or requested_symbols is not None:
         symbol_column = "symbol" if "symbol" in schema_names else "symbol_id"
         if symbol_column not in schema_names:
             raise ValueError("columnar source must contain symbol or symbol_id")
+        filter_values = (
+            symbol_filter_values(str(args.symbol))
+            if requested_symbols is None
+            else list(
+                dict.fromkeys(
+                    value
+                    for symbol in requested_symbols
+                    for value in symbol_filter_values(symbol)
+                )
+            )
+        )
         lf = lf.filter(
-            pl.col(symbol_column).cast(pl.Utf8).is_in(symbol_filter_values(str(args.symbol)))
+            pl.col(symbol_column).cast(pl.Utf8).is_in(filter_values)
         )
     if args.status_allow and "status" in schema_names:
         lf = lf.filter(pl.col("status").cast(pl.Utf8).is_in([str(value) for value in args.status_allow]))
@@ -909,7 +927,11 @@ def load_data_api_frame(args: argparse.Namespace):
     return _collect_source_frame(lf, args, filter_symbol=False)
 
 
-def load_daily_parquet_frame(args: argparse.Namespace):
+def load_daily_parquet_frame(
+    args: argparse.Namespace,
+    *,
+    symbols: Iterable[str] | None = None,
+):
     try:
         import polars as pl
     except ImportError as exc:
@@ -923,7 +945,7 @@ def load_daily_parquet_frame(args: argparse.Namespace):
         )
 
     lf = pl.scan_parquet([str(path) for path in files])
-    return _collect_source_frame(lf, args, filter_symbol=True)
+    return _collect_source_frame(lf, args, filter_symbol=True, symbols=symbols)
 
 
 def row_iter_from_daily_parquet(args: argparse.Namespace) -> Iterator[dict[str, object]]:
@@ -1517,6 +1539,17 @@ def convert(args: argparse.Namespace) -> np.ndarray:
         stats.event_build_seconds = time.perf_counter() - build_started
     stats.load_seconds = load_seconds
 
+    save_event_data(data, stats, args)
+    print_summary(stats, args.output)
+    return data
+
+
+def save_event_data(
+    data: np.ndarray,
+    stats: ConversionStats,
+    args: argparse.Namespace,
+) -> None:
+    """Persist one event array and its audit metadata."""
     args.output.parent.mkdir(parents=True, exist_ok=True)
     prices = data["px"]
     valid_prices = prices[np.isfinite(prices) & (prices > 0)]
@@ -1544,8 +1577,6 @@ def convert(args: argparse.Namespace) -> np.ndarray:
         trade_events=np.asarray([int(np.sum(kinds == TRADE_EVENT))], dtype=np.int64),
     )
     stats.write_seconds = time.perf_counter() - write_started
-    print_summary(stats, args.output)
-    return data
 
 
 def default_output_path(
@@ -1692,6 +1723,119 @@ def convert_tw_stock_future_to_npz(**kwargs) -> tuple[Path, np.ndarray]:
         daily_parquet=True,
         **kwargs,
     )
+
+
+def convert_tw_stock_future_batch_to_npz(
+    *,
+    symbols: Iterable[str],
+    start_date: str,
+    output_by_symbol: Mapping[str, Path],
+    start_time: str | None = None,
+    end_time: str | None = None,
+    workspace_root: Path | None = None,
+    daily_parquet_dir: Path | None = None,
+    path_config: Path | None = None,
+    timezone_name: str = "Asia/Taipei",
+    timestamp_unit: str = "auto",
+    base_latency_ns: int = 0,
+    volume_scale: float = 1.0,
+    levels: int = 5,
+    status_allow: list[str] | None = None,
+    trade_side: str = "infer",
+    no_depth: bool = False,
+    no_trades: bool = False,
+    qa_sample_rows: int = 1000,
+    npz_compression: str = "compressed",
+) -> tuple[dict[str, Path], dict[str, str]]:
+    """Scan one futures daily parquet once and write one NPZ per symbol.
+
+    The filtered daily frame remains resident while symbols are processed one
+    at a time.  Each event array is written and released before the next symbol
+    so peak memory does not scale with the total number of output NPZ files.
+    """
+    normalized_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols))
+    if not normalized_symbols:
+        return {}, {}
+    outputs = {str(symbol): Path(path) for symbol, path in output_by_symbol.items()}
+    missing_outputs = sorted(set(normalized_symbols) - set(outputs))
+    if missing_outputs:
+        raise ValueError(f"missing output paths for symbols: {missing_outputs}")
+    if npz_compression not in {"compressed", "uncompressed"}:
+        raise ValueError("npz_compression must be 'compressed' or 'uncompressed'")
+
+    root = (Path.cwd() if workspace_root is None else workspace_root).resolve()
+    source_kind = "stock_future"
+    parquet_dir = daily_parquet_dir or default_daily_parquet_dir(root, source_kind, path_config)
+    timezone = ZoneInfo(timezone_name)
+    start_exch_ts = parse_timestamp(start_time, timestamp_unit, start_date, timezone) if start_time else None
+    end_exch_ts = parse_timestamp(end_time, timestamp_unit, start_date, timezone) if end_time else None
+    args = argparse.Namespace(
+        output=outputs[normalized_symbols[0]],
+        input_csv=None,
+        data_api=False,
+        daily_parquet=True,
+        daily_parquet_dir=parquet_dir,
+        path_config=path_config or root / "path.toml",
+        source_kind=source_kind,
+        start_date=start_date,
+        end_date=start_date,
+        data_platform_base=DEFAULT_DATA_PLATFORM_BASE,
+        index_backend="duckdb",
+        data_api_module_dir=default_data_api_module_dir(root),
+        symbol=None,
+        date=start_date,
+        timezone=timezone_name,
+        timestamp_unit=timestamp_unit,
+        base_latency_ns=base_latency_ns,
+        volume_scale=volume_scale,
+        price_only_depth_qty=None,
+        levels=levels,
+        status_allow=status_allow,
+        trade_side=trade_side,
+        no_depth=no_depth,
+        no_trades=no_trades,
+        start_exch_ts=start_exch_ts,
+        end_exch_ts=end_exch_ts,
+        qa_sample_rows=qa_sample_rows,
+        npz_compression=npz_compression,
+    )
+
+    load_started = time.perf_counter()
+    frame = load_daily_parquet_frame(args, symbols=normalized_symbols)
+    load_seconds = time.perf_counter() - load_started
+    symbol_column = "symbol" if "symbol" in frame.columns else "symbol_id"
+    if symbol_column not in frame.columns:
+        raise ValueError("daily futures parquet must contain symbol or symbol_id")
+
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise RuntimeError("daily parquet input requires polars") from exc
+
+    generated: dict[str, Path] = {}
+    errors: dict[str, str] = {}
+    amortized_load_seconds = load_seconds / len(normalized_symbols)
+    for symbol in normalized_symbols:
+        symbol_frame = None
+        data = None
+        try:
+            symbol_frame = frame.filter(
+                pl.col(symbol_column).cast(pl.Utf8).is_in(symbol_filter_values(symbol))
+            )
+            symbol_args = argparse.Namespace(**vars(args))
+            symbol_args.symbol = symbol
+            symbol_args.output = outputs[symbol]
+            data, stats = build_events_from_parquet_frame(symbol_frame, symbol_args)
+            stats.load_seconds = amortized_load_seconds
+            save_event_data(data, stats, symbol_args)
+            print_summary(stats, symbol_args.output)
+            generated[symbol] = symbol_args.output
+        except Exception as exc:
+            errors[symbol] = repr(exc)
+        finally:
+            del data
+            del symbol_frame
+    return generated, errors
 
 
 def main() -> int:

@@ -13,7 +13,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -29,6 +29,7 @@ for path in (SCRIPT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT):
 
 from scripts.tw_stock_data_to_npz import (  # noqa: E402
     DEFAULT_DATA_PLATFORM_BASE,
+    convert_tw_stock_future_batch_to_npz,
     convert_tw_stock_future_to_npz,
     convert_tw_stock_to_npz,
     default_output_path,
@@ -79,6 +80,32 @@ DEFAULT_TPEX_DAYTRADE_TEMPLATE = '/mnt/z/TPEX/每日個股狀況/{date_nodash}.c
 DEFAULT_TWSE_DAILY_TEMPLATE = '/mnt/z/TWSE/每日資料/{ldate_nodash}.ftr'
 DEFAULT_TPEX_DAILY_TEMPLATE = '/mnt/z/TPEX/每日資料/{ldate_nodash}.ftr'
 
+# Known incomplete-tick dates.  They are excluded from the HBT date sequence,
+# so carried positions pass directly from the prior included day to the next.
+KNOWN_BAD_TRADE_DATES = (
+    "2026-04-23",
+    "2026-05-04",
+    "2026-05-19",
+    "2026-06-24",
+    "2026-07-01",
+    "2026-07-22",
+    "2026-07-27",
+)
+
+# Runs whose expiry-day residual positions are intentionally removed from the
+# HBT universe and downstream performance/capital reports.  Unlike an audit
+# waiver, these keys must not contribute trades, realized PnL, or stuck cash.
+KNOWN_EXCLUDED_RUN_KEYS = (
+    "2026-04-15::1802_KUFD6",
+    "2026-05-20::6173_PKFE6",
+    "2026-07-15::2340_FYFG6",
+    "2026-07-15::2408_CYFG6",
+    "2026-07-15::3714_QBFG6",
+    "2026-07-15::4919_REFG6",
+    "2026-07-15::5371_NMFG6",
+    "2026-07-15::6257_MQFG6",
+)
+
 @dataclass(frozen=True)
 class DailyPairRecord:
     trade_date: str
@@ -121,6 +148,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default="2026-05-21", help="First trade date, YYYY-MM-DD.")
     parser.add_argument("--end-date", default="2026-05-26", help="Last trade date, YYYY-MM-DD.")
+    parser.add_argument(
+        "--exclude-date",
+        dest="excluded_dates",
+        action="append",
+        default=list(KNOWN_BAD_TRADE_DATES),
+        help="Trade date to omit from config building, event conversion, HBT, reports, and plots. Can repeat.",
+    )
+    parser.add_argument(
+        "--exclude-run-key",
+        dest="excluded_run_keys",
+        action="append",
+        default=list(KNOWN_EXCLUDED_RUN_KEYS),
+        help="Exact YYYY-MM-DD::pair_name run to remove from HBT, trades, performance, and capital replay. Can repeat.",
+    )
     parser.add_argument("--base-config", type=Path, default=Path("arbitrage_config_base.json"))
     parser.add_argument("--calendar", type=Path, default=Path("Calendar.csv"))
     parser.add_argument("--stockinfo", type=Path, default=Path("stockinfo.csv"))
@@ -312,7 +353,12 @@ def main() -> int:
     args.output_dir = resolve_output_dir(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    trade_dates = select_trade_dates(args.calendar, args.start_date, args.end_date)
+    trade_dates = select_trade_dates(
+        args.calendar,
+        args.start_date,
+        args.end_date,
+        excluded_dates=args.excluded_dates,
+    )
     base_records, build_status = build_daily_pair_records(args, trade_dates)
     write_csv(build_status, args.output_dir / "daily_config_build_status.csv")
     outputs = execute_hbt_runs(args, base_records, trade_dates)
@@ -415,12 +461,19 @@ def leg_latency_ms(args: argparse.Namespace, leg: str) -> tuple[float, float, fl
     return values[0], values[1], values[2]
 
 
-def select_trade_dates(calendar_path: Path, start_date: str, end_date: str) -> list[str]:
+def select_trade_dates(
+    calendar_path: Path,
+    start_date: str,
+    end_date: str,
+    *,
+    excluded_dates: Iterable[str] = (),
+) -> list[str]:
     calendar = pd.read_csv(calendar_path, dtype=str)
     start = normalize_date(start_date)
     end = normalize_date(end_date)
+    excluded = {normalize_date(value) for value in excluded_dates}
     dates = [normalize_date(value) for value in calendar["trade_dates"].dropna().astype(str)]
-    selected = [value for value in dates if start <= value <= end]
+    selected = [value for value in dates if start <= value <= end and value not in excluded]
     if not selected:
         raise ValueError(f"No trade dates found between {start} and {end} in {calendar_path}")
     return selected
@@ -587,6 +640,27 @@ def pair_run_key(trade_date: str, pair_name: str) -> str:
     return f"{trade_date}::{pair_name}"
 
 
+def excluded_run_key_set(
+    args: argparse.Namespace | None = None,
+    *,
+    excluded_run_keys: Iterable[str] = (),
+) -> set[str]:
+    configured = excluded_run_keys if args is None else getattr(args, "excluded_run_keys", ())
+    return {str(value).strip() for value in configured if str(value).strip()}
+
+
+def filter_excluded_run_records(
+    records: list[DailyPairRecord],
+    args: argparse.Namespace | None = None,
+    *,
+    excluded_run_keys: Iterable[str] = (),
+) -> list[DailyPairRecord]:
+    excluded = excluded_run_key_set(args, excluded_run_keys=excluded_run_keys)
+    if not excluded:
+        return records
+    return [record for record in records if record.run_key not in excluded]
+
+
 def pair_universe_frame(records: list[DailyPairRecord]) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -618,6 +692,8 @@ def execute_hbt_runs(
     trade_dates: list[str],
 ) -> HbtRunOutputs:
     """Run independent daily HBTs or the date-sequential position-carry workflow."""
+
+    base_records = filter_excluded_run_records(base_records, args)
 
     if not getattr(args, "carry_positions", True):
         cache_hit = hbt_cache_is_valid(args, base_records)
@@ -654,6 +730,7 @@ def execute_hbt_runs(
             trade_dates,
             cached_summary,
             load_calendar_trade_dates(args.calendar),
+            excluded_run_keys=getattr(args, "excluded_run_keys", ()),
         )
     except (TypeError, ValueError, KeyError) as exc:
         logging.info("cached carry state cannot be reconstructed: %s", exc)
@@ -712,6 +789,7 @@ def run_backtests_with_position_carry(
 
     for trade_date in trade_dates:
         date_records = augment_records_with_position_carry(base_by_date.get(trade_date, []), carry, trade_date)
+        date_records = filter_excluded_run_records(date_records, args)
         logging.info(
             "continuous HBT date=%s selected=%s carried=%s total=%s",
             trade_date,
@@ -880,6 +958,8 @@ def reconstruct_position_carry_records(
     trade_dates: list[str],
     summary: pd.DataFrame,
     calendar_trade_dates: list[str],
+    *,
+    excluded_run_keys: Iterable[str] = (),
 ) -> tuple[list[DailyPairRecord], pd.DataFrame]:
     """Rebuild the dynamic universe from saved summaries for cache validation."""
 
@@ -895,6 +975,7 @@ def reconstruct_position_carry_records(
     audit_frames: list[pd.DataFrame] = []
     for trade_date in trade_dates:
         records = augment_records_with_position_carry(base_by_date.get(trade_date, []), carry, trade_date)
+        records = filter_excluded_run_records(records, args=None, excluded_run_keys=excluded_run_keys)
         day_summary = summary.loc[summary_dates.eq(trade_date)].copy()
         carry, audit, _ = advance_position_carry(carry, records, day_summary, calendar_trade_dates)
         all_records.extend(records)
@@ -923,6 +1004,7 @@ def build_event_data(
     records: list[DailyPairRecord],
 ) -> tuple[dict[str, dict[str, Path]], pd.DataFrame]:
     args.spot_input_csv_by_symbol = prepare_spot_input_csvs(args, records)
+    future_results = prepare_future_events(args, records)
     cache: dict[tuple[str, str, str], EventDataResult] = {}
     paths_by_run_key: dict[str, dict[str, Path]] = {}
     rows: list[dict[str, Any]] = []
@@ -932,7 +1014,7 @@ def build_event_data(
         if spot_key not in cache:
             cache[spot_key] = ensure_spot_events(args, record.pair.spot_symbol, record.trade_date)
         if future_key not in cache:
-            cache[future_key] = ensure_future_events(args, record.pair.future_symbol, record.trade_date)
+            cache[future_key] = future_results[(record.trade_date, record.pair.future_symbol)]
 
         spot = cache[spot_key]
         future = cache[future_key]
@@ -1175,6 +1257,68 @@ def ensure_future_events(args: argparse.Namespace, symbol: str, trade_date: str)
         return EventDataResult(None, "error", repr(exc))
 
 
+def prepare_future_events(
+    args: argparse.Namespace,
+    records: list[DailyPairRecord],
+) -> dict[tuple[str, str], EventDataResult]:
+    """Prepare futures event files with one source-parquet scan per trade date."""
+    symbols_by_date: dict[str, set[str]] = {}
+    for record in records:
+        symbols_by_date.setdefault(record.trade_date, set()).add(str(record.pair.future_symbol))
+
+    results: dict[tuple[str, str], EventDataResult] = {}
+    rebuild = bool(getattr(args, "rebuild_event_data", False))
+    skip_missing = bool(getattr(args, "no_convert_missing_event_data", False)) and not rebuild
+    for trade_date, symbol_set in symbols_by_date.items():
+        pending: dict[str, Path] = {}
+        for symbol in sorted(symbol_set):
+            output = expected_event_path(args, symbol, "stock_future", trade_date)
+            key = (trade_date, symbol)
+            if output.exists() and not rebuild:
+                results[key] = EventDataResult(output, "existing")
+            elif skip_missing:
+                results[key] = EventDataResult(None, "missing", f"missing future npz: {output}")
+            else:
+                pending[symbol] = output
+
+        if not pending:
+            continue
+        logging.info(
+            "batch converting futures date=%s symbols=%s with one parquet scan",
+            trade_date,
+            len(pending),
+        )
+        try:
+            generated, errors = convert_tw_stock_future_batch_to_npz(
+                symbols=pending,
+                start_date=trade_date,
+                start_time=args.session_start,
+                end_time=args.session_end,
+                output_by_symbol=pending,
+                workspace_root=WORKSPACE_ROOT,
+                path_config=WORKSPACE_ROOT / "path.toml",
+                daily_parquet_dir=args.event_futures_parquet_dir,
+                levels=5,
+                qa_sample_rows=args.conversion_qa_sample_rows,
+                npz_compression=args.npz_compression,
+            )
+        except Exception as exc:
+            error = repr(exc)
+            generated, errors = {}, {symbol: error for symbol in pending}
+
+        for symbol, output in pending.items():
+            key = (trade_date, symbol)
+            if symbol in generated:
+                results[key] = EventDataResult(generated[symbol], "generated")
+            else:
+                results[key] = EventDataResult(
+                    None,
+                    "error",
+                    errors.get(symbol, f"future batch conversion did not produce {output}"),
+                )
+    return results
+
+
 def hbt_settings_frame(
     args: argparse.Namespace,
     records: list[DailyPairRecord],
@@ -1392,6 +1536,8 @@ HBT_MANIFEST_NAME = "backtest_manifest.json"
 HBT_RESULT_ARG_NAMES = (
     "start_date",
     "end_date",
+    "excluded_dates",
+    "excluded_run_keys",
     "session_start",
     "session_end",
     "first_leg",
@@ -2166,7 +2312,15 @@ def build_cash_roi_outputs(
     records: list[DailyPairRecord],
     capital_config: CapitalAllocationConfig | None = None,
     include_capital_details: bool = True,
+    excluded_run_keys: Iterable[str] = (),
 ) -> dict[str, pd.DataFrame]:
+    excluded = {str(value) for value in excluded_run_keys}
+    if excluded:
+        if not trades.empty and "run_key" in trades.columns:
+            trades = trades.loc[~trades["run_key"].astype(str).isin(excluded)].copy()
+        if not market.empty and "run_key" in market.columns:
+            market = market.loc[~market["run_key"].astype(str).isin(excluded)].copy()
+        records = [record for record in records if record.run_key not in excluded]
     pair_cash_settings = pair_cash_settings_frame(records)
     filled_trades = filled_trade_frame(trades, pair_cash_settings)
     stuck_outputs = build_stuck_cash_outputs(filled_trades)
@@ -2179,6 +2333,7 @@ def build_cash_roi_outputs(
         filled_trades,
         capital_config,
         include_details=include_capital_details,
+        excluded_run_keys=excluded,
     )
     return {
         "pair_cash_settings": pair_cash_settings,

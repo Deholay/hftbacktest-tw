@@ -47,7 +47,12 @@ class BacktestArtifacts:
 def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
     """Run every data/config/HBT stage and persist the core CSV outputs."""
     args = prepare_args(args)
-    trade_dates = daily_pipeline.select_trade_dates(args.calendar, args.start_date, args.end_date)
+    trade_dates = daily_pipeline.select_trade_dates(
+        args.calendar,
+        args.start_date,
+        args.end_date,
+        excluded_dates=args.excluded_dates,
+    )
 
     base_records, build_status = daily_pipeline.build_daily_pair_records(args, trade_dates)
     outputs = hbt_pipeline.execute_hbt_runs(args, base_records, trade_dates)

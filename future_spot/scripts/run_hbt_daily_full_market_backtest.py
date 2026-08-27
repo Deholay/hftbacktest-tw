@@ -36,6 +36,7 @@ from arbitrage.event_data import (  # noqa: E402,F401
     ensure_spot_events,
     expected_event_path,
     first_csv_line,
+    prepare_future_events,
     prepare_spot_input_csvs,
     split_daily_spot_csv,
     split_daily_spot_csv_stream,

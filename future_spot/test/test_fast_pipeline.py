@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -20,8 +21,11 @@ from arbitrage.full_market_runner import (
     attach_entry_signals,
     build_pair_hbt_config,
     leg_latency_ms,
+    filter_excluded_run_records,
     parse_args,
+    prepare_future_events,
     resolve_output_dir,
+    select_trade_dates,
 )
 from arbitrage.hbt_helpers import hbt_asset_audit, infer_hbt_asset_tick_size
 from arbitrage.models import PairConfig
@@ -52,6 +56,75 @@ class FastPipelineTest(unittest.TestCase):
         self.assertEqual(args.report_mode, "summary")
         self.assertEqual(args.report_chunk_rows, 25_000)
         self.assertGreaterEqual(args.workers, 1)
+        self.assertEqual(len(args.excluded_dates), 7)
+        self.assertEqual(len(args.excluded_run_keys), 8)
+
+    def test_run_key_exclusion_removes_exact_record(self) -> None:
+        records = [
+            SimpleNamespace(run_key="2026-04-15::1802_KUFD6"),
+            SimpleNamespace(run_key="2026-04-15::2330_TXFD6"),
+        ]
+        filtered = filter_excluded_run_records(
+            records,
+            excluded_run_keys=["2026-04-15::1802_KUFD6"],
+        )
+        self.assertEqual([record.run_key for record in filtered], ["2026-04-15::2330_TXFD6"])
+
+    def test_trade_date_selection_excludes_known_bad_dates(self) -> None:
+        calendar = pd.DataFrame({"trade_dates": ["2026-04-22", "2026-04-23", "2026-04-24"]})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Calendar.csv"
+            calendar.to_csv(path, index=False)
+            selected = select_trade_dates(
+                path,
+                "2026-04-22",
+                "2026-04-24",
+                excluded_dates=["2026-04-23"],
+            )
+        self.assertEqual(selected, ["2026-04-22", "2026-04-24"])
+
+    def test_future_event_preparation_batches_missing_symbols_by_date(self) -> None:
+        records = [
+            SimpleNamespace(trade_date="2026-03-02", pair=SimpleNamespace(future_symbol="CAFC6")),
+            SimpleNamespace(trade_date="2026-03-02", pair=SimpleNamespace(future_symbol="CBFC6")),
+        ]
+        args = SimpleNamespace(
+            rebuild_event_data=False,
+            no_convert_missing_event_data=False,
+            session_start="09:00:00",
+            session_end="13:25:00",
+            event_futures_parquet_dir=Path("/mock/futures"),
+            conversion_qa_sample_rows=1000,
+            npz_compression="compressed",
+        )
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def event_path(_args, symbol, source_kind, trade_date):
+                self.assertEqual(source_kind, "stock_future")
+                return root / f"{symbol}_{trade_date}.npz"
+
+            existing = event_path(args, "CAFC6", "stock_future", "2026-03-02")
+            existing.touch()
+
+            def batch_convert(**kwargs):
+                calls.append(kwargs)
+                return dict(kwargs["output_by_symbol"]), {}
+
+            with patch(
+                "arbitrage.full_market_runner.expected_event_path",
+                side_effect=event_path,
+            ), patch(
+                "arbitrage.full_market_runner.convert_tw_stock_future_batch_to_npz",
+                side_effect=batch_convert,
+            ):
+                results = prepare_future_events(args, records)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(list(calls[0]["symbols"]), ["CBFC6"])
+        self.assertEqual(results[("2026-03-02", "CAFC6")].status, "existing")
+        self.assertEqual(results[("2026-03-02", "CBFC6")].status, "generated")
 
     def test_default_output_dir_tracks_dates_and_latency(self) -> None:
         args = parse_args(

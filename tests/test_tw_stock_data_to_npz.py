@@ -13,7 +13,10 @@ from scripts.tw_stock_data_to_npz import (
     EVENT_DTYPE,
     build_events_from_parquet_frame,
     build_events_from_rows,
+    convert_tw_stock_future_batch_to_npz,
+    convert_tw_stock_future_to_npz,
     convert_tw_stock_to_npz,
+    load_daily_parquet_frame,
 )
 
 
@@ -165,6 +168,57 @@ class ParquetConversionTest(unittest.TestCase):
                 self.assertEqual(int(saved["event_rows"][0]), len(converted))
                 self.assertEqual(float(saved["min_price"][0]), 77.90)
                 self.assertEqual(float(saved["max_price"][0]), 78.05)
+
+    def test_future_batch_scans_once_and_matches_single_symbol_conversion(self) -> None:
+        rows_a = sample_rows()
+        rows_b = []
+        for source in sample_rows():
+            row = dict(source)
+            row["symbol"] = "0060"
+            for column in ("last_price", "ask_price1", "ask_price2", "bid_price1", "bid_price2"):
+                value = row[column]
+                if value is not None:
+                    row[column] = float(value) + 10.0
+            rows_b.append(row)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parquet_dir = root / "parquet"
+            parquet_dir.mkdir()
+            pl.DataFrame(rows_a + rows_b).write_parquet(parquet_dir / "2023-11-14.parquet")
+            batch_outputs = {symbol: root / f"batch_{symbol}.npz" for symbol in ("0050", "0060")}
+
+            with patch(
+                "scripts.tw_stock_data_to_npz.load_daily_parquet_frame",
+                wraps=load_daily_parquet_frame,
+            ) as load_frame:
+                generated, errors = convert_tw_stock_future_batch_to_npz(
+                    symbols=["0050", "0060"],
+                    start_date="2023-11-14",
+                    output_by_symbol=batch_outputs,
+                    workspace_root=root,
+                    daily_parquet_dir=parquet_dir,
+                    levels=2,
+                    npz_compression="uncompressed",
+                )
+
+            self.assertEqual(load_frame.call_count, 1)
+            self.assertEqual(errors, {})
+            self.assertEqual(generated, batch_outputs)
+
+            for symbol in ("0050", "0060"):
+                expected_path = root / f"single_{symbol}.npz"
+                _, expected = convert_tw_stock_future_to_npz(
+                    symbol=symbol,
+                    start_date="2023-11-14",
+                    output=expected_path,
+                    workspace_root=root,
+                    daily_parquet_dir=parquet_dir,
+                    levels=2,
+                    npz_compression="uncompressed",
+                )
+                with np.load(batch_outputs[symbol]) as saved:
+                    np.testing.assert_array_equal(saved["data"], expected)
 
     def test_data_api_polars_frame_uses_columnar_builder(self) -> None:
         class FakeDataAPI:

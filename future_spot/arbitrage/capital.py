@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -65,6 +65,7 @@ def build_capital_constraint_outputs(
     config: CapitalAllocationConfig | None = None,
     *,
     include_details: bool = True,
+    excluded_run_keys: Iterable[str] = (),
 ) -> dict[str, pd.DataFrame]:
     """Replay candidate fills under a shared capital limit.
 
@@ -128,7 +129,19 @@ def build_capital_constraint_outputs(
     spot_used = 0.0
     futures_used = 0.0
 
-    for trade_date, day_trades in trades.groupby("trade_date", sort=True):
+    discard_by_date = _excluded_positions_by_date(excluded_run_keys)
+    first_trade_date = trades["trade_date"].min()
+    last_trade_date = trades["trade_date"].max()
+    discard_by_date = {
+        date: positions
+        for date, positions in discard_by_date.items()
+        if first_trade_date <= date <= last_trade_date
+    }
+    trade_groups = {trade_date: group for trade_date, group in trades.groupby("trade_date", sort=True)}
+    replay_dates = sorted(set(trade_groups).union(discard_by_date))
+
+    for trade_date in replay_dates:
+        day_trades = trade_groups.get(trade_date, trades.iloc[0:0])
         if not cfg.carry_positions:
             open_lots = defaultdict(deque)
             spot_used = 0.0
@@ -140,7 +153,42 @@ def build_capital_constraint_outputs(
         rejected_entries = 0
         accepted_exits = 0
         unmatched_exits = 0
+        discarded_open_lots = 0
         realized_pnl = 0.0
+
+        for position, excluded_run_key in discard_by_date.get(trade_date, ()):
+            queue = open_lots[position]
+            while queue:
+                lot = queue.popleft()
+                released_spot = lot["spot_equity_required"]
+                released_futures = lot["futures_margin_required"]
+                spot_used = max(0.0, spot_used - released_spot)
+                futures_used = max(0.0, futures_used - released_futures)
+                discarded_open_lots += 1
+                if include_details:
+                    event_rows.append(
+                        {
+                            "trade_date": trade_date,
+                            "capital_event_timestamp": np.nan,
+                            "run_key": excluded_run_key,
+                            "pair_name": f"{position[0]}_{position[1]}",
+                            "spot_symbol": position[0],
+                            "future_symbol": position[1],
+                            "signal": "EXCLUDED_RUN",
+                            "capital_action": "discarded_excluded_position",
+                            "capital_reason": "configured run-key exclusion",
+                            "spot_capital_used": spot_used,
+                            "futures_capital_used": futures_used,
+                            "total_capital_used": spot_used + futures_used,
+                            "capital_headroom": cfg.total_capital - spot_used - futures_used,
+                            "spot_capital_utilization": spot_used / cfg.spot_capital_limit,
+                            "futures_capital_utilization": futures_used / cfg.futures_capital_limit,
+                            "total_capital_utilization": (spot_used + futures_used) / cfg.total_capital,
+                            "released_spot_capital": released_spot,
+                            "released_futures_capital": released_futures,
+                            "realized_pnl": 0.0,
+                        }
+                    )
 
         for row in day_trades.itertuples(index=False):
             signal = str(row.signal)
@@ -234,6 +282,7 @@ def build_capital_constraint_outputs(
                 "rejected_entries": rejected_entries,
                 "accepted_exits": accepted_exits,
                 "ignored_unmatched_exits": unmatched_exits,
+                "discarded_open_lots": discarded_open_lots,
                 "ending_open_lots": ending_open_lots,
                 "realized_pnl": realized_pnl,
                 "ending_spot_capital": spot_used,
@@ -283,6 +332,21 @@ def _entry_lot(row: Any, cfg: CapitalAllocationConfig) -> dict[str, Any]:
     }
 
 
+def _excluded_positions_by_date(
+    excluded_run_keys: Iterable[str],
+) -> dict[pd.Timestamp, list[tuple[tuple[str, str], str]]]:
+    by_date: dict[pd.Timestamp, list[tuple[tuple[str, str], str]]] = defaultdict(list)
+    for raw_run_key in excluded_run_keys:
+        run_key = str(raw_run_key).strip()
+        trade_date, separator, pair_name = run_key.partition("::")
+        if not separator or "_" not in pair_name:
+            raise ValueError(f"invalid excluded run_key: {run_key!r}")
+        spot_symbol, future_symbol = pair_name.split("_", 1)
+        date = pd.to_datetime(trade_date, errors="raise").normalize()
+        by_date[date].append(((spot_symbol, future_symbol), run_key))
+    return dict(by_date)
+
+
 def _realized_pair_pnl(lot: dict[str, Any], exit_row: Any) -> float:
     exit_spot = float(exit_row.spot_exec_price)
     exit_future = float(exit_row.future_exec_price)
@@ -321,6 +385,7 @@ def _capital_summary(
                 "rejected_entries": rejected_entries,
                 "entry_acceptance_rate": accepted_entries / candidate_entries if candidate_entries else np.nan,
                 "accepted_exits": int(daily["accepted_exits"].sum()) if not daily.empty else 0,
+                "discarded_open_lots": int(daily["discarded_open_lots"].sum()) if not daily.empty else 0,
                 "ending_open_lot_days": int(daily["ending_open_lots"].sum()) if not daily.empty else 0,
                 "capital_filtered_realized_pnl": float(daily["realized_pnl"].sum()) if not daily.empty else 0.0,
                 "capital_filtered_realized_roi": (
@@ -348,6 +413,7 @@ def _empty_outputs(cfg: CapitalAllocationConfig) -> dict[str, pd.DataFrame]:
             "rejected_entries",
             "accepted_exits",
             "ignored_unmatched_exits",
+            "discarded_open_lots",
             "ending_open_lots",
             "realized_pnl",
             "ending_spot_capital",

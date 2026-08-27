@@ -123,6 +123,7 @@ def build_report_tables(artifacts: BacktestArtifacts) -> ReportArtifacts:
         artifacts.records,
         capital_allocation_config_from_args(artifacts.args),
         include_capital_details=include_details,
+        excluded_run_keys=getattr(artifacts.args, "excluded_run_keys", ()),
     )
 
     frames = {
