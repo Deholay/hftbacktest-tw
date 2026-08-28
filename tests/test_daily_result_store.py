@@ -76,6 +76,53 @@ class DailyResultStoreTest(unittest.TestCase):
             with self.assertRaises(DailyResultStoreError):
                 store.validate("2026-03-02")
 
+    def test_explicit_rebuild_preserves_superseded_completed_partition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DailyResultStore(Path(tmp) / "core")
+            store.publish(
+                "2026-03-02",
+                {"summary": pd.DataFrame({"rows": [1]})},
+                input_identity={"version": 1},
+                carry_in={},
+                carry_out={},
+                run_keys=[],
+            )
+            store.publish(
+                "2026-03-02",
+                {"summary": pd.DataFrame({"rows": [2]})},
+                input_identity={"version": 2},
+                carry_in={},
+                carry_out={},
+                run_keys=[],
+                replace_existing=True,
+            )
+            self.assertEqual(store.load_table("2026-03-02", "summary")["rows"].tolist(), [2])
+            self.assertEqual(len(list(store.dates_root.glob(".superseded-trade_date=2026-03-02-*"))), 1)
+
+    def test_explicit_rebuild_replaces_identical_identity_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DailyResultStore(Path(tmp) / "core")
+            identity = {"version": 1}
+            store.publish(
+                "2026-03-02",
+                {"summary": pd.DataFrame({"rows": [1]})},
+                input_identity=identity,
+                carry_in={},
+                carry_out={},
+                run_keys=[],
+            )
+            store.publish(
+                "2026-03-02",
+                {"summary": pd.DataFrame({"rows": [2]})},
+                input_identity=identity,
+                carry_in={},
+                carry_out={},
+                run_keys=[],
+                replace_existing=True,
+            )
+            self.assertEqual(store.load_table("2026-03-02", "summary")["rows"].tolist(), [2])
+            self.assertEqual(len(list(store.dates_root.glob(".superseded-trade_date=2026-03-02-*"))), 1)
+
     def test_validated_prefix_stops_at_broken_carry_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = DailyResultStore(Path(tmp) / "core")

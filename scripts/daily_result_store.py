@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -94,6 +95,7 @@ class DailyResultStore:
         carry_out: Any,
         run_keys: Sequence[str],
         metadata: Mapping[str, Any] | None = None,
+        replace_existing: bool = False,
     ) -> DailyResultManifest:
         """Validate and atomically publish a completed date.
 
@@ -109,16 +111,17 @@ class DailyResultStore:
         if final_path.exists():
             existing = self.validate(trade_date)
             payload = existing.payload
-            if (
+            if not replace_existing and (
                 payload.get("input_identity_sha256") == input_sha
                 and payload.get("carry_in_sha256") == carry_in_sha
                 and payload.get("carry_out_sha256") == carry_out_sha
                 and payload.get("run_keys") == list(run_keys)
             ):
                 return existing
-            raise DailyResultConflictError(
-                f"completed result date has a different identity: {final_path}"
-            )
+            if not replace_existing:
+                raise DailyResultConflictError(
+                    f"completed result date has a different identity: {final_path}"
+                )
 
         self.dates_root.mkdir(parents=True, exist_ok=True)
         temp_path = Path(tempfile.mkdtemp(prefix=f".tmp-{trade_date}-", dir=self.dates_root))
@@ -159,7 +162,16 @@ class DailyResultStore:
                 json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            os.replace(temp_path, final_path)
+            stale_path = None
+            if final_path.exists():
+                stale_path = self.dates_root / f".superseded-{final_path.name}-{time.time_ns()}"
+                os.replace(final_path, stale_path)
+            try:
+                os.replace(temp_path, final_path)
+            except Exception:
+                if stale_path is not None and stale_path.exists() and not final_path.exists():
+                    os.replace(stale_path, final_path)
+                raise
         except Exception:
             if temp_path.exists():
                 shutil.rmtree(temp_path)

@@ -10,6 +10,7 @@ import pandas as pd
 
 from future_spot.arbitrage.full_market_runner import (
     DailyPairRecord,
+    account_full_report_rows,
     execute_hbt_runs,
     run_backtests_with_position_carry,
 )
@@ -57,6 +58,13 @@ def _daily_result(record: DailyPairRecord):
 
 
 class DailyResultPipelineTest(unittest.TestCase):
+    def test_full_report_row_budget_is_hard(self) -> None:
+        args = SimpleNamespace(full_report_max_rows=3)
+        used = account_full_report_rows(args, 0, pd.DataFrame({"x": [1, 2]}))
+        self.assertEqual(used, 2)
+        with self.assertRaisesRegex(RuntimeError, "budget exceeded"):
+            account_full_report_rows(args, used, pd.DataFrame({"x": [3, 4]}))
+
     def test_summary_mode_persists_dates_releases_details_and_resumes(self) -> None:
         records = [_record("2026-03-02"), _record("2026-03-03")]
         with tempfile.TemporaryDirectory() as tmp:
@@ -113,10 +121,15 @@ class DailyResultPipelineTest(unittest.TestCase):
             self.assertEqual(run_mock.call_count, 2)
             self.assertTrue(first.daily_partitions)
             self.assertFalse(first.pair_results)
+            self.assertFalse(first.event_paths)
             self.assertTrue(first.trades.empty)
             self.assertTrue(first.market.empty)
             self.assertEqual(len(first.summary), 2)
+            self.assertEqual(len(first.conversion_status), 2)
+            self.assertEqual(len(first.settings), 2)
             self.assertEqual(len(pd.read_csv(Path(tmp) / "summary_all_daily_pairs.csv")), 2)
+            self.assertEqual(len(pd.read_csv(Path(tmp) / "conversion_status.csv")), 2)
+            self.assertEqual(len(pd.read_csv(Path(tmp) / "hbt_settings.csv")), 2)
             self.assertTrue(
                 {
                     "daily_identity_validation",

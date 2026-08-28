@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -22,8 +23,9 @@ import pandas as pd
 ARBITRAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ARBITRAGE_ROOT.parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
-SCRIPT_ROOT = PROJECT_ROOT / "scripts"
-for path in (SCRIPT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT):
+ROOT_SCRIPT_ROOT = WORKSPACE_ROOT / "scripts"
+FUTURE_SPOT_SCRIPT_ROOT = PROJECT_ROOT / "scripts"
+for path in (ROOT_SCRIPT_ROOT, FUTURE_SPOT_SCRIPT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT):
     text = str(path)
     if text not in sys.path:
         sys.path.insert(0, text)
@@ -34,7 +36,17 @@ from scripts.tw_stock_data_to_npz import (  # noqa: E402
     convert_tw_stock_future_to_npz,
     convert_tw_stock_to_npz,
     default_output_path,
+    parse_timestamp,
 )
+from scripts.compact_cache import (  # noqa: E402
+    COMPACT_SCHEMA_VERSION,
+    CompactBuildConfig,
+    CompactCacheError,
+    CompactCacheStore,
+    CompactSource,
+)
+from scripts.compact_hbt_adapter import write_reference_npz_from_compact  # noqa: E402
+from scripts.slim_engine import SLIM_ENGINE_VERSION  # noqa: E402
 from scripts.tw_stock_hftbacktest import BacktestConfig  # noqa: E402
 from scripts.io_utils import (  # noqa: E402
     concat_frames,
@@ -80,6 +92,9 @@ from build_arbitrage_config_from_date import (  # noqa: E402
 
 
 DEFAULT_FUTURES_PARQUET_TEMPLATE = '/mnt/z/ticks_parquet_stock_future/{ldate}.parquet'
+DEFAULT_STOCK_TICK_PARQUET_TEMPLATE = (
+    '/mnt/z/數據平台/ticker_store/daily_parquet/twstock_{date_nodash}.parquet'
+)
 DEFAULT_SPOT_INPUT_CSV_TEMPLATE = ''
 DEFAULT_TWSE_DAYTRADE_TEMPLATE = '/mnt/z/TWSE/每日個股狀況/{date_nodash}.csv'
 DEFAULT_TPEX_DAYTRADE_TEMPLATE = '/mnt/z/TPEX/每日個股狀況/{date_nodash}.csv'
@@ -225,6 +240,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Directory containing stock-future event conversion parquet files named YYYY-MM-DD.parquet.",
     )
+    parser.add_argument(
+        "--engine",
+        choices=("reference", "slim"),
+        default="reference",
+        help="Execution engine. Slim supports only immediate crossing FOK/IOC BBO mode.",
+    )
+    parser.add_argument(
+        "--market-data-cache",
+        choices=("event_npz", "compact"),
+        default="event_npz",
+        help="Reference may use legacy NPZ or compact-to-reference reconstruction; slim requires compact.",
+    )
+    parser.add_argument(
+        "--compact-cache-root",
+        type=Path,
+        default=WORKSPACE_ROOT / "data" / "tw_compact_v1",
+    )
+    parser.add_argument(
+        "--stock-tick-parquet-template",
+        default=DEFAULT_STOCK_TICK_PARQUET_TEMPLATE,
+    )
+    parser.add_argument("--compact-cache-compression", choices=("none", "lz4", "zstd"), default="lz4")
+    parser.add_argument("--compact-cache-profile", choices=("bbo",), default="bbo")
+    parser.add_argument("--compact-cache-max-gb", type=float, default=200.0)
+    parser.add_argument("--compact-cache-min-free-gb", type=float, default=200.0)
+    parser.add_argument("--compact-cache-batch-rows", type=int, default=131_072)
+    parser.add_argument("--rebuild-compact-cache", action="store_true")
 
     parser.add_argument("--first-leg", choices=("stock", "future"), default="future")
     parser.add_argument("--step-ms", type=float, default=1000.0)
@@ -338,6 +380,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Summary omits large diagnostic detail tables; full builds them from bounded chunks.",
     )
     parser.add_argument(
+        "--full-report-max-rows",
+        type=int,
+        default=None,
+        help="Required hard cap on retained detail rows when --report-mode full is selected.",
+    )
+    parser.add_argument(
         "--report-chunk-rows",
         type=int,
         default=25_000,
@@ -353,7 +401,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.engine == "slim":
+        args.market_data_cache = "compact"
+    if args.report_mode == "full" and (
+        args.full_report_max_rows is None or args.full_report_max_rows <= 0
+    ):
+        parser.error("--report-mode full requires a positive --full-report-max-rows budget")
+    return args
 
 
 def main() -> int:
@@ -814,6 +869,7 @@ def run_backtests_with_position_carry(
     reused_dates = 0
     executed_dates = 0
     timing_rows: list[dict[str, Any]] = []
+    full_detail_rows = 0
 
     configured_workers = max(1, int(getattr(args, "workers", 1)))
     executor = ProcessPoolExecutor(max_workers=configured_workers) if configured_workers > 1 else None
@@ -880,16 +936,19 @@ def run_backtests_with_position_carry(
                             )
                         carry = next_carry
                         all_records.extend(date_records)
-                        summary_frames.append(summary)
                         if not stream_daily_details:
+                            full_detail_rows = account_full_report_rows(
+                                args, full_detail_rows, trades, market, latency
+                            )
+                            summary_frames.append(summary)
                             all_pair_results.update(pair_results)
                             trade_frames.append(trades)
                             market_frames.append(market)
                             latency_frames.append(latency)
-                        error_frames.append(run_errors)
-                        conversion_frames.append(conversion_status)
-                        settings_frames.append(settings)
-                        carry_frames.append(carry_status)
+                            error_frames.append(run_errors)
+                            conversion_frames.append(conversion_status)
+                            settings_frames.append(settings)
+                            carry_frames.append(carry_status)
                         completed_dates.append(trade_date)
                         reused_dates += 1
                         timing_rows.append(
@@ -988,12 +1047,18 @@ def run_backtests_with_position_carry(
                 carry_out=position_carry_identity(carry),
                 run_keys=[record.run_key for record in date_records],
                 metadata={
-                    "engine": "reference",
-                    "engine_version": REFERENCE_ENGINE_VERSION,
+                    "engine": getattr(args, "engine", "reference"),
+                    "engine_version": execution_engine_version(args),
+                    "compact_schema_version": (
+                        COMPACT_SCHEMA_VERSION
+                        if getattr(args, "market_data_cache", "event_npz") == "compact"
+                        else None
+                    ),
                     "strategy_clock": "step_ms",
                     "step_ms": getattr(args, "step_ms", None),
                     "time_in_force_semantics": HBT_TIME_IN_FORCE_SEMANTICS,
                 },
+                replace_existing=bool(getattr(args, "rebuild_hbt_results", False)),
             )
             timing_rows.append(
                 stage_timing_row(
@@ -1006,17 +1071,20 @@ def run_backtests_with_position_carry(
             )
 
             all_records.extend(date_records)
-            all_event_paths.update(event_paths)
-            summary_frames.append(summary)
             if not stream_daily_details:
+                full_detail_rows = account_full_report_rows(
+                    args, full_detail_rows, trades, market, latency
+                )
+                all_event_paths.update(event_paths)
+                summary_frames.append(summary)
                 all_pair_results.update(pair_results)
                 trade_frames.append(trades)
                 market_frames.append(market)
                 latency_frames.append(latency)
-            error_frames.extend((run_errors, expiry_errors))
-            conversion_frames.append(conversion_status)
-            settings_frames.append(settings)
-            carry_frames.append(carry_status)
+                error_frames.extend((run_errors, expiry_errors))
+                conversion_frames.append(conversion_status)
+                settings_frames.append(settings)
+                carry_frames.append(carry_status)
             completed_dates.append(trade_date)
             executed_dates += 1
             timing_rows.append(
@@ -1041,6 +1109,9 @@ def run_backtests_with_position_carry(
             "run_errors": "run_errors.csv",
             "entry_exit": "entry_exit_all_daily_pairs.csv",
             "entry_exit_index": "entry_exit_index.csv",
+            "conversion": "conversion_status.csv",
+            "settings": "hbt_settings.csv",
+            "position_carry": "position_carry_status.csv",
         }
         compatibility_started = time.perf_counter()
         result_store.write_tables_csv(
@@ -1060,18 +1131,33 @@ def run_backtests_with_position_carry(
             )
         )
 
+        # Default annual runs release every daily frame before advancing. Read
+        # back only the small Python-boundary tables after the bounded Parquet
+        # to CSV stream is complete; detailed tables stay on disk.
+        summary_output = read_csv_if_exists(Path(args.output_dir) / compatibility_tables["summary"])
+        error_output = read_csv_if_exists(Path(args.output_dir) / compatibility_tables["run_errors"])
+        conversion_output = read_csv_if_exists(Path(args.output_dir) / compatibility_tables["conversion"])
+        settings_output = read_csv_if_exists(Path(args.output_dir) / compatibility_tables["settings"])
+        carry_output = read_csv_if_exists(Path(args.output_dir) / compatibility_tables["position_carry"])
+    else:
+        summary_output = concat_frames(summary_frames)
+        error_output = concat_frames(error_frames)
+        conversion_output = concat_frames(conversion_frames)
+        settings_output = concat_frames(settings_frames)
+        carry_output = concat_frames(carry_frames)
+
     return HbtRunOutputs(
         records=all_records,
         event_paths=all_event_paths,
         pair_results=all_pair_results,
-        summary=concat_frames(summary_frames),
+        summary=summary_output,
         trades=concat_frames(trade_frames),
         market=concat_frames(market_frames),
         latency=concat_frames(latency_frames),
-        run_errors=concat_frames(error_frames),
-        conversion_status=concat_frames(conversion_frames),
-        settings=concat_frames(settings_frames),
-        position_carry_status=concat_frames(carry_frames),
+        run_errors=error_output,
+        conversion_status=conversion_output,
+        settings=settings_output,
+        position_carry_status=carry_output,
         cache_hit=False,
         daily_partitions=stream_daily_details,
         daily_dates_reused=reused_dates,
@@ -1094,6 +1180,23 @@ def stage_timing_row(
         "pair_count": pair_count,
         "mode": mode,
     }
+
+
+def account_full_report_rows(
+    args: argparse.Namespace,
+    current_rows: int,
+    *frames: pd.DataFrame,
+) -> int:
+    """Enforce the explicit retained-row budget required by diagnostic full mode."""
+    total = current_rows + sum(len(frame) for frame in frames)
+    limit = getattr(args, "full_report_max_rows", None)
+    if limit is None or int(limit) <= 0:
+        raise RuntimeError("full report mode requires a positive full_report_max_rows budget")
+    if total > int(limit):
+        raise RuntimeError(
+            f"full report retained-row budget exceeded: rows={total} limit={int(limit)}"
+        )
+    return total
 
 
 def position_carry_identity(
@@ -1283,6 +1386,8 @@ def build_event_data(
     args: argparse.Namespace,
     records: list[DailyPairRecord],
 ) -> tuple[dict[str, dict[str, Path]], pd.DataFrame]:
+    if getattr(args, "market_data_cache", "event_npz") == "compact":
+        return build_compact_event_data(args, records)
     args.spot_input_csv_by_symbol = prepare_spot_input_csvs(args, records)
     future_results = prepare_future_events(args, records)
     cache: dict[tuple[str, str, str], EventDataResult] = {}
@@ -1320,6 +1425,161 @@ def build_event_data(
         if not ok and not args.continue_on_error:
             raise RuntimeError(f"event data missing for {record.run_key}: spot={spot.error} future={future.error}")
     return paths_by_run_key, pd.DataFrame(rows)
+
+
+def build_compact_event_data(
+    args: argparse.Namespace,
+    records: list[DailyPairRecord],
+) -> tuple[dict[str, dict[str, Path]], pd.DataFrame]:
+    """Build one date's compact partitions and return slim or reference-adapter paths."""
+    if not records:
+        return {}, pd.DataFrame()
+    trade_dates = sorted({record.trade_date for record in records})
+    if len(trade_dates) != 1:
+        paths: dict[str, dict[str, Path]] = {}
+        frames = []
+        for trade_date in trade_dates:
+            date_paths, date_frame = build_compact_event_data(
+                args, [record for record in records if record.trade_date == trade_date]
+            )
+            paths.update(date_paths)
+            frames.append(date_frame)
+        return paths, concat_frames(frames)
+
+    trade_date = trade_dates[0]
+    date_nodash = trade_date.replace("-", "")
+    stock_path = Path(
+        str(args.stock_tick_parquet_template).format(
+            date=trade_date, date_dash=trade_date, date_nodash=date_nodash
+        )
+    )
+    futures_dir = getattr(args, "event_futures_parquet_dir", None)
+    future_path = (
+        Path(futures_dir) / f"{trade_date}.parquet"
+        if futures_dir is not None
+        else Path(f"/mnt/z/ticks_parquet_stock_future/{trade_date}.parquet")
+    )
+    spots = tuple(sorted({str(record.pair.spot_symbol) for record in records}))
+    futures = tuple(sorted({str(record.pair.future_symbol) for record in records}))
+    timezone = ZoneInfo("Asia/Taipei")
+    session_start_ns = parse_timestamp(args.session_start, "auto", trade_date, timezone)
+    session_end_ns = parse_timestamp(args.session_end, "auto", trade_date, timezone)
+    store = CompactCacheStore(
+        CompactBuildConfig(
+            cache_root=Path(args.compact_cache_root),
+            compression=args.compact_cache_compression,
+            profile=args.compact_cache_profile,
+            session_start_ns=session_start_ns,
+            session_end_ns=session_end_ns,
+            batch_rows=args.compact_cache_batch_rows,
+            max_cache_bytes=int(args.compact_cache_max_gb * 1024**3),
+            min_free_bytes=int(args.compact_cache_min_free_gb * 1024**3),
+            rebuild=args.rebuild_compact_cache,
+        )
+    )
+    try:
+        manifest = store.build_date(
+            trade_date,
+            [
+                CompactSource("stock", (stock_path,), spots),
+                CompactSource("stock_future", (future_path,), futures),
+            ],
+        )
+    except (CompactCacheError, OSError) as exc:
+        if not args.continue_on_error:
+            raise
+        error = repr(exc)
+        logging.error("compact date build failed date=%s error=%s", trade_date, error)
+        return {}, pd.DataFrame(
+            [
+                {
+                    "trade_date": trade_date,
+                    "run_key": record.run_key,
+                    "pair_name": record.pair.name,
+                    "spot_symbol": record.pair.spot_symbol,
+                    "future_symbol": record.pair.future_symbol,
+                    "spot_status": "missing",
+                    "future_status": "missing",
+                    "spot_path": None,
+                    "future_path": None,
+                    "ok": False,
+                    "spot_error": error,
+                    "future_error": error,
+                    "compact_cache_state": "error",
+                    "compact_identity_sha256": None,
+                    "compact_build_invocation_scan_count": 0,
+                }
+                for record in records
+            ]
+        )
+    paths_by_run_key: dict[str, dict[str, Path]] = {}
+    audit_rows: list[dict[str, Any]] = []
+    reference_mode = getattr(args, "engine", "reference") == "reference"
+    for record in records:
+        leg_paths: dict[str, Path] = {}
+        errors = {}
+        for leg, source, symbol in (
+            ("spot", "stock", record.pair.spot_symbol),
+            ("future", "stock_future", record.pair.future_symbol),
+        ):
+            details = manifest["sources"][source]["symbols"].get(str(symbol), {})
+            if details.get("status") != "valid":
+                errors[leg] = f"missing compact partition: {source}/{symbol}"
+                continue
+            compact_path = store.date_path(trade_date) / f"source={source}" / details["file"]
+            if reference_mode:
+                output = (
+                    WORKSPACE_ROOT
+                    / "data"
+                    / "tw_compact_reference_events"
+                    / f"date={date_nodash}"
+                    / f"source={source}"
+                    / f"{symbol}.npz"
+                )
+                adapter_manifest = output.with_suffix(output.suffix + ".compact.json")
+                reusable = False
+                if output.is_file() and adapter_manifest.is_file() and not args.rebuild_event_data:
+                    try:
+                        saved = json.loads(adapter_manifest.read_text(encoding="utf-8"))
+                        reusable = saved.get("compact_identity_sha256") == manifest["identity_sha256"]
+                    except (OSError, json.JSONDecodeError):
+                        reusable = False
+                if not reusable:
+                    write_reference_npz_from_compact(
+                        store.read_symbol(trade_date, source, str(symbol)),
+                        output,
+                        trade_date=trade_date,
+                        compact_identity_sha256=manifest["identity_sha256"],
+                        npz_compression=args.npz_compression,
+                    )
+                leg_paths[leg] = output
+            else:
+                leg_paths[leg] = compact_path
+        ok = not errors and len(leg_paths) == 2
+        if ok:
+            paths_by_run_key[record.run_key] = leg_paths
+        audit_rows.append(
+            {
+                "trade_date": trade_date,
+                "run_key": record.run_key,
+                "pair_name": record.pair.name,
+                "spot_symbol": record.pair.spot_symbol,
+                "future_symbol": record.pair.future_symbol,
+                "spot_status": "compact" if "spot" in leg_paths else "missing",
+                "future_status": "compact" if "future" in leg_paths else "missing",
+                "spot_path": str(leg_paths["spot"]) if "spot" in leg_paths else None,
+                "future_path": str(leg_paths["future"]) if "future" in leg_paths else None,
+                "ok": ok,
+                "spot_error": errors.get("spot"),
+                "future_error": errors.get("future"),
+                "compact_cache_state": manifest["cache_state"],
+                "compact_identity_sha256": manifest["identity_sha256"],
+                "compact_build_invocation_scan_count": manifest["build_invocation_scan_count"],
+            }
+        )
+        if not ok and not args.continue_on_error:
+            raise RuntimeError(f"compact data missing for {record.run_key}: {errors}")
+    return paths_by_run_key, pd.DataFrame(audit_rows)
 
 
 def expected_event_path(args: argparse.Namespace, symbol: str, source_kind: str, trade_date: str) -> Path:
@@ -1630,7 +1890,10 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
         audit_cache = args.hbt_asset_audits = {}
     audit_key = (str(data_path), instrument, record.trade_date)
     if audit_key not in audit_cache:
-        audit_cache[audit_key] = hbt_asset_audit(data_path, instrument, trade_date=record.trade_date)
+        if getattr(args, "engine", "reference") == "slim":
+            audit_cache[audit_key] = compact_asset_audit(data_path, instrument, record.trade_date)
+        else:
+            audit_cache[audit_key] = hbt_asset_audit(data_path, instrument, trade_date=record.trade_date)
     tick_size, summary = audit_cache[audit_key]
     if configured_tick is not None:
         tick_size = configured_tick
@@ -1670,6 +1933,53 @@ def summarize_asset(args: argparse.Namespace, record: DailyPairRecord, leg: str,
         "max_feed_latency_ns": summary["max_latency_ns"],
         "depth_events": summary["depth_events"],
         "trade_events": summary["trade_events"],
+        "engine": getattr(args, "engine", "reference"),
+        "compact_schema_version": COMPACT_SCHEMA_VERSION
+        if getattr(args, "market_data_cache", "event_npz") == "compact"
+        else None,
+    }
+
+
+def compact_asset_audit(
+    data_path: Path,
+    instrument: str,
+    trade_date: str,
+) -> tuple[float, dict[str, int | None]]:
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    from arbitrage.ticks import tw_stock_future_tick_size, tw_stock_tick_size
+
+    with pa.memory_map(str(data_path), "r") as handle:
+        table = ipc.open_file(handle).read_all()
+    metadata = {key.decode(): value.decode() for key, value in (table.schema.metadata or {}).items()}
+    adjustment = int(metadata.get("local_timestamp_adjustment_ns", 0))
+    exchange = table["exch_ts"].to_numpy(zero_copy_only=False)
+    local = table["local_ts_raw"].to_numpy(zero_copy_only=False) + adjustment
+    bid = table["bid_px"].to_numpy(zero_copy_only=False)
+    ask = table["ask_px"].to_numpy(zero_copy_only=False)
+    prices = np.concatenate((bid, ask))
+    prices = prices[np.isfinite(prices) & (prices > 0)]
+    if len(prices):
+        min_price = float(prices.min())
+        tick_size = (
+            tw_stock_tick_size(min_price)
+            if instrument == "stock"
+            else tw_stock_future_tick_size(min_price, trade_date)
+        )
+    else:
+        # Match infer_hbt_asset_tick_size for a valid zero-event reference NPZ.
+        tick_size = 1.0
+    volume = table["total_volume"].to_numpy(zero_copy_only=False)
+    trade_events = int(np.sum(np.diff(volume) > 0)) if len(volume) > 1 else 0
+    return tick_size, {
+        "rows": table.num_rows,
+        "first_exch_ts": int(exchange.min()) if len(exchange) else None,
+        "last_exch_ts": int(exchange.max()) if len(exchange) else None,
+        "min_latency_ns": int(np.min(local - exchange)) if len(exchange) else None,
+        "max_latency_ns": int(np.max(local - exchange)) if len(exchange) else None,
+        "depth_events": None,
+        "trade_events": trade_events,
     }
 
 
@@ -1896,7 +2206,7 @@ def hbt_result_csvs_exist(output_dir: Path) -> bool:
     return all(paths[name].exists() for name in required)
 
 
-HBT_CACHE_SCHEMA_VERSION = 5
+HBT_CACHE_SCHEMA_VERSION = 7
 HBT_MANIFEST_NAME = "backtest_manifest.json"
 REFERENCE_ENGINE_VERSION = "reference-v1"
 HBT_RESULT_ARG_NAMES = (
@@ -1906,6 +2216,10 @@ HBT_RESULT_ARG_NAMES = (
     "excluded_run_keys",
     "session_start",
     "session_end",
+    "engine",
+    "market_data_cache",
+    "compact_cache_compression",
+    "compact_cache_profile",
     "first_leg",
     "step_ms",
     "strategy_engine",
@@ -1934,6 +2248,19 @@ HBT_RESULT_ARG_NAMES = (
     "no_second_leg_profit_check",
     "no_flatten",
     "carry_positions",
+    "total_capital",
+    "futures_margin_rate",
+    "spot_equity_rate",
+    "leverage",
+    "workers",
+    "report_mode",
+    "full_report_max_rows",
+    "low_memory_reports",
+    "report_chunk_rows",
+    "skip_entry_exit_by_pair",
+    "skip_detailed_reports",
+    "detailed_report_format",
+    "continue_on_error",
 )
 
 
@@ -1943,17 +2270,30 @@ def hbt_manifest_path(output_dir: Path) -> Path:
 
 def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord]) -> dict[str, Any]:
     config_paths = sorted({record.config_path.resolve() for record in records}, key=str)
-    event_paths = sorted(
-        {
-            expected_event_path(args, record.pair.spot_symbol, "stock", record.trade_date).resolve()
-            for record in records
-        }
-        | {
-            expected_event_path(args, record.pair.future_symbol, "stock_future", record.trade_date).resolve()
-            for record in records
-        },
-        key=str,
-    )
+    if getattr(args, "market_data_cache", "event_npz") == "compact":
+        event_paths = sorted(
+            {
+                compact_raw_source_path(args, record.trade_date, "stock").resolve()
+                for record in records
+            }
+            | {
+                compact_raw_source_path(args, record.trade_date, "stock_future").resolve()
+                for record in records
+            },
+            key=str,
+        )
+    else:
+        event_paths = sorted(
+            {
+                expected_event_path(args, record.pair.spot_symbol, "stock", record.trade_date).resolve()
+                for record in records
+            }
+            | {
+                expected_event_path(args, record.pair.future_symbol, "stock_future", record.trade_date).resolve()
+                for record in records
+            },
+            key=str,
+        )
     implementation_paths = [
         ARBITRAGE_ROOT / "hbt_backtest.py",
         ARBITRAGE_ROOT / "hbt_numba.py",
@@ -1961,13 +2301,21 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
         ARBITRAGE_ROOT / "strategy.py",
         ARBITRAGE_ROOT / "strategy_adapter.py",
         ARBITRAGE_ROOT / "position_carry.py",
+        ROOT_SCRIPT_ROOT / "compact_cache.py",
+        ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py",
+        ROOT_SCRIPT_ROOT / "slim_engine.py",
+        WORKSPACE_ROOT / "crates" / "hbt_slim" / "src" / "lib.rs",
         Path(__file__),
     ]
     return {
         "schema_version": HBT_CACHE_SCHEMA_VERSION,
-        "engine": "reference",
-        "engine_version": REFERENCE_ENGINE_VERSION,
-        "compact_schema_version": None,
+        "engine": getattr(args, "engine", "reference"),
+        "engine_version": execution_engine_version(args),
+        "compact_schema_version": (
+            COMPACT_SCHEMA_VERSION
+            if getattr(args, "market_data_cache", "event_npz") == "compact"
+            else None
+        ),
         "daily_result_schema_version": DAILY_RESULT_SCHEMA_VERSION,
         "strategy_clock": {
             "kind": "step_ms",
@@ -1980,6 +2328,27 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
         "event_files": [_stat_fingerprint(path) for path in event_paths],
         "implementation_sha256": _combined_content_sha256(implementation_paths),
     }
+
+
+def execution_engine_version(args: argparse.Namespace) -> str:
+    return SLIM_ENGINE_VERSION if getattr(args, "engine", "reference") == "slim" else REFERENCE_ENGINE_VERSION
+
+
+def compact_raw_source_path(args: argparse.Namespace, trade_date: str, source: str) -> Path:
+    if source == "stock":
+        return Path(
+            str(args.stock_tick_parquet_template).format(
+                date=trade_date,
+                date_dash=trade_date,
+                date_nodash=trade_date.replace("-", ""),
+            )
+        )
+    futures_dir = getattr(args, "event_futures_parquet_dir", None)
+    return (
+        Path(futures_dir) / f"{trade_date}.parquet"
+        if futures_dir is not None
+        else Path(f"/mnt/z/ticks_parquet_stock_future/{trade_date}.parquet")
+    )
 
 
 def hbt_cache_is_valid(args: argparse.Namespace, records: list[DailyPairRecord]) -> bool:
@@ -2130,7 +2499,11 @@ def build_pair_hbt_config(
         flatten_on_second_leg_failure=not args.no_flatten,
         second_leg_profit_check=not args.no_second_leg_profit_check,
         record_market_every_steps=None if args.record_market_every_steps <= 0 else args.record_market_every_steps,
-        strategy_engine=getattr(args, "strategy_engine", "numba"),
+        strategy_engine=(
+            "python" if getattr(args, "engine", "reference") == "slim"
+            else getattr(args, "strategy_engine", "numba")
+        ),
+        execution_engine=getattr(args, "engine", "reference"),
     )
 
 

@@ -1142,6 +1142,38 @@ def _aggregate_depth_side(
 
 
 @njit(cache=True)
+def normalized_bbo_from_depth_columns(
+    prices: np.ndarray,
+    quantities: np.ndarray,
+    volume_scale: float,
+    price_only_depth_qty: float,
+    use_price_only_depth_qty: bool,
+    bid: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return normalized best prices/quantities using the reference Top-5 rules."""
+    best_prices = np.full(prices.shape[0], np.nan, dtype=np.float64)
+    best_quantities = np.full(prices.shape[0], np.nan, dtype=np.float64)
+    work_prices = np.empty(prices.shape[1], dtype=np.float64)
+    work_quantities = np.empty(prices.shape[1], dtype=np.float64)
+    for row in range(prices.shape[0]):
+        count = _aggregate_depth_side(
+            prices,
+            quantities,
+            row,
+            volume_scale,
+            price_only_depth_qty,
+            use_price_only_depth_qty,
+            not bid,
+            work_prices,
+            work_quantities,
+        )
+        if count:
+            best_prices[row] = work_prices[0]
+            best_quantities[row] = work_quantities[0]
+    return best_prices, best_quantities
+
+
+@njit(cache=True)
 def _fill_events_from_columns(
     out: np.ndarray,
     exch_ts: np.ndarray,

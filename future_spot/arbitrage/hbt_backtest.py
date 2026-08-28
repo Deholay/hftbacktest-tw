@@ -21,6 +21,7 @@ from scripts.hbt_common import (
     round_price_to_tick,
 )
 from scripts.tw_stock_hftbacktest import import_hftbacktest, workspace_root
+from scripts.slim_engine import SlimBacktest, SlimHbtConstants, validate_slim_pair_config
 
 from .config import build_initial_position
 from .hbt_helpers import (
@@ -66,7 +67,12 @@ class HbtPairBacktester:
         strategy: Strategy | None = None,
     ) -> None:
         self.config = config
-        self.hbtpkg = hbtpkg or import_hftbacktest(workspace_root(config.spot.data))
+        execution_engine = config.execution_engine.strip().lower()
+        self.hbtpkg = hbtpkg or (
+            SlimHbtConstants
+            if execution_engine == "slim"
+            else import_hftbacktest(workspace_root(config.spot.data))
+        )
         self.pricer = PairPricer()
         self._custom_strategy = strategy is not None
         self.strategy = strategy or default_strategy()
@@ -83,6 +89,8 @@ class HbtPairBacktester:
         hbt = self._build_backtest()
         try:
             engine = self.config.strategy_engine.strip().lower()
+            if self.config.execution_engine.strip().lower() == "slim":
+                engine = "python"
             if engine == "python":
                 self._run_python(hbt)
             elif engine == "numba":
@@ -302,10 +310,39 @@ class HbtPairBacktester:
             raise RuntimeError(f"unknown Numba signal code: {code}") from exc
 
     def _build_backtest(self):
+        execution_engine = self.config.execution_engine.strip().lower()
+        if execution_engine == "slim":
+            validate_slim_pair_config(self.config.pair)
+            spot_tick = self.config.spot.tick_size or self._infer_compact_tick_size(self.config.spot)
+            future_tick = self.config.future.tick_size or self._infer_compact_tick_size(self.config.future)
+            spot = HbtAssetConfig(**{**self.config.spot.__dict__, "tick_size": spot_tick})
+            future = HbtAssetConfig(**{**self.config.future.__dict__, "tick_size": future_tick})
+            self.resolved_tick_sizes = {"spot_tick_size": spot_tick, "future_tick_size": future_tick}
+            return SlimBacktest([spot, future])
+        if execution_engine != "reference":
+            raise ValueError(f"execution_engine must be 'reference' or 'slim': {self.config.execution_engine}")
         spot_asset, spot_tick = self._build_asset(self.config.spot)
         future_asset, future_tick = self._build_asset(self.config.future)
         self.resolved_tick_sizes = {"spot_tick_size": spot_tick, "future_tick_size": future_tick}
         return self.hbtpkg.HashMapMarketDepthBacktest([spot_asset, future_asset])
+
+    def _infer_compact_tick_size(self, asset_config: HbtAssetConfig) -> float:
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+
+        with pa.memory_map(str(asset_config.data), "r") as handle:
+            table = ipc.open_file(handle).read_all()
+        prices = table["bid_px"].to_numpy(zero_copy_only=False)
+        prices = prices[(prices == prices) & (prices > 0)]
+        if not len(prices):
+            return 1.0
+        price = float(prices.min())
+        return pair_leg_tick_size(
+            self.config.pair,
+            "stock" if asset_config.instrument == "stock" else "future",
+            price,
+            {"exchtime": table["exch_ts"][0].as_py() if table.num_rows else 0},
+        )
 
     def _build_asset(self, asset_config: HbtAssetConfig):
         tick_size = asset_config.tick_size or infer_hbt_asset_tick_size(

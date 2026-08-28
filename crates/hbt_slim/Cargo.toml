@@ -1,0 +1,7 @@
+[package]
+name = "hbt_slim"
+version = "0.2.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

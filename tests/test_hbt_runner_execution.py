@@ -11,6 +11,7 @@ import pandas as pd
 from future_spot.arbitrage.full_market_runner import (
     DailyPairRecord,
     balanced_backtest_shards,
+    build_compact_event_data,
     run_backtests,
 )
 from future_spot.arbitrage.models import PairConfig
@@ -47,6 +48,38 @@ class InlineExecutor:
 
 
 class PersistentExecutorTest(unittest.TestCase):
+    def test_compact_missing_date_preserves_reference_error_path(self) -> None:
+        record = DailyPairRecord(
+            "2026-07-10",
+            "2026-07-10::carry",
+            _pair("carry"),
+            Path("carry.json"),
+        )
+        args = SimpleNamespace(
+            stock_tick_parquet_template="/missing/stock_{date_nodash}.parquet",
+            event_futures_parquet_dir=Path("/missing/futures"),
+            session_start="09:00:00",
+            session_end="13:25:00",
+            compact_cache_root=Path("/unused/cache"),
+            compact_cache_compression="lz4",
+            compact_cache_profile="bbo",
+            compact_cache_batch_rows=1024,
+            compact_cache_max_gb=1.0,
+            compact_cache_min_free_gb=0.0,
+            rebuild_compact_cache=False,
+            continue_on_error=True,
+            engine="slim",
+        )
+        with patch(
+            "future_spot.arbitrage.full_market_runner.CompactCacheStore.build_date",
+            side_effect=FileNotFoundError("missing date source"),
+        ):
+            paths, audit = build_compact_event_data(args, [record])
+        self.assertFalse(paths)
+        self.assertEqual(audit["compact_cache_state"].tolist(), ["error"])
+        self.assertEqual(audit["compact_build_invocation_scan_count"].tolist(), [0])
+        self.assertIn("missing date source", audit.loc[0, "future_error"])
+
     def test_run_backtests_uses_caller_owned_executor(self) -> None:
         records = [
             DailyPairRecord("2026-03-02", f"2026-03-02::{name}", _pair(name), Path(f"{name}.json"))

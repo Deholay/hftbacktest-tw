@@ -54,10 +54,19 @@ class FastPipelineTest(unittest.TestCase):
         self.assertEqual(args.data_platform_base, "/mnt/z/數據平台")
         self.assertTrue(args.low_memory_reports)
         self.assertEqual(args.report_mode, "summary")
+        self.assertIsNone(args.full_report_max_rows)
         self.assertEqual(args.report_chunk_rows, 25_000)
         self.assertGreaterEqual(args.workers, 1)
         self.assertEqual(len(args.excluded_dates), 7)
         self.assertEqual(len(args.excluded_run_keys), 8)
+
+    def test_full_report_requires_explicit_positive_row_budget(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_args(["--report-mode", "full"])
+        args = parse_args(
+            ["--report-mode", "full", "--full-report-max-rows", "100000"]
+        )
+        self.assertEqual(args.full_report_max_rows, 100_000)
 
     def test_run_key_exclusion_removes_exact_record(self) -> None:
         records = [
