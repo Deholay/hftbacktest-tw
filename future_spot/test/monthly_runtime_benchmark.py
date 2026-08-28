@@ -52,6 +52,7 @@ BASELINE_ARGS = (
     "--workers", "6",
     "--strategy-engine", "numba",
     "--record-market-every-steps", "60",
+    "--continue-on-error",
 )
 
 
@@ -78,6 +79,26 @@ def cpu_seconds() -> float:
     own = resource.getrusage(resource.RUSAGE_SELF)
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
+
+
+def peak_rss_bytes() -> int:
+    own = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    children = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    return int(max(own, children) * 1024)
+
+
+def directory_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def partition_rows(output_dir: Path, table: str) -> int:
+    rows = 0
+    for path in (output_dir / "core" / "dates").glob("trade_date=*/manifest.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows += int(payload.get("tables", {}).get(table, {}).get("rows", 0))
+    return rows
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -141,6 +162,7 @@ def run_hbt(cli: argparse.Namespace) -> None:
     runner.hbt_settings_frame = timed_wrapper(originals["hbt_settings_frame"], timings, "npz_audit_seconds")
     runner.run_backtests = timed_wrapper(originals["run_backtests"], timings, "pair_backtest_seconds")
 
+    result_bytes_before = directory_bytes(args.output_dir)
     wall_started = time.perf_counter()
     cpu_started = cpu_seconds()
     try:
@@ -151,6 +173,7 @@ def run_hbt(cli: argparse.Namespace) -> None:
         runner.run_backtests = originals["run_backtests"]
     wall_seconds = time.perf_counter() - wall_started
     cpu_used = cpu_seconds() - cpu_started
+    result_bytes_after = directory_bytes(args.output_dir)
 
     records = runner.pair_universe_frame(outputs.records)
     records.to_csv(cli.benchmark_dir / "records.csv", index=False)
@@ -167,7 +190,7 @@ def run_hbt(cli: argparse.Namespace) -> None:
         "trade_date_count": len(trade_dates),
         "base_pair_count": len(base_records),
         "executed_pair_count": len(outputs.records),
-        "completed_pair_count": len(outputs.pair_results),
+        "completed_pair_count": len(outputs.summary),
         "run_error_count": len(outputs.run_errors),
         "unique_event_asset_count": int(unique_assets["data"].nunique()) if not unique_assets.empty else 0,
         "event_rows": int(unique_assets["rows"].sum()) if not unique_assets.empty else 0,
@@ -175,12 +198,36 @@ def run_hbt(cli: argparse.Namespace) -> None:
         "trade_events": int(unique_assets["trade_events"].sum()) if not unique_assets.empty else 0,
         "event_file_bytes": event_file_bytes,
         "summary_rows": len(outputs.summary),
-        "trade_rows": len(outputs.trades),
-        "market_rows": len(outputs.market),
-        "latency_rows": len(outputs.latency),
+        "trade_rows": partition_rows(args.output_dir, "trades") if outputs.daily_partitions else len(outputs.trades),
+        "market_rows": partition_rows(args.output_dir, "market") if outputs.daily_partitions else len(outputs.market),
+        "latency_rows": partition_rows(args.output_dir, "latency") if outputs.daily_partitions else len(outputs.latency),
         "config_build_seconds": config_seconds,
         "hbt_total_wall_seconds": wall_seconds,
         "hbt_total_cpu_seconds": cpu_used,
+        "peak_rss_bytes": peak_rss_bytes(),
+        "result_disk_bytes": result_bytes_after,
+        "result_disk_growth_bytes": result_bytes_after - result_bytes_before,
+        "cache_state": (
+            "warm_legacy"
+            if outputs.cache_hit
+            else "warm_daily"
+            if outputs.daily_dates_reused and not outputs.daily_dates_executed
+            else "partial_daily_resume"
+            if outputs.daily_dates_reused
+            else "cold"
+        ),
+        "daily_dates_reused": outputs.daily_dates_reused,
+        "daily_dates_executed": outputs.daily_dates_executed,
+        "engine": "reference",
+        "engine_version": runner.REFERENCE_ENGINE_VERSION,
+        "time_in_force_semantics": runner.HBT_TIME_IN_FORCE_SEMANTICS,
+        "compact_schema_version": None,
+        "daily_result_schema_version": runner.DAILY_RESULT_SCHEMA_VERSION,
+        "worker_pool_creations": int(
+            not outputs.cache_hit and args.carry_positions and args.workers > 1
+        ),
+        "worker_process_count": len(getattr(args, "hbt_worker_pids", set())),
+        "last_date_shard_weights": list(getattr(args, "hbt_shard_weights", [])),
         **timings,
         "settings": {
             "workers": args.workers,
@@ -193,6 +240,8 @@ def run_hbt(cli: argparse.Namespace) -> None:
             "future_latency_ms": runner.leg_latency_ms(args, "future"),
             "spot_latency_ms": runner.leg_latency_ms(args, "spot"),
             "post_first_feed_wait": args.post_first_feed_wait,
+            "report_mode": args.report_mode,
+            "strategy_clock_step_ms": args.step_ms,
         },
         "host": host_info(),
     }
@@ -318,6 +367,7 @@ def run_conversion(cli: argparse.Namespace) -> None:
         "output_bytes_if_retained": output_bytes,
         "conversion_total_wall_seconds": wall_seconds,
         "conversion_total_cpu_seconds": cpu_used,
+        "peak_rss_bytes": peak_rss_bytes(),
         "stock_conversion_seconds": stock_seconds,
         "future_conversion_seconds": future_seconds,
         "npz_compression": cli.npz_compression,

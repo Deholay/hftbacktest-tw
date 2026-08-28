@@ -11,7 +11,8 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, replace
+import time
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -43,6 +44,13 @@ from scripts.io_utils import (  # noqa: E402
     write_csv,
     write_parquet,
 )
+from scripts.daily_result_store import (  # noqa: E402
+    DAILY_RESULT_SCHEMA_VERSION,
+    DailyResultStore,
+    DailyResultStoreError,
+    canonical_sha256,
+)
+from scripts.hbt_common import HBT_TIME_IN_FORCE_SEMANTICS  # noqa: E402
 from arbitrage.config import load_config  # noqa: E402
 from arbitrage.capital import (  # noqa: E402
     CapitalAllocationConfig,
@@ -137,6 +145,10 @@ class HbtRunOutputs:
     settings: pd.DataFrame
     position_carry_status: pd.DataFrame
     cache_hit: bool
+    daily_partitions: bool = False
+    daily_dates_reused: int = 0
+    daily_dates_executed: int = 0
+    stage_timings: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -368,26 +380,28 @@ def main() -> int:
     write_csv(outputs.conversion_status, args.output_dir / "conversion_status.csv")
     write_csv(outputs.settings, args.output_dir / "hbt_settings.csv")
     write_csv(outputs.position_carry_status, args.output_dir / "position_carry_status.csv")
-    write_csv(outputs.summary, args.output_dir / "summary_all_daily_pairs.csv")
-    write_csv(outputs.trades, args.output_dir / "trades_all_daily_pairs.csv")
-    write_csv(outputs.market, args.output_dir / "market_all_daily_pairs.csv")
-    write_csv(outputs.latency, args.output_dir / "latency_all_daily_pairs.csv")
-    write_csv(outputs.run_errors, args.output_dir / "run_errors.csv")
+    if not outputs.daily_partitions:
+        write_csv(outputs.summary, args.output_dir / "summary_all_daily_pairs.csv")
+        write_csv(outputs.trades, args.output_dir / "trades_all_daily_pairs.csv")
+        write_csv(outputs.market, args.output_dir / "market_all_daily_pairs.csv")
+        write_csv(outputs.latency, args.output_dir / "latency_all_daily_pairs.csv")
+        write_csv(outputs.run_errors, args.output_dir / "run_errors.csv")
     if not outputs.cache_hit:
         write_hbt_manifest(args, records)
 
-    entry_exit_by_pair, entry_exit_all, entry_exit_index = build_entry_exit_outputs(outputs.pair_results, records)
-    write_csv(entry_exit_all, args.output_dir / "entry_exit_all_daily_pairs.csv")
-    write_csv(entry_exit_index, args.output_dir / "entry_exit_index.csv")
-    if not args.skip_entry_exit_by_pair:
-        write_entry_exit_by_pair(entry_exit_by_pair, args.output_dir / "entry_exit_by_pair")
+    if not outputs.daily_partitions:
+        entry_exit_by_pair, entry_exit_all, entry_exit_index = build_entry_exit_outputs(outputs.pair_results, records)
+        write_csv(entry_exit_all, args.output_dir / "entry_exit_all_daily_pairs.csv")
+        write_csv(entry_exit_index, args.output_dir / "entry_exit_index.csv")
+        if not args.skip_entry_exit_by_pair:
+            write_entry_exit_by_pair(entry_exit_by_pair, args.output_dir / "entry_exit_by_pair")
 
     logging.info(
         "done dates=%s daily_pairs=%s ready_pairs=%s completed_pairs=%s errors=%s output=%s",
         len(trade_dates),
         len(records),
         len(outputs.event_paths),
-        len(outputs.pair_results),
+        len(outputs.summary),
         len(outputs.run_errors),
         args.output_dir,
     )
@@ -735,7 +749,15 @@ def execute_hbt_runs(
     except (TypeError, ValueError, KeyError) as exc:
         logging.info("cached carry state cannot be reconstructed: %s", exc)
         cached_records, reconstructed_status = [], pd.DataFrame()
-    cache_hit = bool(cached_records) and hbt_cache_is_valid(args, cached_records)
+    use_daily_resume = (
+        getattr(args, "report_mode", "summary") == "summary"
+        and (Path(args.output_dir) / "core" / "dates").is_dir()
+    )
+    cache_hit = (
+        not use_daily_resume
+        and bool(cached_records)
+        and hbt_cache_is_valid(args, cached_records)
+    )
     if cache_hit:
         logging.info("valid continuous-position result manifest found; reuse saved HBT results")
         pair_results, summary, trades, market, latency, run_errors = run_or_load_backtests(
@@ -786,40 +808,257 @@ def run_backtests_with_position_carry(
     conversion_frames: list[pd.DataFrame] = []
     settings_frames: list[pd.DataFrame] = []
     carry_frames: list[pd.DataFrame] = []
+    result_store = DailyResultStore(Path(args.output_dir) / "core")
+    stream_daily_details = getattr(args, "report_mode", "summary") == "summary"
+    completed_dates: list[str] = []
+    reused_dates = 0
+    executed_dates = 0
+    timing_rows: list[dict[str, Any]] = []
 
-    for trade_date in trade_dates:
-        date_records = augment_records_with_position_carry(base_by_date.get(trade_date, []), carry, trade_date)
-        date_records = filter_excluded_run_records(date_records, args)
-        logging.info(
-            "continuous HBT date=%s selected=%s carried=%s total=%s",
-            trade_date,
-            len(base_by_date.get(trade_date, [])),
-            sum(record.universe_source != "selected" for record in date_records),
-            len(date_records),
-        )
-        event_paths, conversion_status = build_event_data(args, date_records)
-        settings = hbt_settings_frame(args, date_records, event_paths)
-        pair_results, summary, trades, market, latency, run_errors = run_backtests(
-            args, date_records, event_paths
-        )
-        carry, carry_status, expiry_errors = advance_position_carry(
-            carry,
-            date_records,
-            summary,
-            calendar_trade_dates,
-        )
+    configured_workers = max(1, int(getattr(args, "workers", 1)))
+    executor = ProcessPoolExecutor(max_workers=configured_workers) if configured_workers > 1 else None
+    try:
+        for trade_date in trade_dates:
+            date_started = time.perf_counter()
+            date_records = augment_records_with_position_carry(base_by_date.get(trade_date, []), carry, trade_date)
+            date_records = filter_excluded_run_records(date_records, args)
+            logging.info(
+                "continuous HBT date=%s selected=%s carried=%s total=%s",
+                trade_date,
+                len(base_by_date.get(trade_date, [])),
+                sum(record.universe_source != "selected" for record in date_records),
+                len(date_records),
+            )
+            identity_started = time.perf_counter()
+            carry_in = position_carry_identity(carry)
+            input_identity = hbt_manifest_payload(args, date_records)
+            if not getattr(args, "rebuild_hbt_results", False):
+                try:
+                    persisted = result_store.validate(trade_date)
+                    payload = persisted.payload
+                    reusable = (
+                        payload.get("input_identity_sha256") == canonical_sha256(input_identity)
+                        and payload.get("carry_in_sha256") == canonical_sha256(carry_in)
+                        and payload.get("run_keys") == [record.run_key for record in date_records]
+                    )
+                except DailyResultStoreError:
+                    persisted = None
+                    reusable = False
+                timing_rows.append(
+                    stage_timing_row(
+                        trade_date,
+                        "daily_identity_validation",
+                        identity_started,
+                        len(date_records),
+                        "resume_check",
+                    )
+                )
+                if reusable and persisted is not None:
+                    resume_started = time.perf_counter()
+                    summary = result_store.load_table(trade_date, "summary")
+                    trades = result_store.load_table(trade_date, "trades")
+                    market = result_store.load_table(trade_date, "market")
+                    latency = result_store.load_table(trade_date, "latency")
+                    run_errors = result_store.load_table(trade_date, "run_errors")
+                    conversion_status = result_store.load_table(trade_date, "conversion")
+                    settings = result_store.load_table(trade_date, "settings")
+                    carry_status = result_store.load_table(trade_date, "position_carry")
+                    next_carry, _, _ = advance_position_carry(
+                        carry,
+                        date_records,
+                        summary,
+                        calendar_trade_dates,
+                    )
+                    if canonical_sha256(position_carry_identity(next_carry)) == persisted.carry_out_sha256:
+                        logging.info("reusing verified daily result partition date=%s", trade_date)
+                        pair_results = pair_results_from_frames(trades, summary, market, latency)
+                        if not getattr(args, "skip_entry_exit_by_pair", False):
+                            entry_by_pair, _, _ = build_entry_exit_outputs(pair_results, date_records)
+                            write_entry_exit_by_pair(
+                                entry_by_pair,
+                                Path(args.output_dir) / "entry_exit_by_pair",
+                            )
+                        carry = next_carry
+                        all_records.extend(date_records)
+                        summary_frames.append(summary)
+                        if not stream_daily_details:
+                            all_pair_results.update(pair_results)
+                            trade_frames.append(trades)
+                            market_frames.append(market)
+                            latency_frames.append(latency)
+                        error_frames.append(run_errors)
+                        conversion_frames.append(conversion_status)
+                        settings_frames.append(settings)
+                        carry_frames.append(carry_status)
+                        completed_dates.append(trade_date)
+                        reused_dates += 1
+                        timing_rows.append(
+                            stage_timing_row(
+                                trade_date,
+                                "daily_resume_load",
+                                resume_started,
+                                len(date_records),
+                                "reused",
+                            )
+                        )
+                        timing_rows.append(
+                            stage_timing_row(
+                                trade_date,
+                                "date_total",
+                                date_started,
+                                len(date_records),
+                                "reused",
+                            )
+                        )
+                        continue
+                    logging.warning("daily result carry-out mismatch; rebuild required date=%s", trade_date)
+            else:
+                timing_rows.append(
+                    stage_timing_row(
+                        trade_date,
+                        "daily_identity_validation",
+                        identity_started,
+                        len(date_records),
+                        "forced_rebuild",
+                    )
+                )
 
-        all_records.extend(date_records)
-        all_event_paths.update(event_paths)
-        all_pair_results.update(pair_results)
-        summary_frames.append(summary)
-        trade_frames.append(trades)
-        market_frames.append(market)
-        latency_frames.append(latency)
-        error_frames.extend((run_errors, expiry_errors))
-        conversion_frames.append(conversion_status)
-        settings_frames.append(settings)
-        carry_frames.append(carry_status)
+            stage_started = time.perf_counter()
+            event_paths, conversion_status = build_event_data(args, date_records)
+            timing_rows.append(
+                stage_timing_row(trade_date, "event_data", stage_started, len(date_records), "executed")
+            )
+            stage_started = time.perf_counter()
+            settings = hbt_settings_frame(args, date_records, event_paths)
+            timing_rows.append(
+                stage_timing_row(trade_date, "event_audit", stage_started, len(date_records), "executed")
+            )
+            stage_started = time.perf_counter()
+            pair_results, summary, trades, market, latency, run_errors = run_backtests(
+                args,
+                date_records,
+                event_paths,
+                executor=executor,
+            )
+            timing_rows.append(
+                stage_timing_row(trade_date, "pair_matching", stage_started, len(date_records), "executed")
+            )
+            # run_backtests waits for every submitted future. Carry is therefore
+            # resolved before the next date can submit work to the same pool.
+            stage_started = time.perf_counter()
+            carry, carry_status, expiry_errors = advance_position_carry(
+                carry,
+                date_records,
+                summary,
+                calendar_trade_dates,
+            )
+            entry_by_pair, entry_exit, entry_exit_index = build_entry_exit_outputs(pair_results, date_records)
+            if not getattr(args, "skip_entry_exit_by_pair", False):
+                write_entry_exit_by_pair(
+                    entry_by_pair,
+                    Path(args.output_dir) / "entry_exit_by_pair",
+                )
+            date_errors = concat_frames([run_errors, expiry_errors])
+            timing_rows.append(
+                stage_timing_row(
+                    trade_date,
+                    "carry_and_entry_exit",
+                    stage_started,
+                    len(date_records),
+                    "executed",
+                )
+            )
+            stage_started = time.perf_counter()
+            result_store.publish(
+                trade_date,
+                {
+                    "summary": summary,
+                    "trades": trades,
+                    "market": market,
+                    "latency": latency,
+                    "entry_exit": entry_exit,
+                    "entry_exit_index": entry_exit_index,
+                    "run_errors": date_errors,
+                    "conversion": conversion_status,
+                    "settings": settings,
+                    "position_carry": carry_status,
+                },
+                input_identity=input_identity,
+                carry_in=carry_in,
+                carry_out=position_carry_identity(carry),
+                run_keys=[record.run_key for record in date_records],
+                metadata={
+                    "engine": "reference",
+                    "engine_version": REFERENCE_ENGINE_VERSION,
+                    "strategy_clock": "step_ms",
+                    "step_ms": getattr(args, "step_ms", None),
+                    "time_in_force_semantics": HBT_TIME_IN_FORCE_SEMANTICS,
+                },
+            )
+            timing_rows.append(
+                stage_timing_row(
+                    trade_date,
+                    "daily_result_publish",
+                    stage_started,
+                    len(date_records),
+                    "executed",
+                )
+            )
+
+            all_records.extend(date_records)
+            all_event_paths.update(event_paths)
+            summary_frames.append(summary)
+            if not stream_daily_details:
+                all_pair_results.update(pair_results)
+                trade_frames.append(trades)
+                market_frames.append(market)
+                latency_frames.append(latency)
+            error_frames.extend((run_errors, expiry_errors))
+            conversion_frames.append(conversion_status)
+            settings_frames.append(settings)
+            carry_frames.append(carry_status)
+            completed_dates.append(trade_date)
+            executed_dates += 1
+            timing_rows.append(
+                stage_timing_row(
+                    trade_date,
+                    "date_total",
+                    date_started,
+                    len(date_records),
+                    "executed",
+                )
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    if stream_daily_details:
+        compatibility_tables = {
+            "summary": "summary_all_daily_pairs.csv",
+            "trades": "trades_all_daily_pairs.csv",
+            "market": "market_all_daily_pairs.csv",
+            "latency": "latency_all_daily_pairs.csv",
+            "run_errors": "run_errors.csv",
+            "entry_exit": "entry_exit_all_daily_pairs.csv",
+            "entry_exit_index": "entry_exit_index.csv",
+        }
+        compatibility_started = time.perf_counter()
+        result_store.write_tables_csv(
+            completed_dates,
+            {
+                table: Path(args.output_dir) / filename
+                for table, filename in compatibility_tables.items()
+            },
+        )
+        timing_rows.append(
+            stage_timing_row(
+                None,
+                "compatibility_csv_stream",
+                compatibility_started,
+                len(all_records),
+                "run",
+            )
+        )
 
     return HbtRunOutputs(
         records=all_records,
@@ -834,7 +1073,48 @@ def run_backtests_with_position_carry(
         settings=concat_frames(settings_frames),
         position_carry_status=concat_frames(carry_frames),
         cache_hit=False,
+        daily_partitions=stream_daily_details,
+        daily_dates_reused=reused_dates,
+        daily_dates_executed=executed_dates,
+        stage_timings=pd.DataFrame(timing_rows),
     )
+
+
+def stage_timing_row(
+    trade_date: str | None,
+    stage: str,
+    started: float,
+    pair_count: int,
+    mode: str,
+) -> dict[str, Any]:
+    return {
+        "trade_date": trade_date,
+        "stage": stage,
+        "elapsed_seconds": time.perf_counter() - started,
+        "pair_count": pair_count,
+        "mode": mode,
+    }
+
+
+def position_carry_identity(
+    carry: dict[PositionKey, PositionSnapshot],
+) -> list[dict[str, Any]]:
+    """Return deterministic, result-defining carry state for manifest chaining."""
+    return [
+        {
+            "spot_symbol": key[0],
+            "future_symbol": key[1],
+            "source_trade_date": snapshot.source_trade_date,
+            "config_path": str(snapshot.config_path),
+            "quantity": snapshot.quantity,
+            "direction": snapshot.direction.value,
+            "entry_basis_pct": snapshot.entry_basis_pct,
+            "entry_spot_price": snapshot.entry_spot_price,
+            "entry_future_price": snapshot.entry_future_price,
+            "pair": snapshot.pair,
+        }
+        for key, snapshot in sorted(carry.items())
+    ]
 
 
 def augment_records_with_position_carry(
@@ -1326,6 +1606,7 @@ def hbt_settings_frame(
 ) -> pd.DataFrame:
     rows = []
     args.hbt_tick_sizes = {}
+    args.hbt_event_rows = {}
     for record in records:
         paths = event_paths.get(record.run_key)
         if not paths:
@@ -1335,6 +1616,8 @@ def hbt_settings_frame(
         rows.extend((spot, future))
         args.hbt_tick_sizes[str(paths["spot"])] = spot["tick_size"]
         args.hbt_tick_sizes[str(paths["future"])] = future["tick_size"]
+        args.hbt_event_rows[str(paths["spot"])] = int(spot["rows"])
+        args.hbt_event_rows[str(paths["future"])] = int(future["rows"])
     return pd.DataFrame(rows)
 
 
@@ -1394,6 +1677,8 @@ def run_backtests(
     args: argparse.Namespace,
     records: list[DailyPairRecord],
     event_paths: dict[str, dict[str, Path]],
+    *,
+    executor: ProcessPoolExecutor | None = None,
 ) -> tuple[dict[str, dict[str, pd.DataFrame]], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     results: dict[str, dict[str, pd.DataFrame]] = {}
     summary_frames = []
@@ -1423,24 +1708,17 @@ def run_backtests(
                 failures[record.run_key] = repr(exc)
                 if not args.continue_on_error:
                     raise
+    elif executor is None:
+        with ProcessPoolExecutor(max_workers=workers) as date_executor:
+            _collect_parallel_backtests(
+                args,
+                runnable,
+                date_executor,
+                completed,
+                failures,
+            )
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_records = {
-                executor.submit(_run_single_pair_backtest, args, record, paths): record
-                for record, paths in runnable
-            }
-            for index, future in enumerate(as_completed(future_records), start=1):
-                record = future_records[future]
-                try:
-                    completed[record.run_key] = future.result()
-                    if index == len(runnable) or index % 10 == 0:
-                        logging.info("pair backtest progress=%s/%s", index, len(runnable))
-                except Exception as exc:
-                    failures[record.run_key] = repr(exc)
-                    if not args.continue_on_error:
-                        for pending in future_records:
-                            pending.cancel()
-                        raise
+        _collect_parallel_backtests(args, runnable, executor, completed, failures)
 
     for record in records:
         if record.run_key in failures:
@@ -1470,6 +1748,93 @@ def run_backtests(
         concat_frames(latency_frames),
         pd.DataFrame(error_rows),
     )
+
+
+def _collect_parallel_backtests(
+    args: argparse.Namespace,
+    runnable: list[tuple[DailyPairRecord, dict[str, Path]]],
+    executor: ProcessPoolExecutor,
+    completed: dict[str, dict[str, pd.DataFrame]],
+    failures: dict[str, str],
+) -> None:
+    workers = max(1, min(int(getattr(args, "workers", 1)), len(runnable) or 1))
+    shards = balanced_backtest_shards(runnable, workers, getattr(args, "hbt_event_rows", {}))
+    args.hbt_shard_weights = [sum(item[2] for item in shard) for shard in shards]
+    future_shards = {
+        executor.submit(
+            _run_backtest_shard,
+            args,
+            [(record, paths) for record, paths, _ in shard],
+        ): shard
+        for shard in shards
+    }
+    finished = 0
+    worker_pids = set(getattr(args, "hbt_worker_pids", set()))
+    for future in as_completed(future_shards):
+        try:
+            worker_pid, shard_results = future.result()
+            worker_pids.add(worker_pid)
+            for run_key, result, error in shard_results:
+                if error is None and result is not None:
+                    completed[run_key] = result
+                elif error is not None:
+                    failures[run_key] = error
+                finished += 1
+                if finished == len(runnable) or finished % 10 == 0:
+                    logging.info("pair backtest progress=%s/%s", finished, len(runnable))
+        except Exception as exc:
+            if not args.continue_on_error:
+                for pending in future_shards:
+                    pending.cancel()
+                raise
+            for record, _, _ in future_shards[future]:
+                failures.setdefault(record.run_key, repr(exc))
+                finished += 1
+    args.hbt_worker_pids = worker_pids
+
+
+def balanced_backtest_shards(
+    runnable: list[tuple[DailyPairRecord, dict[str, Path]]],
+    workers: int,
+    event_rows: dict[str, int] | None = None,
+) -> list[list[tuple[DailyPairRecord, dict[str, Path], int]]]:
+    """Balance pair work using the combined event rows of both legs."""
+    shard_count = max(1, min(int(workers), len(runnable) or 1))
+    shards: list[list[tuple[DailyPairRecord, dict[str, Path], int]]] = [
+        [] for _ in range(shard_count)
+    ]
+    totals = [0] * shard_count
+    row_counts = event_rows or {}
+    weighted: list[tuple[DailyPairRecord, dict[str, Path], int]] = []
+    for record, paths in runnable:
+        weight = sum(max(0, int(row_counts.get(str(path), 0))) for path in paths.values())
+        if weight <= 0:
+            weight = sum(
+                max(1, int(path.stat().st_size)) if path.exists() else 1
+                for path in paths.values()
+            )
+        weighted.append((record, paths, weight))
+    for item in sorted(weighted, key=lambda value: (-value[2], value[0].run_key)):
+        index = min(range(shard_count), key=lambda shard_index: (totals[shard_index], shard_index))
+        shards[index].append(item)
+        totals[index] += item[2]
+    return [shard for shard in shards if shard]
+
+
+def _run_backtest_shard(
+    args: argparse.Namespace,
+    shard: list[tuple[DailyPairRecord, dict[str, Path]]],
+) -> tuple[int, list[tuple[str, dict[str, pd.DataFrame] | None, str | None]]]:
+    results: list[tuple[str, dict[str, pd.DataFrame] | None, str | None]] = []
+    for record, paths in shard:
+        try:
+            result = _run_single_pair_backtest(args, record, paths)
+            results.append((record.run_key, result, None))
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise RuntimeError(f"pair backtest failed run_key={record.run_key}: {exc!r}") from exc
+            results.append((record.run_key, None, repr(exc)))
+    return os.getpid(), results
 
 
 def _run_single_pair_backtest(
@@ -1531,8 +1896,9 @@ def hbt_result_csvs_exist(output_dir: Path) -> bool:
     return all(paths[name].exists() for name in required)
 
 
-HBT_CACHE_SCHEMA_VERSION = 4
+HBT_CACHE_SCHEMA_VERSION = 5
 HBT_MANIFEST_NAME = "backtest_manifest.json"
+REFERENCE_ENGINE_VERSION = "reference-v1"
 HBT_RESULT_ARG_NAMES = (
     "start_date",
     "end_date",
@@ -1599,6 +1965,15 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
     ]
     return {
         "schema_version": HBT_CACHE_SCHEMA_VERSION,
+        "engine": "reference",
+        "engine_version": REFERENCE_ENGINE_VERSION,
+        "compact_schema_version": None,
+        "daily_result_schema_version": DAILY_RESULT_SCHEMA_VERSION,
+        "strategy_clock": {
+            "kind": "step_ms",
+            "step_ms": _json_value(getattr(args, "step_ms", None)),
+        },
+        "time_in_force_semantics": HBT_TIME_IN_FORCE_SEMANTICS,
         "arguments": {name: _json_value(getattr(args, name, None)) for name in HBT_RESULT_ARG_NAMES},
         "run_keys": [record.run_key for record in records],
         "daily_configs": [_content_fingerprint(path) for path in config_paths],

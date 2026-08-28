@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 from .hbt_types import HbtAssetConfig, HbtLegFill
@@ -40,11 +41,36 @@ def round_price_to_tick(price: float, tick_size: float) -> float:
     return round(price / tick_size) * tick_size
 
 
+HBT_TIME_IN_FORCE_SEMANTICS = "strict-v1"
+
+
 def hbt_time_in_force(hbtpkg: Any, value: str) -> int:
-    attr = getattr(hbtpkg, value.upper(), None)
-    if attr is not None:
-        return attr
-    return hbtpkg.GTC
+    """Resolve an HftBacktest time-in-force without changing its semantics.
+
+    HftBacktest 2.4 exports GTC/GTX from the package root while FOK/IOC live in
+    ``hftbacktest.order``.  Older code used a root-level ``getattr`` and fell
+    back to GTC, causing configured immediate orders to become resting orders.
+    ROD is the broker-facing spelling used by the futures/spot configuration
+    and is intentionally mapped to HBT's GTC constant.
+    """
+    text = str(value).strip().upper()
+    canonical = {"ROD": "GTC", "GTC": "GTC", "GTX": "GTX", "FOK": "FOK", "IOC": "IOC"}.get(text)
+    if canonical is None:
+        raise ValueError(f"unknown HftBacktest time_in_force: {value!r}")
+
+    attr = getattr(hbtpkg, canonical, None)
+    if attr is None:
+        package_name = getattr(hbtpkg, "__name__", "hftbacktest")
+        try:
+            order_module = importlib.import_module(f"{package_name}.order")
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                f"HftBacktest does not expose required time_in_force {canonical}"
+            ) from exc
+        attr = getattr(order_module, canonical, None)
+    if attr is None:
+        raise RuntimeError(f"HftBacktest does not expose required time_in_force {canonical}")
+    return int(attr)
 
 
 def hbt_feed_latency(hbt: Any, asset_no: int) -> tuple[int, int] | None:

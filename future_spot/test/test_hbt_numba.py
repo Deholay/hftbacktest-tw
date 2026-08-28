@@ -30,6 +30,7 @@ from arbitrage.hbt_types import HbtPairBacktestConfig  # noqa: E402
 from arbitrage.models import PairConfig, PairMarket, PairPosition, Quote, Signal  # noqa: E402
 from arbitrage.strategy import PairPricer, StopLossAwareSignalEngine  # noqa: E402
 from scripts.hbt_types import HbtAssetConfig  # noqa: E402
+from scripts.hbt_common import hbt_time_in_force  # noqa: E402
 from scripts.tw_stock_hftbacktest import import_hftbacktest  # noqa: E402
 from scripts.tw_stock_data_to_npz import (  # noqa: E402
     EVENT_DTYPE,
@@ -69,6 +70,17 @@ def pair_config(**updates) -> PairConfig:
 
 
 class HbtNumbaTest(unittest.TestCase):
+    def test_installed_hbt_has_separate_legacy_and_immediate_tif_baselines(self) -> None:
+        hbtpkg = import_hftbacktest(WORKSPACE_ROOT)
+        legacy_gtc = hbt_time_in_force(hbtpkg, "ROD")
+        intended_fok = hbt_time_in_force(hbtpkg, "FOK")
+        intended_ioc = hbt_time_in_force(hbtpkg, "IOC")
+
+        self.assertEqual(legacy_gtc, hbt_time_in_force(hbtpkg, "GTC"))
+        self.assertNotEqual(intended_fok, legacy_gtc)
+        self.assertNotEqual(intended_ioc, legacy_gtc)
+        self.assertNotEqual(intended_fok, intended_ioc)
+
     def test_numba_pricing_matches_pair_pricer_across_tick_schedule(self) -> None:
         pair = pair_config()
         for timestamp, prices in (

@@ -45,8 +45,10 @@ def write_parquet(frame: pd.DataFrame, path: Path) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     parquet_frame = frame.copy()
-    for name in parquet_frame.select_dtypes(include="object").columns:
+    for name in parquet_frame.columns:
         values = parquet_frame[name]
+        if values.dtype != object:
+            continue
         present = values[values.notna()]
         if not present.empty and present.map(_is_integer_compatible).all():
             parquet_frame[name] = pd.array(values, dtype="Int64")
