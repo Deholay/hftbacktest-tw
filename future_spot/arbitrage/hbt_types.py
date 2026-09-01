@@ -25,3 +25,4 @@ class HbtPairBacktestConfig:
     second_leg_profit_check: bool = True
     record_market_every_steps: int | None = None
     strategy_engine: str = "python"
+    execution_engine: str = "reference"

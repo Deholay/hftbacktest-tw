@@ -50,6 +50,7 @@ python future_spot/test/run_full_backtest.py \
 # Build detailed failure/capital tables while retaining bounded CSV reads.
 python future_spot/test/run_full_backtest.py \
   --report-mode full \
+  --full-report-max-rows 5000000 \
   --report-chunk-rows 25000
 
 # Force a valid-cache bypass after intentional strategy/config changes.

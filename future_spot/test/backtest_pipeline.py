@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,16 +47,28 @@ class BacktestArtifacts:
 
 def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
     """Run every data/config/HBT stage and persist the core CSV outputs."""
+    pipeline_started = time.perf_counter()
+    timing_rows: list[dict[str, Any]] = []
+    stage_started = time.perf_counter()
     args = prepare_args(args)
+    timing_rows.append(_pipeline_timing("prepare_args", stage_started))
+    stage_started = time.perf_counter()
     trade_dates = daily_pipeline.select_trade_dates(
         args.calendar,
         args.start_date,
         args.end_date,
         excluded_dates=args.excluded_dates,
     )
+    timing_rows.append(_pipeline_timing("select_trade_dates", stage_started))
 
+    stage_started = time.perf_counter()
     base_records, build_status = daily_pipeline.build_daily_pair_records(args, trade_dates)
+    timing_rows.append(_pipeline_timing("build_daily_pair_records", stage_started, len(base_records)))
+    stage_started = time.perf_counter()
     outputs = hbt_pipeline.execute_hbt_runs(args, base_records, trade_dates)
+    timing_rows.append(_pipeline_timing("execute_or_resume_hbt", stage_started, len(outputs.records)))
+    if not outputs.stage_timings.empty:
+        timing_rows.extend(outputs.stage_timings.to_dict("records"))
     records = outputs.records
     event_paths = outputs.event_paths
     pair_results = outputs.pair_results
@@ -67,6 +80,7 @@ def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
     conversion_status = outputs.conversion_status
     settings = outputs.settings
     pair_universe = daily_pipeline.pair_universe_frame(records)
+    stage_started = time.perf_counter()
     _write_frames(args.output_dir, {
         "daily_config_build_status": build_status,
         "daily_pair_universe": pair_universe,
@@ -74,28 +88,43 @@ def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
         "hbt_settings": settings,
         "position_carry_status": outputs.position_carry_status,
     })
+    timing_rows.append(_pipeline_timing("persist_audit_frames", stage_started, len(records)))
     if args.post_first_feed_wait != "none" and not summary.empty and "post_first_feed_wait" not in summary.columns:
         raise RuntimeError(
             "Loaded incompatible cached results: summary is missing post_first_feed_wait. "
             "Rerun with --rebuild-hbt-results."
         )
-    core_frames = {
-        "summary_all_daily_pairs": summary,
-        "trades_all_daily_pairs": trades,
-        "market_all_daily_pairs": market,
-        "latency_all_daily_pairs": latency,
-        "run_errors": run_errors,
-    }
-    _write_frames(args.output_dir, core_frames)
+    if not outputs.daily_partitions:
+        stage_started = time.perf_counter()
+        core_frames = {
+            "summary_all_daily_pairs": summary,
+            "trades_all_daily_pairs": trades,
+            "market_all_daily_pairs": market,
+            "latency_all_daily_pairs": latency,
+            "run_errors": run_errors,
+        }
+        _write_frames(args.output_dir, core_frames)
+        timing_rows.append(_pipeline_timing("persist_legacy_core_csv", stage_started, len(records)))
+    stage_started = time.perf_counter()
     if not outputs.cache_hit:
         manifest = hbt_pipeline.write_hbt_manifest(args, records)
         logging.info("wrote backtest manifest to %s", manifest)
+    timing_rows.append(_pipeline_timing("write_backtest_manifest", stage_started, len(records)))
 
-    entry_by_pair, entry_exit_all, entry_exit_index = reporting.build_entry_exit_outputs(pair_results, records)
-    reporting.write_csv(entry_exit_all, args.output_dir / "entry_exit_all_daily_pairs.csv")
-    reporting.write_csv(entry_exit_index, args.output_dir / "entry_exit_index.csv")
-    if not getattr(args, "skip_entry_exit_by_pair", False):
-        reporting.write_entry_exit_by_pair(entry_by_pair, args.output_dir / "entry_exit_by_pair")
+    stage_started = time.perf_counter()
+    if outputs.daily_partitions:
+        entry_exit_all = pd.DataFrame()
+        entry_exit_index = pd.DataFrame()
+    else:
+        entry_by_pair, entry_exit_all, entry_exit_index = reporting.build_entry_exit_outputs(pair_results, records)
+        reporting.write_csv(entry_exit_all, args.output_dir / "entry_exit_all_daily_pairs.csv")
+        reporting.write_csv(entry_exit_index, args.output_dir / "entry_exit_index.csv")
+        if not getattr(args, "skip_entry_exit_by_pair", False):
+            reporting.write_entry_exit_by_pair(entry_by_pair, args.output_dir / "entry_exit_by_pair")
+    timing_rows.append(_pipeline_timing("entry_exit_handoff", stage_started, len(records)))
+    timing_rows.append(_pipeline_timing("pipeline_total", pipeline_started, len(records)))
+    stage_timings = pd.DataFrame(timing_rows)
+    reporting.write_csv(stage_timings, args.output_dir / "stage_timings.csv")
 
     frames = {
         "build_status": build_status,
@@ -110,10 +139,21 @@ def run_backtest_pipeline(args: Namespace) -> BacktestArtifacts:
         "entry_exit_all": entry_exit_all,
         "entry_exit_index": entry_exit_index,
         "position_carry_status": outputs.position_carry_status,
+        "stage_timings": stage_timings,
     }
     logging.info("core backtest outputs saved to %s", args.output_dir)
     hbt_pipeline.raise_for_expiry_position_errors(args, outputs.position_carry_status)
     return BacktestArtifacts(args, trade_dates, records, event_paths, pair_results, frames)
+
+
+def _pipeline_timing(stage: str, started: float, pair_count: int = 0) -> dict[str, Any]:
+    return {
+        "trade_date": None,
+        "stage": stage,
+        "elapsed_seconds": time.perf_counter() - started,
+        "pair_count": pair_count,
+        "mode": "pipeline",
+    }
 
 
 def _write_frames(output_dir: Path, frames: dict[str, pd.DataFrame]) -> None:

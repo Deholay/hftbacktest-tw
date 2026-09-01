@@ -107,7 +107,9 @@ Report generation defaults to `--low-memory-reports --report-mode summary`:
 the persisted trade, market, and latency CSVs are reduced in 25,000-row
 batches after their multi-GB in-memory frames are released. Use
 `--report-mode full` when failure windows and per-event capital diagnostics are
-required; batch size remains configurable with `--report-chunk-rows`.
+required. Full mode must also declare a hard retained-row budget with
+`--full-report-max-rows`; batch size remains configurable with
+`--report-chunk-rows`.
 
 Run from the Poetry project under `data_platform_client`:
 
