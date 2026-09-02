@@ -234,3 +234,99 @@ installed metadata version `0.3.0a0` and confirms that no `hftbacktest`,
 `future_spot`, or `scripts` module was loaded. The temporary-copy approach also
 prevents setuptools build and egg-info artifacts from polluting the package
 source tree.
+
+## Phase 2 pre-move baseline
+
+The following commands ran against the untouched Phase 1 tree immediately
+before relocating the native crate. The worktree was clean at baseline.
+
+| Exact command | Outcome |
+| --- | --- |
+| `git status --short` | PASS: no tracked or untracked changes. |
+| `cargo test --workspace` | PASS: 5 Rust unit tests and 0 doc-test failures. |
+| `cargo fmt --check --all` | PASS: no output. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS: no warnings. |
+| `python3 -m pytest -q tests/test_slim_engine.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: system `/usr/bin/python3` raised `ModuleNotFoundError: No module named 'numpy'`; no assertion ran. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py` | PASS: 2 tests. |
+| `python3 -m pytest -q tests/test_slim_pair_parity.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: system `/usr/bin/python3` raised `ModuleNotFoundError: No module named 'numpy'`; no assertion ran. |
+| `.venv/bin/python -m pytest -q tests/test_slim_pair_parity.py` | PASS: 1 test. |
+| `cargo build --workspace --release` | PASS: `target/release/libhbt_slim.so` built at the existing root target path. |
+| `python3 -c "import ctypes; lib=ctypes.CDLL('target/release/libhbt_slim.so'); lib.hbt_slim_version.restype=ctypes.c_uint32; print(lib.hbt_slim_version())"` | PASS: native ABI version `1`. |
+
+The pre-move release library exported exactly these sorted `hbt_slim_*`
+symbols, captured with
+`nm -D --defined-only target/release/libhbt_slim.so`:
+
+```text
+hbt_slim_create
+hbt_slim_current_timestamp
+hbt_slim_depth
+hbt_slim_elapse
+hbt_slim_feed_latency
+hbt_slim_free
+hbt_slim_order
+hbt_slim_order_latency
+hbt_slim_submit
+hbt_slim_version
+hbt_slim_wait_order_response
+```
+
+The library was an ELF 64-bit x86-64 shared object named
+`libhbt_slim.so`. The crate version was `0.2.0`, the native ABI version was
+`1`, and the Python implementation identity remained `rust-0.2.0`.
+
+## Phase 2 post-move result
+
+Phase 2 is a relocation-only change. The sole root Cargo workspace member is
+now `hftbacktest_slim/native`; the crate remains named `hbt_slim` at version
+`0.2.0`, and release builds still publish
+`target/release/libhbt_slim.so`. The old `crates/hbt_slim/` implementation was
+removed without leaving a duplicate.
+
+The former monolithic implementation is split under `native/src/` as follows:
+
+- `types.rs`: ABI constants, C-layout rows/views, and native configuration;
+- `book.rs`: BBO/depth snapshot state and locked/crossed handling;
+- `scheduler.rs`: event kinds, pending events, priority keys, and selection;
+- `matcher.rs`: pure immediate crossing, fill, and expiry decision;
+- `engine.rs`: two-asset state, clock, latency, requests, and responses;
+- `ffi.rs`: pointer validation and every retained C ABI export; and
+- `lib.rs`: minimal declarations and crate-root compatibility re-exports.
+
+The post-move release library exports the same sorted 11-symbol list recorded
+above and returns ABI version `1`. The retained `scripts/slim_engine.py`
+binding still loads the root release artifact without an import or path change.
+Linux x86-64 layout tests freeze the existing `BboRow`, `BboView`, and
+`OrderView` sizes, alignments, and field offsets used by that binding.
+
+`future_spot.arbitrage.full_market_runner` now fingerprints
+`hftbacktest_slim/native/Cargo.toml` and every `.rs` file below
+`hftbacktest_slim/native/src/` in deterministic sorted source-path order. This
+changes implementation identity, so existing result manifests may invalidate
+conservatively. No unrelated manifest field, compact schema version, compact
+builder version, native ABI version, matching semantic version, strategy clock,
+or time-in-force semantic identity changed.
+
+### Phase 2 post-move validation
+
+| Exact command | Outcome |
+| --- | --- |
+| `cargo test -p hbt_slim` | PASS: 13 Rust unit tests and 0 doc-test failures. |
+| `cargo test --workspace` | PASS: 13 Rust unit tests and 0 doc-test failures. |
+| `cargo fmt --check --all` | PASS: no output. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS: no warnings. |
+| `cargo build --workspace --release` | PASS: relocated release library built at the unchanged root target path. |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests` | PASS: 12 Phase 1 package and dependency-boundary tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py` | PASS: 2 ctypes binding tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_pair_parity.py` | PASS: 1 reference/slim pair golden test. |
+| `.venv/bin/python -m pytest -q tests/test_hbt_runner_execution.py` | PASS: 4 runner tests, including relocated native fingerprint selection. |
+| `.venv/bin/python -m pytest -q tests/test_hbt_runner_execution.py tests/test_daily_result_pipeline.py tests/test_backtest_pipeline_timings.py tests/test_compare_engine_outputs.py` | PASS: 9 focused runner, manifest, persistence, timing, and comparison tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py tests/test_slim_pair_parity.py tests/test_hbt_runner_execution.py hftbacktest_slim/tests` | PASS: 19 focused binding, parity, runner, manifest, and package-boundary tests. |
+| `.venv/bin/python -m pytest -q tests future_spot/test` | PASS: 71 repository tests. |
+| `PYTHONPYCACHEPREFIX=/tmp/hftbacktest_phase2_pycache .venv/bin/python -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py future_spot/test/*.py hftbacktest_slim/src/hftbacktest_slim/*.py hftbacktest_slim/tests/*.py` | PASS: retained Python entrypoints, Phase 1 package modules, and tests compiled. |
+| `git diff --check` plus `git diff --no-index --check /dev/null <each-new-native-file>` | PASS: tracked and relocated files have no whitespace errors. |
+
+The system `python3` collection failures recorded in the pre-move table remain
+an interpreter dependency issue only; the repository-managed `.venv` executes
+the complete Python suite. No external market data or performance benchmark is
+required or claimed for this relocation gate.

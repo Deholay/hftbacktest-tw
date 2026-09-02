@@ -2268,6 +2268,27 @@ def hbt_manifest_path(output_dir: Path) -> Path:
     return output_dir / HBT_MANIFEST_NAME
 
 
+def _hbt_implementation_paths() -> list[Path]:
+    native_root = WORKSPACE_ROOT / "hftbacktest_slim" / "native"
+    native_sources = sorted(
+        (native_root / "src").rglob("*.rs"), key=lambda path: path.as_posix()
+    )
+    return [
+        ARBITRAGE_ROOT / "hbt_backtest.py",
+        ARBITRAGE_ROOT / "hbt_numba.py",
+        ARBITRAGE_ROOT / "hbt_helpers.py",
+        ARBITRAGE_ROOT / "strategy.py",
+        ARBITRAGE_ROOT / "strategy_adapter.py",
+        ARBITRAGE_ROOT / "position_carry.py",
+        ROOT_SCRIPT_ROOT / "compact_cache.py",
+        ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py",
+        ROOT_SCRIPT_ROOT / "slim_engine.py",
+        native_root / "Cargo.toml",
+        *native_sources,
+        Path(__file__),
+    ]
+
+
 def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord]) -> dict[str, Any]:
     config_paths = sorted({record.config_path.resolve() for record in records}, key=str)
     if getattr(args, "market_data_cache", "event_npz") == "compact":
@@ -2294,19 +2315,6 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
             },
             key=str,
         )
-    implementation_paths = [
-        ARBITRAGE_ROOT / "hbt_backtest.py",
-        ARBITRAGE_ROOT / "hbt_numba.py",
-        ARBITRAGE_ROOT / "hbt_helpers.py",
-        ARBITRAGE_ROOT / "strategy.py",
-        ARBITRAGE_ROOT / "strategy_adapter.py",
-        ARBITRAGE_ROOT / "position_carry.py",
-        ROOT_SCRIPT_ROOT / "compact_cache.py",
-        ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py",
-        ROOT_SCRIPT_ROOT / "slim_engine.py",
-        WORKSPACE_ROOT / "crates" / "hbt_slim" / "src" / "lib.rs",
-        Path(__file__),
-    ]
     return {
         "schema_version": HBT_CACHE_SCHEMA_VERSION,
         "engine": getattr(args, "engine", "reference"),
@@ -2326,7 +2334,7 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
         "run_keys": [record.run_key for record in records],
         "daily_configs": [_content_fingerprint(path) for path in config_paths],
         "event_files": [_stat_fingerprint(path) for path in event_paths],
-        "implementation_sha256": _combined_content_sha256(implementation_paths),
+        "implementation_sha256": _combined_content_sha256(_hbt_implementation_paths()),
     }
 
 

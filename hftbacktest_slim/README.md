@@ -1,16 +1,17 @@
 # hftbacktest-slim
 
 `hftbacktest-slim` is the future shared package for the project-owned slim
-market replay runtime. Version `0.3.0a0` is the Phase 1 package-boundary
-skeleton: it provides only neutral configuration, enums, exceptions, and
-version metadata. It does not yet provide a usable engine or compact-cache
+market replay runtime. Version `0.3.0a0` provides the Phase 1 Python
+package-boundary skeleton and the relocated Phase 2 native core. The Python
+package still provides only neutral configuration, enums, exceptions, and
+version metadata; it does not yet expose a usable engine or compact-cache
 implementation.
 
-The native engine remains in `crates/hbt_slim/`, and the current Python binding
-and compact-cache implementation remain in `scripts/slim_engine.py` and
-`scripts/compact_cache.py`. They will move in later migration phases. Existing
-runtime imports and consumers therefore continue to use their legacy locations
-during Phase 1.
+The native engine now lives in `native/`, split by stable responsibility under
+`native/src/`. The current Python binding and compact-cache implementation
+remain in `scripts/slim_engine.py` and `scripts/compact_cache.py`; they move in
+later migration phases. Existing Python runtime imports and consumers therefore
+continue to use their legacy locations during Phase 2.
 
 The future supported slim profile is deliberately constrained:
 
@@ -44,9 +45,24 @@ asset = AssetConfig(
 )
 ```
 
-There is intentionally no `SlimEngine` or compact-cache export in Phase 1.
-Importing internal modules is unsupported and must not be treated as a stable
-backend contract.
+There is intentionally no Python `SlimEngine` or compact-cache export through
+Phase 2. Importing internal modules is unsupported and must not be treated as a
+stable backend contract.
+
+## Native development
+
+The root Cargo workspace owns `native/` as the `hbt_slim` crate. From the
+repository root, build the release library with:
+
+```bash
+cargo build --workspace --release
+```
+
+On the supported Linux x86-64 development platform this continues to produce
+`target/release/libhbt_slim.so`, which the retained
+`scripts/slim_engine.py` binding discovers without a path change. The Rust
+crate remains version `0.2.0`, and `hbt_slim_version()` continues to return C
+ABI version `1`.
 
 ## Installation
 

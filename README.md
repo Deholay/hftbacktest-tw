@@ -101,7 +101,7 @@ Slim 會保留設定的 `step_ms` 策略決策時鐘、各腿獨立的 feed/orde
 
 | 路徑 | Slim engine 職責 |
 | --- | --- |
-| `crates/hbt_slim/src/lib.rs` | Rust scheduler、BBO state、latency/order state，以及立即 FOK/IOC matching core。 |
+| `hftbacktest_slim/native/src/` | Rust scheduler、BBO state、latency/order state，以及立即 FOK/IOC matching core；依 types、book、scheduler、matcher、engine 與 FFI 職責分割。 |
 | `scripts/slim_engine.py` | `ctypes` binding、Arrow partition 載入，以及與 HBT 相容的 Python facade。 |
 | `scripts/compact_cache.py` | 版本化 compact schema、具資源上限的每日建置、驗證與原子發布。 |
 | `future_spot/arbitrage/hbt_backtest.py` | Engine 選擇與 pair strategy 整合。 |
@@ -146,7 +146,7 @@ python3 future_spot/test/run_full_backtest.py \
 | `scripts/tw_stock_data_to_npz.py` | 將臺灣五檔資料列轉成 HftBacktest event arrays 或 `.npz`。 |
 | `scripts/tw_stock_hftbacktest.py` | 共用的股票回測設定、asset 建立、狀態與 BBO helpers。 |
 | `scripts/tw_stock_strategies.py` | 股票 notebook strategies 與 DataFrame summaries。 |
-| `crates/hbt_slim/` | 專案自行維護的 Rust slim scheduler 與 matcher。 |
+| `hftbacktest_slim/native/` | 專案自行維護的 Rust slim scheduler、matcher 與穩定 C ABI。 |
 | `future_spot/arbitrage/` | 期現貨定價、風險、執行、HBT、留倉、資金與報表實作。 |
 | `future_spot/scripts/` | 精簡的期現貨 CLI entrypoints。 |
 | `future_spot/test/run_full_backtest.py` | 完整回測、報表資料表與 PNG 產生流程。 |

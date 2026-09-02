@@ -10,6 +10,7 @@ import pandas as pd
 
 from future_spot.arbitrage.full_market_runner import (
     DailyPairRecord,
+    _hbt_implementation_paths,
     balanced_backtest_shards,
     build_compact_event_data,
     run_backtests,
@@ -48,6 +49,25 @@ class InlineExecutor:
 
 
 class PersistentExecutorTest(unittest.TestCase):
+    def test_manifest_fingerprints_every_sorted_relocated_native_source(self) -> None:
+        native_root = Path(__file__).resolve().parents[1] / "hftbacktest_slim" / "native"
+        expected = [
+            native_root / "Cargo.toml",
+            *sorted((native_root / "src").rglob("*.rs"), key=lambda path: path.as_posix()),
+        ]
+        selected = [
+            path
+            for path in _hbt_implementation_paths()
+            if path.is_relative_to(native_root)
+        ]
+
+        self.assertEqual(selected, expected)
+        self.assertTrue(all(path.is_file() for path in selected))
+        self.assertNotIn(
+            Path(__file__).resolve().parents[1] / "crates" / "hbt_slim" / "src" / "lib.rs",
+            _hbt_implementation_paths(),
+        )
+
     def test_compact_missing_date_preserves_reference_error_path(self) -> None:
         record = DailyPairRecord(
             "2026-07-10",

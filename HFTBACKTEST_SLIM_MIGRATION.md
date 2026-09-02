@@ -235,6 +235,11 @@ does not load `hftbacktest`, `future_spot`, or root HBT helpers.
 
 ### Phase 2: move and split the native core
 
+Implementation status (2026-09-02): **complete**. The crate is owned by
+`hftbacktest_slim/native/`, its C ABI and root Cargo target path are unchanged,
+and the Phase 2 Rust, ctypes-binding, pair-parity, manifest-fingerprint, and
+package-boundary gates pass. Phases 3 through 6 remain pending.
+
 - Relocate the Rust crate under `hftbacktest_slim/native/`.
 - Split types, book, scheduler, matcher, engine, and FFI by responsibility.
 - Keep symbol names and ABI layout stable unless an intentional ABI bump is
@@ -284,8 +289,9 @@ semantic baseline.
 
 - Keep old modules as import-only wrappers while current callers migrate.
 - Do not maintain duplicate implementations in old and new paths.
-- Remove wrappers and `crates/hbt_slim` only after repository imports, docs,
-  notebooks, tests, manifests, and build commands use the new package.
+- The old `crates/hbt_slim` native location was removed in Phase 2. Remove the
+  remaining Python wrappers only after repository imports, docs, notebooks,
+  tests, manifests, and build commands use the new package.
 
 Gate: repository search finds no runtime import of old slim locations, and a
 clean build/test run succeeds without them.
