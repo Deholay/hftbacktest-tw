@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hftbacktest-slim"
+version = "0.3.0a0"
+description = "Neutral package boundary for the project-owned slim BBO replay runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "hftbacktest-slim maintainers" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
