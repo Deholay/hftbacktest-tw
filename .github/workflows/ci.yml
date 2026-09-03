@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: cargo build --workspace --release --locked
+      - run: python -m pytest -q
+      - run: python -m compileall -q src/hftbacktest_slim
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo test --workspace --locked
+      - run: cargo fmt --check --all
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python -m pip install --upgrade pip build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: python -m venv /tmp/hftbacktest-slim-wheel-smoke
+      - run: /tmp/hftbacktest-slim-wheel-smoke/bin/pip install --no-deps dist/*.whl
+      - run: /tmp/hftbacktest-slim-wheel-smoke/bin/python -c "from hftbacktest_slim.engine.binding import NativeBinding; assert NativeBinding().path.is_file()"

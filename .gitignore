@@ -1,13 +1,24 @@
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 *.egg-info/
+build/
+dist/
 
-data/
-hftbacktest/
-data_platform/
-data_platform_client/
-
-output/
 target/
+*.so
+*.dylib
+*.dll
+*.pyd
+
+# Local integration inputs and sibling source checkouts are not release files.
+/data/
+/data_platform/
+/data_platform_client/
+/hftbacktest/

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=77", "setuptools-rust>=1.13,<2", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hftbacktest-slim"
+version = "0.3.0"
+description = "A compact-BBO replay runtime with a Rust scheduler and matcher"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "hftbacktest-slim maintainers" }]
+keywords = ["backtest", "market-microstructure", "rust", "arrow", "bbo"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "numba>=0.61",
+    "numpy>=2.0,<2.3",
+    "pyarrow>=15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "pytest>=8",
+    "setuptools>=77",
+    "setuptools-rust>=1.13,<2",
+    "twine>=5",
+    "wheel",
+]
+
+[project.scripts]
+hftbacktest-slim-build-cache = "hftbacktest_slim.cli.build_cache:main"
+hftbacktest-slim-benchmark-read = "hftbacktest_slim.cli.benchmark_read:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hftbacktest_slim = ["py.typed"]
+
+[[tool.setuptools-rust.ext-modules]]
+target = "hftbacktest_slim._native.hbt_slim"
+path = "native/Cargo.toml"
+binding = "NoBinding"
+cargo-manifest-args = ["--locked"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-ra"]

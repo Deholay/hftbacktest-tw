@@ -1,0 +1,8 @@
+[package]
+name = "hbt_slim"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
