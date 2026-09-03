@@ -31,6 +31,7 @@ dev = [
     "pytest>=8",
     "setuptools>=77",
     "setuptools-rust>=1.13,<2",
+    "tomli>=1.1; python_version < '3.11'",
     "twine>=5",
     "wheel",
 ]
