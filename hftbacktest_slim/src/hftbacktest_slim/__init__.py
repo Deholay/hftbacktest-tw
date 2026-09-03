@@ -1,19 +1,25 @@
-"""Neutral public boundary for the project-owned slim replay runtime.
-
-Phase 1 intentionally exports configuration and type definitions only. The
-engine and compact-cache implementations remain in their legacy locations.
-"""
+"""Neutral public boundary for the project-owned slim replay runtime."""
 
 from .api import (
     AbiMismatchError,
+    ArrowDataError,
     AssetConfig,
+    DepthView,
+    EngineClosedError,
+    FeedLatency,
+    NativeCallError,
     NativeLibraryError,
     NativeLibraryNotFoundError,
+    OrderLatency,
     OrderStatus,
+    OrderSubmissionError,
     OrderType,
+    OrderView,
     Side,
     SlimConfigurationError,
     SlimError,
+    SlimEngine,
+    SLIM_ENGINE_VERSION,
     TimeInForce,
     UnsupportedCapabilityError,
     __version__,
@@ -21,14 +27,24 @@ from .api import (
 
 __all__ = (
     "AbiMismatchError",
+    "ArrowDataError",
     "AssetConfig",
+    "DepthView",
+    "EngineClosedError",
+    "FeedLatency",
+    "NativeCallError",
     "NativeLibraryError",
     "NativeLibraryNotFoundError",
+    "OrderLatency",
     "OrderStatus",
+    "OrderSubmissionError",
     "OrderType",
+    "OrderView",
     "Side",
     "SlimConfigurationError",
     "SlimError",
+    "SlimEngine",
+    "SLIM_ENGINE_VERSION",
     "TimeInForce",
     "UnsupportedCapabilityError",
     "__version__",

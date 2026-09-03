@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hftbacktest-slim"
-version = "0.3.0a0"
+version = "0.3.0a1"
 description = "Neutral package boundary for the project-owned slim BBO replay runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = []
+dependencies = ["numpy", "pyarrow"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -251,6 +251,12 @@ exactly.
 
 ### Phase 3: move the Python engine runtime
 
+Implementation status (2026-09-02): **complete**. The neutral Python engine,
+ctypes ABI binding, compact Arrow row reader, immutable runtime models, native
+library discovery, HBT compatibility facade, and legacy import-only wrapper
+are package-owned. Native ABI/matching behavior and compact-cache ownership are
+unchanged; Phases 4 through 6 remain pending.
+
 - Move ctypes structs, signatures, library loading, Arrow row reading, depth
   and order views, and engine lifecycle.
 - Replace the dependency on `scripts.hbt_types.HbtAssetConfig` with the neutral

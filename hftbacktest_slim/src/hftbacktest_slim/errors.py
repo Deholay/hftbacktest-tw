@@ -13,6 +13,22 @@ class UnsupportedCapabilityError(SlimError):
     """The requested behavior is outside the supported slim profile."""
 
 
+class ArrowDataError(SlimError, ValueError):
+    """A compact Arrow partition cannot satisfy the native row contract."""
+
+
+class EngineClosedError(SlimError):
+    """An operation was attempted after the engine handle was closed."""
+
+
+class NativeCallError(SlimError, RuntimeError):
+    """A native operation returned an unexpected failure code."""
+
+
+class OrderSubmissionError(NativeCallError):
+    """An immediate order could not be submitted."""
+
+
 class NativeLibraryError(SlimError):
     """Base class for native-library loading or compatibility failures."""
 
@@ -27,8 +43,12 @@ class AbiMismatchError(NativeLibraryError):
 
 __all__ = (
     "AbiMismatchError",
+    "ArrowDataError",
+    "EngineClosedError",
     "NativeLibraryError",
     "NativeLibraryNotFoundError",
+    "NativeCallError",
+    "OrderSubmissionError",
     "SlimConfigurationError",
     "SlimError",
     "UnsupportedCapabilityError",

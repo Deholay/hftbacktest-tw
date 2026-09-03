@@ -2269,24 +2269,40 @@ def hbt_manifest_path(output_dir: Path) -> Path:
 
 
 def _hbt_implementation_paths() -> list[Path]:
+    slim_python_root = WORKSPACE_ROOT / "hftbacktest_slim" / "src" / "hftbacktest_slim"
+    slim_python_sources = sorted(
+        [
+            *(slim_python_root / "engine").rglob("*.py"),
+            slim_python_root / "config.py",
+            slim_python_root / "enums.py",
+            slim_python_root / "models.py",
+            slim_python_root / "version.py",
+            slim_python_root / "compat" / "hbt.py",
+        ],
+        key=lambda path: path.as_posix(),
+    )
     native_root = WORKSPACE_ROOT / "hftbacktest_slim" / "native"
     native_sources = sorted(
         (native_root / "src").rglob("*.rs"), key=lambda path: path.as_posix()
     )
-    return [
-        ARBITRAGE_ROOT / "hbt_backtest.py",
-        ARBITRAGE_ROOT / "hbt_numba.py",
-        ARBITRAGE_ROOT / "hbt_helpers.py",
-        ARBITRAGE_ROOT / "strategy.py",
-        ARBITRAGE_ROOT / "strategy_adapter.py",
-        ARBITRAGE_ROOT / "position_carry.py",
-        ROOT_SCRIPT_ROOT / "compact_cache.py",
-        ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py",
-        ROOT_SCRIPT_ROOT / "slim_engine.py",
-        native_root / "Cargo.toml",
-        *native_sources,
-        Path(__file__),
-    ]
+    return sorted(
+        [
+            ARBITRAGE_ROOT / "hbt_backtest.py",
+            ARBITRAGE_ROOT / "hbt_numba.py",
+            ARBITRAGE_ROOT / "hbt_helpers.py",
+            ARBITRAGE_ROOT / "strategy.py",
+            ARBITRAGE_ROOT / "strategy_adapter.py",
+            ARBITRAGE_ROOT / "position_carry.py",
+            ROOT_SCRIPT_ROOT / "compact_cache.py",
+            ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py",
+            *slim_python_sources,
+            ROOT_SCRIPT_ROOT / "slim_engine.py",
+            native_root / "Cargo.toml",
+            *native_sources,
+            Path(__file__),
+        ],
+        key=lambda path: path.as_posix(),
+    )
 
 
 def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord]) -> dict[str, Any]:

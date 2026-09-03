@@ -330,3 +330,84 @@ The system `python3` collection failures recorded in the pre-move table remain
 an interpreter dependency issue only; the repository-managed `.venv` executes
 the complete Python suite. No external market data or performance benchmark is
 required or claimed for this relocation gate.
+
+## Phase 3 pre-move baseline
+
+The following commands ran against the clean, completed Phase 2 tree before
+moving any Python runtime implementation. This Phase 3 change is classified as
+**relocation-only/API-boundary work**: the Rust ABI, scheduler, matcher, compact
+schema/builder, and futures/spot behavior are frozen.
+
+| Exact command | Outcome |
+| --- | --- |
+| `git status --short` | PASS: no tracked or untracked changes. |
+| `cargo test --workspace` | PASS: 13 Rust unit tests and 0 doc-test failures. |
+| `python3 -m pytest -q hftbacktest_slim/tests` | PASS: 12 Phase 1/2 package and boundary tests. |
+| `python3 -m pytest -q tests/test_slim_engine.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: system `/usr/bin/python3` raised `ModuleNotFoundError: No module named 'numpy'`; no assertion ran. |
+| `python3 -m pytest -q tests/test_slim_pair_parity.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: system `/usr/bin/python3` raised `ModuleNotFoundError: No module named 'numpy'`; no assertion ran. |
+| `python3 -m pytest -q tests/test_hbt_runner_execution.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: system `/usr/bin/python3` raised `ModuleNotFoundError: No module named 'pandas'`; no assertion ran. |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests` | PASS: 12 package and dependency-boundary tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py` | PASS: 2 exact legacy ctypes/Arrow binding tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_pair_parity.py` | PASS: 1 exact reference/slim pair golden test. |
+| `.venv/bin/python -m pytest -q tests/test_hbt_runner_execution.py` | PASS: 4 runner and implementation-fingerprint tests. |
+| `cargo build --workspace --release` | PASS: release shared library built at `target/release/libhbt_slim.so`. |
+
+The pre-move release artifact reports native ABI version `1` and exports the
+same sorted 11-symbol `hbt_slim_*` list recorded for Phase 2. The Rust crate is
+version `0.2.0`, `SLIM_ENGINE_VERSION` is `rust-0.2.0`, the package is
+`0.3.0a0`, compact schema is `bbo_v1`, and compact builder version is `1`.
+The package root exports `AssetConfig`, neutral enums, the Phase 1 exception
+hierarchy, and `__version__`; it intentionally has no engine before this move.
+The legacy compatibility surface is `SlimBacktest`, `SlimHbtConstants`,
+`SlimOrder`, `SlimDepth`, `validate_slim_pair_config`,
+`SLIM_ENGINE_VERSION`, and `SLIM_LIBRARY`, with current HBT-shaped methods and
+return codes frozen by the focused binding and pair-parity results above.
+
+## Phase 3 post-move result
+
+Phase 3 is complete as a relocation/API-boundary change. The package owns the
+neutral `SlimEngine`, immutable depth/order/feed-latency/order-latency models,
+ABI-v1 ctypes declarations and calls, deterministic native-library discovery,
+the minimal runtime-side `bbo_v1` Arrow row contract, and the temporary HBT
+compatibility facade. `scripts/slim_engine.py` is now an import-only wrapper
+with a narrow repository `src/` bootstrap for current uninstalled consumers.
+
+The package version is `0.3.0a1`. Rust crate `0.2.0`, engine identity
+`rust-0.2.0`, native ABI `1`, compact schema `bbo_v1`, and compact builder
+version `1` are unchanged. The release artifact remains
+`target/release/libhbt_slim.so` with the same 11 exported symbols. No Rust
+source, compact builder/schema, strategy consumer import, or matching behavior
+changed.
+
+The run-manifest implementation fingerprint now includes every sorted Python
+source below `hftbacktest_slim/src/hftbacktest_slim/engine/`, neutral
+config/enums/models/version, `compat/hbt.py`, the legacy wrapper, and the Phase
+2 native sources. Existing result manifests may therefore invalidate
+conservatively. Compact market-data cache identity is unchanged.
+
+### Phase 3 post-move validation
+
+| Exact command | Outcome |
+| --- | --- |
+| `cargo test --workspace` | PASS: 13 Rust unit tests and 0 doc-test failures. |
+| `cargo fmt --check --all` | PASS: no output. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS: no warnings. |
+| `cargo build --workspace --release` | PASS: release artifact built at the unchanged root target path. |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests` | PASS: 42 neutral API, Arrow reader, native loading, compatibility, dependency-boundary, and external-install tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py` | PASS: 2 unchanged legacy binding tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_pair_parity.py` | PASS: 1 exact reference/slim pair golden test. |
+| `.venv/bin/python -m pytest -q tests/test_hbt_runner_execution.py tests/test_daily_result_pipeline.py tests/test_backtest_pipeline_timings.py tests/test_compare_engine_outputs.py` | PASS: 10 runner, manifest, persistence, timing, and output-comparison tests. |
+| `.venv/bin/python -m pytest -q tests future_spot/test` | PASS: 72 repository tests. |
+| `PYTHONPYCACHEPREFIX=/tmp/hftbacktest_phase3_pycache .venv/bin/python -m compileall -q scripts future_spot/arbitrage future_spot/scripts future_spot/test hftbacktest_slim/src/hftbacktest_slim` | PASS: all retained Python entrypoints and package modules compiled. |
+| `git diff --check` plus `git diff --no-index --check /dev/null <each-new-file>` | PASS: tracked and new Phase 3 files have no whitespace errors. |
+
+The exact system-interpreter validation commands still fail during collection
+because `/usr/bin/python3` has neither NumPy/PyArrow nor Pandas. The failures
+are environment-only and occur before assertions; the repository `.venv`
+passes every corresponding command and the full suite. The installed-package
+test copies and installs the src-layout package into a temporary target, imports
+it from an external working directory without loading forbidden packages or the
+native library, then constructs the neutral engine there with the explicit
+valid release-library path. Missing-library and ABI-mismatch construction
+failures are typed. No external-data run or performance benchmark was executed,
+so no `run_errors.csv` or performance claim is produced for Phase 3.

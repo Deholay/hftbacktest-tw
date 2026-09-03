@@ -68,6 +68,33 @@ class PersistentExecutorTest(unittest.TestCase):
             _hbt_implementation_paths(),
         )
 
+    def test_manifest_fingerprints_package_owned_python_runtime(self) -> None:
+        package_root = (
+            Path(__file__).resolve().parents[1]
+            / "hftbacktest_slim"
+            / "src"
+            / "hftbacktest_slim"
+        )
+        expected = sorted(
+            [
+                *(package_root / "engine").rglob("*.py"),
+                package_root / "config.py",
+                package_root / "enums.py",
+                package_root / "models.py",
+                package_root / "version.py",
+                package_root / "compat" / "hbt.py",
+            ],
+            key=lambda path: path.as_posix(),
+        )
+        selected = [path for path in _hbt_implementation_paths() if path in expected]
+
+        self.assertEqual(selected, expected)
+        self.assertTrue(all(path.is_file() for path in selected))
+        self.assertIn(
+            Path(__file__).resolve().parents[1] / "scripts" / "slim_engine.py",
+            _hbt_implementation_paths(),
+        )
+
     def test_compact_missing_date_preserves_reference_error_path(self) -> None:
         record = DailyPairRecord(
             "2026-07-10",

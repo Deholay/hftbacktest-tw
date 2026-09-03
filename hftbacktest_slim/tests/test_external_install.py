@@ -11,7 +11,9 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PACKAGE_ROOT.parent
 
 
-def test_local_install_and_import_work_outside_repository(tmp_path: Path) -> None:
+def test_local_install_and_import_work_outside_repository(
+    tmp_path: Path, write_partition, native_library_path: Path
+) -> None:
     target = tmp_path / "target"
     outside = tmp_path / "outside"
     source = tmp_path / "local-source"
@@ -61,8 +63,8 @@ import hftbacktest_slim
 repository = pathlib.Path({str(REPOSITORY_ROOT)!r}).resolve()
 cwd = pathlib.Path.cwd().resolve()
 assert cwd != repository and repository not in cwd.parents
-assert hftbacktest_slim.__version__ == "0.3.0a0"
-assert importlib.metadata.version("hftbacktest-slim") == "0.3.0a0"
+assert hftbacktest_slim.__version__ == "0.3.0a1"
+assert importlib.metadata.version("hftbacktest-slim") == "0.3.0a1"
 assert hftbacktest_slim.AssetConfig("0050", "0050.arrow", 0.05).symbol == "0050"
 forbidden = sorted(
     name
@@ -85,3 +87,34 @@ assert forbidden == [], forbidden
         text=True,
     )
     assert imported.returncode == 0, imported.stdout + imported.stderr
+
+    left = write_partition(
+        tmp_path / "installed-left.arrow",
+        [(0, 100, 110, 99.0, 101.0, 1.0, 1.0, 100.0, 1)],
+    )
+    right = write_partition(
+        tmp_path / "installed-right.arrow",
+        [(0, 100, 110, 199.0, 201.0, 1.0, 1.0, 200.0, 1)],
+    )
+    engine_code = f"""
+import sys
+sys.path.insert(0, {str(target)!r})
+from hftbacktest_slim import AssetConfig, SlimEngine
+assets = [
+    AssetConfig('A', {str(left)!r}, 1.0),
+    AssetConfig('B', {str(right)!r}, 1.0),
+]
+with SlimEngine(assets, library_path={str(native_library_path)!r}) as engine:
+    assert engine.library_path == __import__('pathlib').Path({str(native_library_path)!r}).resolve()
+    assert engine.advance(10)
+    assert engine.depth(0).best_ask == 101.0
+"""
+    engine_opened = subprocess.run(
+        [sys.executable, "-I", "-c", engine_code],
+        cwd=outside,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert engine_opened.returncode == 0, engine_opened.stdout + engine_opened.stderr
