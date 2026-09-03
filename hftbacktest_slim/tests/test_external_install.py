@@ -63,8 +63,8 @@ import hftbacktest_slim
 repository = pathlib.Path({str(REPOSITORY_ROOT)!r}).resolve()
 cwd = pathlib.Path.cwd().resolve()
 assert cwd != repository and repository not in cwd.parents
-assert hftbacktest_slim.__version__ == "0.3.0a1"
-assert importlib.metadata.version("hftbacktest-slim") == "0.3.0a1"
+assert hftbacktest_slim.__version__ == "0.3.0a2"
+assert importlib.metadata.version("hftbacktest-slim") == "0.3.0a2"
 assert hftbacktest_slim.AssetConfig("0050", "0050.arrow", 0.05).symbol == "0050"
 forbidden = sorted(
     name
@@ -99,7 +99,21 @@ assert forbidden == [], forbidden
     engine_code = f"""
 import sys
 sys.path.insert(0, {str(target)!r})
-from hftbacktest_slim import AssetConfig, SlimEngine
+from hftbacktest_slim import (
+    AssetConfig,
+    BBO_SCHEMA,
+    COMPACT_BUILDER_VERSION,
+    CompactBuildConfig,
+    CompactCacheStore,
+    SlimEngine,
+)
+assert BBO_SCHEMA.names[0] == 'source_seq'
+assert COMPACT_BUILDER_VERSION == 2
+assert CompactCacheStore(CompactBuildConfig(
+    cache_root={str(tmp_path / 'installed-cache')!r},
+    max_cache_bytes=0,
+    min_free_bytes=0,
+)).root.name == 'installed-cache'
 assets = [
     AssetConfig('A', {str(left)!r}, 1.0),
     AssetConfig('B', {str(right)!r}, 1.0),

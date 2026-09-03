@@ -17,6 +17,14 @@ class ArrowDataError(SlimError, ValueError):
     """A compact Arrow partition cannot satisfy the native row contract."""
 
 
+class CompactCacheError(SlimError, RuntimeError):
+    """A compact cache cannot be built, validated, or reused safely."""
+
+
+class CompactCacheBudgetError(CompactCacheError):
+    """A configured compact-cache size or free-space limit was crossed."""
+
+
 class EngineClosedError(SlimError):
     """An operation was attempted after the engine handle was closed."""
 
@@ -44,6 +52,8 @@ class AbiMismatchError(NativeLibraryError):
 __all__ = (
     "AbiMismatchError",
     "ArrowDataError",
+    "CompactCacheBudgetError",
+    "CompactCacheError",
     "EngineClosedError",
     "NativeLibraryError",
     "NativeLibraryNotFoundError",

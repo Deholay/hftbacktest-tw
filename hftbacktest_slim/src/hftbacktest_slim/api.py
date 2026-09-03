@@ -5,6 +5,8 @@ from .enums import OrderStatus, OrderType, Side, TimeInForce
 from .errors import (
     AbiMismatchError,
     ArrowDataError,
+    CompactCacheBudgetError,
+    CompactCacheError,
     EngineClosedError,
     NativeCallError,
     NativeLibraryError,
@@ -22,6 +24,8 @@ __all__ = (
     "AbiMismatchError",
     "ArrowDataError",
     "AssetConfig",
+    "CompactCacheBudgetError",
+    "CompactCacheError",
     "DepthView",
     "EngineClosedError",
     "FeedLatency",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hftbacktest-slim"
-version = "0.3.0a1"
+version = "0.3.0a2"
 description = "Neutral package boundary for the project-owned slim BBO replay runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,7 +14,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ["numpy", "pyarrow"]
+dependencies = ["numba", "numpy", "pyarrow"]
+
+[project.scripts]
+hftbacktest-slim-build-cache = "hftbacktest_slim.cli.build_cache:main"
+hftbacktest-slim-benchmark-read = "hftbacktest_slim.cli.benchmark_read:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

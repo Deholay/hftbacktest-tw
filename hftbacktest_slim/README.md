@@ -1,9 +1,10 @@
 # hftbacktest-slim
 
-`hftbacktest-slim` is the project-owned, strategy-neutral compact-BBO replay
-runtime. Version `0.3.0a1` completes migration Phase 3: the Python ctypes
-binding, Arrow row reader, neutral engine lifecycle, models, and temporary HBT
-compatibility facade now live in this standalone package. The native crate
+`hftbacktest-slim` is the project-owned, strategy-neutral compact-BBO data and
+replay runtime. Version `0.3.0a2` completes migration Phase 4: the canonical
+schema/native dtype, Top-5 normalization, timestamp ordering, audit, streaming
+cache builder, manifest validation, sidecars, resource controls, publication,
+reader, and compact CLIs now live in this standalone package. The native crate
 remains version `0.2.0`, engine identity remains `rust-0.2.0`, and C ABI version
 remains `1`.
 
@@ -61,6 +62,78 @@ nanosecond timestamps and unrounded native prices/quantities. `close()` is
 explicit and idempotent; context-manager exit closes the engine, and later
 operations raise `EngineClosedError`.
 
+## Compact cache API and physical contract
+
+Backends and new strategies use the root-package cache API:
+
+```python
+from hftbacktest_slim import (
+    BBO_SCHEMA,
+    COMPACT_BUILDER_VERSION,
+    COMPACT_SCHEMA_VERSION,
+    CompactBuildConfig,
+    CompactCacheBudgetError,
+    CompactCacheError,
+    CompactCacheStore,
+    CompactSource,
+)
+```
+
+`COMPACT_SCHEMA_VERSION` remains `bbo_v1`. Its physical Arrow IPC File/Feather
+V2 fields are fixed and nullable in this exact order:
+
+```text
+source_seq    uint64
+exch_ts       int64
+local_ts_raw  int64
+bid_px        float64
+ask_px        float64
+bid_qty       float64
+ask_qty       float64
+last_px       float64
+total_volume  int64
+```
+
+`source_seq` is mandatory. The aligned native `SLIM_ROW_DTYPE` is derived from
+the same package schema module and remains a 72-byte structure. File metadata
+records the schema, symbol/source/date, local-timestamp adjustment, and exact
+exchange/local ordering. Empty symbols are valid files with the same schema.
+
+Builder version `2` deliberately invalidates builder-version-1 cache
+identities because implementation ownership and deterministic fingerprints
+moved. The physical fields and matching behavior did not change. A cold date
+streams projected Arrow record batches and scans each physical stock/futures
+source once while routing every requested symbol; validated warm reuse performs
+zero payload scans. Source and implementation identity validation uses source
+stats, Parquet footer metadata, and completed compact files, never a hidden
+second raw-data scan.
+
+The default LZ4 compression also supports `none` and `zstd`. Before writing,
+the builder estimates `source_rows * 96 * 1.20`, enforces the configured cache
+cap and free-space reserve, and checks both again after every batch. It writes a
+same-filesystem temporary date, validates closed files and deterministic
+sidecars, writes the date manifest last, then atomically publishes. Failures
+clean only that incomplete temporary date; completed cache, raw inputs, and
+results are never automatically deleted.
+
+Installable package commands retain the legacy arguments and JSON shapes:
+
+```bash
+hftbacktest-slim-build-cache \
+  --date 2026-03-02 \
+  --cache-root data/tw_compact_v1 \
+  --stock-path /data/twstock_20260302.parquet \
+  --spot-symbols 0050 2330
+
+hftbacktest-slim-benchmark-read \
+  --date 2026-03-02 \
+  --cache-root data/tw_compact_v1 \
+  --repetitions 3
+```
+
+They are also available as `python -m hftbacktest_slim.cli.build_cache` and
+`python -m hftbacktest_slim.cli.benchmark_read`.
+
 ## Native library discovery
 
 The library is resolved deterministically without a system-basename search:
@@ -97,13 +170,19 @@ The wrapper contains a temporary repository-local `src/` path bootstrap so the
 existing uninstalled checkout continues to run. Phase 5/6 removes that shim
 after consumers migrate.
 
-Phase 4 still owns the move of compact schema, normalization, builder,
-manifests, publication, and sidecars out of `scripts.compact_cache`; none moved
-in Phase 3. Phase 5 still owns futures/spot migration to the neutral API.
+`scripts.compact_cache` is now an import-only re-export and
+`scripts/build_compact_cache.py` plus `scripts/benchmark_compact_read.py` are
+thin CLI delegates. They emit no worker deprecation warnings. The explicit
+reference-HftBacktest bridge remains outside the package at
+`scripts/compact_hbt_adapter.py`; it imports the package schema but the package
+never imports it. Phase 5 still owns futures/spot execution migration to the
+neutral `SlimEngine`; strategy pricing, execution policy, carry, capital, and
+reporting remain outside this package.
 
 ## Installation
 
-The package uses a conventional `src` layout and declares NumPy and PyArrow:
+The package uses a conventional `src` layout and declares Numba, NumPy, and
+PyArrow:
 
 ```bash
 python3 -m pip install /path/to/hftbacktest_slim

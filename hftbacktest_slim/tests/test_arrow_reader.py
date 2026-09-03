@@ -97,3 +97,34 @@ def test_reader_rejects_incompatible_declared_schema(tmp_path: Path, write_parti
     path = write_partition(tmp_path / "future.arrow", [], schema_version="bbo_v2")
     with pytest.raises(ArrowDataError, match="bbo_v2"):
         read_rows(path)
+
+
+def test_reader_rejects_extra_or_reordered_physical_fields(
+    tmp_path: Path, write_partition
+) -> None:
+    extra = pa.schema([*PHYSICAL_EXTRA_BASE(), ("extra", pa.int64())])
+    extra_path = write_partition(tmp_path / "extra.arrow", [], schema=extra)
+    with pytest.raises(ArrowDataError, match="fields/order"):
+        read_rows(extra_path)
+
+    fields = PHYSICAL_EXTRA_BASE()
+    reordered = pa.schema([fields[1], fields[0], *fields[2:]])
+    reordered_path = write_partition(
+        tmp_path / "reordered.arrow", [], schema=reordered
+    )
+    with pytest.raises(ArrowDataError, match="fields/order"):
+        read_rows(reordered_path)
+
+
+def PHYSICAL_EXTRA_BASE() -> list[tuple[str, pa.DataType]]:
+    return [
+        ("source_seq", pa.uint64()),
+        ("exch_ts", pa.int64()),
+        ("local_ts_raw", pa.int64()),
+        ("bid_px", pa.float64()),
+        ("ask_px", pa.float64()),
+        ("bid_qty", pa.float64()),
+        ("ask_qty", pa.float64()),
+        ("last_px", pa.float64()),
+        ("total_volume", pa.int64()),
+    ]

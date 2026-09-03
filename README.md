@@ -103,19 +103,39 @@ Slim 會保留設定的 `step_ms` 策略決策時鐘、各腿獨立的 feed/orde
 | --- | --- |
 | `hftbacktest_slim/native/src/` | Rust scheduler、BBO state、latency/order state，以及立即 FOK/IOC matching core；依 types、book、scheduler、matcher、engine 與 FFI 職責分割。 |
 | `hftbacktest_slim/src/hftbacktest_slim/engine/` | Neutral `SlimEngine`、`ctypes` ABI binding、Arrow partition reader、lifecycle 與 capability validation。 |
+| `hftbacktest_slim/src/hftbacktest_slim/market_data/` | Canonical `bbo_v1` schema/aligned dtype、Top-5 normalization、timestamp ordering/sidecars 與 generic compact audit。 |
+| `hftbacktest_slim/src/hftbacktest_slim/cache/` | Builder v2 one-scan cache、manifest identity/validation、disk budgets 與 atomic publication。 |
 | `hftbacktest_slim/src/hftbacktest_slim/compat/hbt.py` | 現有 `future_spot` 暫時使用的 HBT-compatible facade。 |
 | `scripts/slim_engine.py` | 僅保留舊 import path 的過渡 re-export wrapper；不再包含 runtime implementation。 |
-| `scripts/compact_cache.py` | 版本化 compact schema、具資源上限的每日建置、驗證與原子發布。 |
+| `scripts/compact_cache.py` | 僅保留舊 compact import path 的過渡 re-export wrapper。 |
+| `scripts/build_compact_cache.py`、`scripts/benchmark_compact_read.py` | 保留舊命令的 package CLI delegates。 |
 | `future_spot/arbitrage/hbt_backtest.py` | Engine 選擇與 pair strategy 整合。 |
 | `future_spot/arbitrage/full_market_runner.py` | CLI、compact data 編排、依日期循序留倉、workers、結果持久化與 manifests。 |
 
 Linux 環境會產生 `target/release/libhbt_slim.so`。Compact cache 的預設位置為
 `data/tw_compact_v1/date=YYYYMMDD/source={stock|stock_future}/<symbol>.arrow`。
 Python neutral API 可由 `hftbacktest_slim` 匯入 `AssetConfig`、`SlimEngine`、
-`Side` 與 `TimeInForce`。Native library 依序採用明確的 `library_path`、
+`Side`、`TimeInForce`、`BBO_SCHEMA`、`CompactBuildConfig`、
+`CompactCacheStore` 與 `CompactSource`。Native library 依序採用明確的 `library_path`、
 `HFTBACKTEST_SLIM_LIBRARY`、package artifact，以及 root Cargo release artifact；
-package import 本身不會載入 shared library。Phase 4 的 compact-cache ownership 與
-Phase 5 的 strategy consumer migration 尚未進行。
+package import 本身不會載入 shared library。Compact schema 仍為 `bbo_v1`，builder
+已升為 version `2`，因此 version 1 cache 會保守失效；physical fields 與 matching
+語意均未改變。Phase 5 的 strategy execution consumer migration 尚未進行。
+
+Package-owned cache commands 與舊 wrappers 使用相同參數和 JSON 輸出形狀：
+
+```bash
+PYTHONPATH=hftbacktest_slim/src python3 -m hftbacktest_slim.cli.build_cache --help
+PYTHONPATH=hftbacktest_slim/src python3 -m hftbacktest_slim.cli.benchmark_read --help
+python3 scripts/build_compact_cache.py --help
+python3 scripts/benchmark_compact_read.py --help
+```
+
+Cold build 對每個日期的股票及期貨 physical source 各讀一次 projected record
+batches；warm validated reuse 不讀 raw payload。預設 LZ4，亦保留 `none` 與 `zstd`。
+建置前依 `source_rows * 96 * 1.20` 檢查容量及 free-space reserve，每個 batch 後重查；
+manifest 最後寫入並以同檔案系統 atomic rename 發布，失敗時只清理當次 incomplete
+temporary date，不會自動刪除 completed cache、raw data 或 results。
 
 目前保留的一月至七月回測，除日期區間與資料路徑外，另使用以下會影響結果的執行與
 資金設定：
@@ -148,8 +168,8 @@ python3 future_spot/test/run_full_backtest.py \
 | `scripts/hbt_types.py` | 與策略無關的 HBT asset 與 fill dataclasses。 |
 | `scripts/hbt_common.py` | 共用的 queue、order、latency 與 fill helpers。 |
 | `scripts/io_utils.py` | 小型 DataFrame、CSV 與時間處理 helpers。 |
-| `scripts/compact_cache.py` | 可重用的 compact BBO cache schema、builder、manifest 與驗證。 |
-| `hftbacktest_slim/src/hftbacktest_slim/` | Neutral slim Python API、runtime binding/reader/models，以及暫時的 HBT compatibility namespace。 |
+| `scripts/compact_cache.py` | Package compact API 的過渡 import-only wrapper。 |
+| `hftbacktest_slim/src/hftbacktest_slim/` | Neutral slim Python API、compact market-data/cache/CLI ownership、runtime binding/reader/models，以及暫時的 HBT compatibility namespace。 |
 | `scripts/slim_engine.py` | 現有 consumer 的過渡 import-only wrapper。 |
 | `scripts/tw_stock_data_to_npz.py` | 將臺灣五檔資料列轉成 HftBacktest event arrays 或 `.npz`。 |
 | `scripts/tw_stock_hftbacktest.py` | 共用的股票回測設定、asset 建立、狀態與 BBO helpers。 |

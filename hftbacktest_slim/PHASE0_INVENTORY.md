@@ -411,3 +411,129 @@ native library, then constructs the neutral engine there with the explicit
 valid release-library path. Missing-library and ABI-mismatch construction
 failures are typed. No external-data run or performance benchmark was executed,
 so no `run_errors.csv` or performance claim is produced for Phase 3.
+
+## Phase 4 pre-change baseline
+
+The Phase 4 baseline was captured on 2026-09-03 against the completed Phase 3
+tree before compact-cache ownership moved. The worktree contained only the
+expected in-progress Phase 3 files listed by `git status --short`; they were
+preserved and treated as user-owned migration work.
+
+| Exact command | Outcome |
+| --- | --- |
+| `python3 -m pytest -q tests/test_compact_cache.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q tests/test_source_parity.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q tests/test_tw_stock_data_to_npz.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q tests/test_slim_engine.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q tests/test_slim_pair_parity.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q hftbacktest_slim/tests` | PRE-EXISTING ENVIRONMENT FAILURE during collection: `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q tests/test_hbt_runner_execution.py tests/test_daily_result_pipeline.py tests/test_daily_result_store.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection: `/usr/bin/python3` has no Pandas. |
+| `.venv/bin/python -m pytest -q tests/test_compact_cache.py tests/test_source_parity.py tests/test_tw_stock_data_to_npz.py` | PASS: 15 cache, source-parity, and converter tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py tests/test_slim_pair_parity.py` | PASS: 3 binding and exact pair-parity tests. |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests` | PASS: 42 package tests. |
+| `.venv/bin/python -m pytest -q tests/test_hbt_runner_execution.py tests/test_daily_result_pipeline.py tests/test_daily_result_store.py future_spot/test/test_fast_pipeline.py` | PASS: 25 runner, manifest, persistence, budget, and pipeline tests. |
+| `cargo test --workspace` | PASS: 13 Rust unit tests and 0 doc-test failures. |
+| `.venv/bin/python scripts/build_compact_cache.py --help` | PASS: legacy build CLI arguments recorded. |
+| `.venv/bin/python scripts/benchmark_compact_read.py --help` | PASS: legacy benchmark CLI arguments recorded. |
+
+The frozen compact contract is `COMPACT_SCHEMA_VERSION = "bbo_v1"` and
+`COMPACT_BUILDER_VERSION = 1`. `BBO_SCHEMA` has exactly nine nullable physical
+fields in this order: `source_seq uint64`, `exch_ts int64`, `local_ts_raw
+int64`, `bid_px float64`, `ask_px float64`, `bid_qty float64`, `ask_qty
+float64`, `last_px float64`, and `total_volume int64`. The separately defined
+Phase 3 `SLIM_ROW_DTYPE` has the same names in the same order, native-endian
+8-byte scalar fields at offsets 0 through 64, aligned layout, and item size 72.
+
+The projected source columns are `symbol`, `symbol_id`, `exchtime`,
+`localtime`, `status`, `last_price`, `total_volume`, `sequence`, followed for
+levels 1 through 5 by bid price/volume and ask price/volume. The identity keys
+are `trade_date`, `schema_version`, `builder_version`, `builder_sha256`,
+`top5_implementation_sha256`, `compression`, `profile`, `timezone`, session
+bounds, `base_latency_ns`, `projected_columns`, and `sources`. Each source
+identity records kind, ordered symbols, status filters, price-only quantity,
+volume scale, and file identities; each file identity records resolved path,
+bytes, nanosecond mtime, and Parquet/Arrow metadata row count. The baseline
+legacy file fingerprints were builder SHA-256
+`219fd49ef6366d50c193ff2df7cc250ff6353af1a26ff5e0e9f4a78feffca3e2` and
+converter/normalization SHA-256
+`9c16ffcf090896d6d1375c014823bc29fdf9dd49d6fc4f2293a12396418a758d`.
+
+The cold synthetic build scans its single physical stock source once; a warm
+validated build reports zero invocation scans while retaining the original
+source manifest's scan count. Requested symbols with no retained rows publish
+a valid empty `bbo_v1` Arrow partition rather than a missing status. Per-symbol
+negative-latency correction is recorded in metadata, and independently
+non-monotonic exchange/local orders publish deterministic LZ4 order sidecars.
+Preflight cache-size or free-space failures publish no final date, and a build
+failure cleans only its current `.tmp-*` date. An incomplete final date is not
+a hit; without explicit rebuild it raises an incompatible-identity error.
+
+The legacy build CLI accepts `--date`, `--cache-root`, stock/future paths,
+explicit spot/future symbols, settings Parquet, `none|lz4|zstd` compression,
+batch rows, cache/free-space GB limits, rebuild, and output. Its JSON result has
+top-level `date`, `cache_root`, `compression`, `cache_state`, wall/CPU seconds,
+peak RSS, and the full manifest. The warm-read CLI accepts cache root, date,
+repetitions, and output; its JSON has date/root, file and byte counts, peak RSS,
+per-run wall/CPU/rows/throughput/checksum records, and median wall/throughput.
+
+## Phase 4 post-move result
+
+Phase 4 is complete as a compact-builder implementation-ownership change. The
+package now owns the canonical `bbo_v1` schema and aligned dtype, neutral Top-5
+normalization, per-symbol timestamp correction and order sidecars, generic
+partition audit, cache configuration/builder/store, deterministic manifest
+identity, validation, resource checks, recoverable atomic publication, and the
+build/read CLIs. The reference converter imports the package normalizer. The
+legacy compact module and command scripts are thin re-exports/delegates, while
+the reference-HBT adapter remains outside the package.
+
+The package is `0.3.0a2`, compact builder version is `2`, and compact schema
+remains `bbo_v1`. Rust crate `0.2.0`, engine identity `rust-0.2.0`, native ABI
+`1`, matching, latency, FOK/IOC, strategy, carry, capital, and reporting
+semantics are unchanged. Builder-version-1 caches and old implementation
+fingerprints invalidate conservatively. The final package implementation SHA-256
+is `d2d775a64e0d7ad86d895e55c6c76959c05240db8151d6483d695b0e2b5072c0`;
+the package normalization SHA-256 is
+`1dc8b7507bd94f5764b198c6926a5be7384721125938d9c81879f0a2a562b019`.
+Both are content identities, not performance claims.
+
+The canonical Arrow schema retains the exact nine nullable fields and types
+recorded in the pre-change section. `SLIM_ROW_DTYPE` has the same names, native
+8-byte formats and offsets `[0, 8, 16, 24, 32, 40, 48, 56, 64]`, aligned item
+size 72. Its reader, builder, and compatibility imports all source this one
+definition from `market_data/schema.py`.
+
+### Phase 4 post-move validation
+
+| Exact command | Outcome |
+| --- | --- |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests` | PASS: 70 schema, normalization, cache, ordering, publication, resource, CLI, native, boundary, and external-install tests. |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests tests/test_compact_cache.py tests/test_source_parity.py tests/test_tw_stock_data_to_npz.py tests/test_slim_engine.py tests/test_slim_pair_parity.py tests/test_hbt_runner_execution.py tests/test_daily_result_pipeline.py tests/test_daily_result_store.py future_spot/test/test_fast_pipeline.py` | PASS: 115 focused package, compatibility, converter, parity, runner, manifest, persistence, and pipeline tests. |
+| `.venv/bin/python -m pytest -q tests future_spot/test` | PASS: 74 repository tests. |
+| `cargo test --workspace` | PASS: 13 Rust unit tests and 0 doc-test failures. |
+| `cargo fmt --check --all` | PASS: no output. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS: no warnings. |
+| `cargo build --workspace --release` | PASS: unchanged release artifact built successfully. |
+| `PYTHONPYCACHEPREFIX=/tmp/hftbacktest_phase4_pycache .venv/bin/python -m compileall -q scripts future_spot/arbitrage future_spot/scripts future_spot/test hftbacktest_slim/src/hftbacktest_slim hftbacktest_slim/tests tests` | PASS: all retained entrypoints, package modules, and tests compiled. |
+| `.venv/bin/python -c "import numpy as np; ... data/tw_stock_events/0050_20260223_093000_100000.npz ..."` | PASS: available fixture preserves `77.90`, `77.95`, `78.00`, and `78.05` among its first valid prices. |
+| `git diff --check` plus whitespace checks for new files | PASS: no whitespace errors. |
+
+Cold multi-symbol tests observe one payload scan for each physical source; warm
+validated reuse observes zero. Two `future_spot` pairs are combined into one
+stock and one futures source universe before the package builder is invoked.
+Manifest/source identity derives row counts and Parquet footer identity without
+a payload rescan. Tests also freeze empty partitions, independent per-symbol
+correction, equal-time stable ordering, both sidecars, all three compression
+modes, last-manifest publication, builder/source/implementation invalidation,
+corruption rejection, preflight and during-build budget failures, narrow temp
+cleanup, and preservation of completed caches.
+
+The system `/usr/bin/python3` failures from the pre-change table remain a
+concrete interpreter dependency limitation: NumPy/PyArrow and Pandas are not
+installed there, so collection stops before assertions. The repository-managed
+`.venv` passes every corresponding focused and full command. The external-install
+package test performs a no-index local install and imports/constructs cache and
+engine APIs from a working directory outside the repository while proving no
+`scripts`, `future_spot`, or installed `hftbacktest` dependency. No full-market
+data run or performance benchmark was executed, so Phase 4 creates no
+`run_errors.csv` and makes no throughput claim.

@@ -4,6 +4,8 @@ from .api import (
     AbiMismatchError,
     ArrowDataError,
     AssetConfig,
+    CompactCacheBudgetError,
+    CompactCacheError,
     DepthView,
     EngineClosedError,
     FeedLatency,
@@ -25,10 +27,42 @@ from .api import (
     __version__,
 )
 
+
+_COMPACT_EXPORTS = {
+    "BBO_SCHEMA": (".market_data.schema", "BBO_SCHEMA"),
+    "COMPACT_BUILDER_VERSION": (".cache.config", "COMPACT_BUILDER_VERSION"),
+    "COMPACT_SCHEMA_VERSION": (".market_data.schema", "COMPACT_SCHEMA_VERSION"),
+    "CompactBuildConfig": (".cache.config", "CompactBuildConfig"),
+    "CompactCacheStore": (".cache.store", "CompactCacheStore"),
+    "CompactSource": (".cache.config", "CompactSource"),
+}
+
+
+def __getattr__(name: str):
+    """Load PyArrow/Numba-backed cache objects only when requested."""
+
+    target = _COMPACT_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    from importlib import import_module
+
+    module = import_module(target[0], __name__)
+    value = getattr(module, target[1])
+    globals()[name] = value
+    return value
+
 __all__ = (
     "AbiMismatchError",
     "ArrowDataError",
     "AssetConfig",
+    "BBO_SCHEMA",
+    "COMPACT_BUILDER_VERSION",
+    "COMPACT_SCHEMA_VERSION",
+    "CompactBuildConfig",
+    "CompactCacheBudgetError",
+    "CompactCacheError",
+    "CompactCacheStore",
+    "CompactSource",
     "DepthView",
     "EngineClosedError",
     "FeedLatency",

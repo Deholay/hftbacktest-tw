@@ -268,6 +268,18 @@ fills, statuses, prices, quantities, timestamps, and latency fields.
 
 ### Phase 4: move compact BBO and cache ownership
 
+Implementation status (2026-09-03): **complete**. The package owns the one
+canonical `bbo_v1` Arrow schema and aligned native dtype, neutral Top-5
+normalization, timestamp correction/order sidecars, generic compact audit,
+builder version 2 streaming cache, deterministic manifests, validation,
+resource controls, atomic publication, reader, and installable build/read
+commands. Legacy compact modules are thin wrappers/delegates and the reference
+converter imports the package normalization implementation. Builder-version-1
+caches and the relocated implementation fingerprint invalidate
+conservatively. Physical schema, native ABI, Rust/engine versions, matching,
+strategy, carry, capital, and reporting semantics are unchanged. Phases 5 and
+6 remain pending.
+
 - Move schema, normalization, ordering, builder, reader, manifest, sidecars,
   disk checks, and atomic publication.
 - Reverse the normalization dependency so reference conversion imports the
