@@ -32,6 +32,7 @@ def test_local_install_and_import_work_outside_repository(
         "Cargo.toml",
         "MANIFEST.in",
         "README.md",
+        "README_en.md",
         "pyproject.toml",
     ):
         shutil.copy2(PACKAGE_ROOT / name, source / name)

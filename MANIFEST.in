@@ -1,5 +1,6 @@
 include Cargo.toml
 include Cargo.lock
 include CHANGELOG.md
+include README_en.md
 recursive-include native *.toml *.rs
 recursive-include tests *.py
