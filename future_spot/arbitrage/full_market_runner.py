@@ -25,7 +25,12 @@ PROJECT_ROOT = ARBITRAGE_ROOT.parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 ROOT_SCRIPT_ROOT = WORKSPACE_ROOT / "scripts"
 FUTURE_SPOT_SCRIPT_ROOT = PROJECT_ROOT / "scripts"
-for path in (ROOT_SCRIPT_ROOT, FUTURE_SPOT_SCRIPT_ROOT, WORKSPACE_ROOT, PROJECT_ROOT):
+for path in (
+    ROOT_SCRIPT_ROOT,
+    FUTURE_SPOT_SCRIPT_ROOT,
+    WORKSPACE_ROOT,
+    PROJECT_ROOT,
+):
     text = str(path)
     if text not in sys.path:
         sys.path.insert(0, text)
@@ -38,15 +43,17 @@ from scripts.tw_stock_data_to_npz import (  # noqa: E402
     default_output_path,
     parse_timestamp,
 )
-from scripts.compact_cache import (  # noqa: E402
+from hftbacktest_slim import (  # noqa: E402
+    COMPACT_BUILDER_VERSION,
     COMPACT_SCHEMA_VERSION,
     CompactBuildConfig,
     CompactCacheError,
     CompactCacheStore,
     CompactSource,
 )
+from hftbacktest_slim.market_data import compact_partition_audit  # noqa: E402
 from scripts.compact_hbt_adapter import write_reference_npz_from_compact  # noqa: E402
-from scripts.slim_engine import SLIM_ENGINE_VERSION  # noqa: E402
+from hftbacktest_slim import SLIM_ENGINE_VERSION  # noqa: E402
 from scripts.tw_stock_hftbacktest import BacktestConfig  # noqa: E402
 from scripts.io_utils import (  # noqa: E402
     concat_frames,
@@ -1054,6 +1061,11 @@ def run_backtests_with_position_carry(
                         if getattr(args, "market_data_cache", "event_npz") == "compact"
                         else None
                     ),
+                    "compact_builder_version": (
+                        COMPACT_BUILDER_VERSION
+                        if getattr(args, "market_data_cache", "event_npz") == "compact"
+                        else None
+                    ),
                     "strategy_clock": "step_ms",
                     "step_ms": getattr(args, "step_ms", None),
                     "time_in_force_semantics": HBT_TIME_IN_FORCE_SEMANTICS,
@@ -1945,23 +1957,11 @@ def compact_asset_audit(
     instrument: str,
     trade_date: str,
 ) -> tuple[float, dict[str, int | None]]:
-    import pyarrow as pa
-    import pyarrow.ipc as ipc
-
     from arbitrage.ticks import tw_stock_future_tick_size, tw_stock_tick_size
 
-    with pa.memory_map(str(data_path), "r") as handle:
-        table = ipc.open_file(handle).read_all()
-    metadata = {key.decode(): value.decode() for key, value in (table.schema.metadata or {}).items()}
-    adjustment = int(metadata.get("local_timestamp_adjustment_ns", 0))
-    exchange = table["exch_ts"].to_numpy(zero_copy_only=False)
-    local = table["local_ts_raw"].to_numpy(zero_copy_only=False) + adjustment
-    bid = table["bid_px"].to_numpy(zero_copy_only=False)
-    ask = table["ask_px"].to_numpy(zero_copy_only=False)
-    prices = np.concatenate((bid, ask))
-    prices = prices[np.isfinite(prices) & (prices > 0)]
-    if len(prices):
-        min_price = float(prices.min())
+    facts = compact_partition_audit(data_path)
+    min_price = facts["min_price"]
+    if min_price is not None:
         tick_size = (
             tw_stock_tick_size(min_price)
             if instrument == "stock"
@@ -1970,16 +1970,17 @@ def compact_asset_audit(
     else:
         # Match infer_hbt_asset_tick_size for a valid zero-event reference NPZ.
         tick_size = 1.0
-    volume = table["total_volume"].to_numpy(zero_copy_only=False)
-    trade_events = int(np.sum(np.diff(volume) > 0)) if len(volume) > 1 else 0
     return tick_size, {
-        "rows": table.num_rows,
-        "first_exch_ts": int(exchange.min()) if len(exchange) else None,
-        "last_exch_ts": int(exchange.max()) if len(exchange) else None,
-        "min_latency_ns": int(np.min(local - exchange)) if len(exchange) else None,
-        "max_latency_ns": int(np.max(local - exchange)) if len(exchange) else None,
-        "depth_events": None,
-        "trade_events": trade_events,
+        key: facts[key]
+        for key in (
+            "rows",
+            "first_exch_ts",
+            "last_exch_ts",
+            "min_latency_ns",
+            "max_latency_ns",
+            "depth_events",
+            "trade_events",
+        )
     }
 
 
@@ -2268,6 +2269,71 @@ def hbt_manifest_path(output_dir: Path) -> Path:
     return output_dir / HBT_MANIFEST_NAME
 
 
+def _hbt_implementation_paths(
+    engine: str = "slim", market_data_cache: str = "compact"
+) -> list[Path]:
+    slim_python_root = WORKSPACE_ROOT / "hftbacktest_slim" / "src" / "hftbacktest_slim"
+    slim_runtime_sources = [
+        *(slim_python_root / "engine").rglob("*.py"),
+        slim_python_root / "config.py",
+        slim_python_root / "enums.py",
+        slim_python_root / "errors.py",
+        slim_python_root / "models.py",
+        slim_python_root / "version.py",
+    ]
+    compact_sources = [
+        *(slim_python_root / "cache").rglob("*.py"),
+        *(slim_python_root / "market_data").rglob("*.py"),
+    ]
+    slim_python_sources = [
+        slim_python_root / "__init__.py",
+        slim_python_root / "api.py",
+    ]
+    if engine == "slim":
+        slim_python_sources.extend(slim_runtime_sources)
+    if engine == "slim" or market_data_cache == "compact":
+        slim_python_sources.extend(compact_sources)
+    slim_python_sources = sorted(set(slim_python_sources), key=lambda path: path.as_posix())
+    native_root = WORKSPACE_ROOT / "hftbacktest_slim" / "native"
+    native_sources = sorted(
+        (native_root / "src").rglob("*.rs"), key=lambda path: path.as_posix()
+    )
+    return sorted(
+        [
+            ARBITRAGE_ROOT / "capital.py",
+            ARBITRAGE_ROOT / "config.py",
+            ARBITRAGE_ROOT / "hbt_backtest.py",
+            ARBITRAGE_ROOT / "execution_port.py",
+            ARBITRAGE_ROOT / "reference_execution.py",
+            ARBITRAGE_ROOT / "slim_execution.py",
+            ARBITRAGE_ROOT / "hbt_numba.py",
+            ARBITRAGE_ROOT / "hbt_helpers.py",
+            ARBITRAGE_ROOT / "hbt_rows.py",
+            ARBITRAGE_ROOT / "hbt_types.py",
+            ARBITRAGE_ROOT / "models.py",
+            ARBITRAGE_ROOT / "strategy.py",
+            ARBITRAGE_ROOT / "strategy_adapter.py",
+            ARBITRAGE_ROOT / "ticks.py",
+            ARBITRAGE_ROOT / "utils.py",
+            ARBITRAGE_ROOT / "position_carry.py",
+            ROOT_SCRIPT_ROOT / "daily_result_store.py",
+            ROOT_SCRIPT_ROOT / "hbt_common.py",
+            ROOT_SCRIPT_ROOT / "hbt_types.py",
+            ROOT_SCRIPT_ROOT / "io_utils.py",
+            ROOT_SCRIPT_ROOT / "strategy_api.py",
+            *(
+                [ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py"]
+                if engine == "reference" and market_data_cache == "compact"
+                else []
+            ),
+            *slim_python_sources,
+            *([native_root / "Cargo.toml", *native_sources] if engine == "slim" else []),
+            Path(__file__),
+        ],
+        key=lambda path: path.as_posix(),
+    )
+
+
 def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord]) -> dict[str, Any]:
     config_paths = sorted({record.config_path.resolve() for record in records}, key=str)
     if getattr(args, "market_data_cache", "event_npz") == "compact":
@@ -2294,25 +2360,19 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
             },
             key=str,
         )
-    implementation_paths = [
-        ARBITRAGE_ROOT / "hbt_backtest.py",
-        ARBITRAGE_ROOT / "hbt_numba.py",
-        ARBITRAGE_ROOT / "hbt_helpers.py",
-        ARBITRAGE_ROOT / "strategy.py",
-        ARBITRAGE_ROOT / "strategy_adapter.py",
-        ARBITRAGE_ROOT / "position_carry.py",
-        ROOT_SCRIPT_ROOT / "compact_cache.py",
-        ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py",
-        ROOT_SCRIPT_ROOT / "slim_engine.py",
-        WORKSPACE_ROOT / "crates" / "hbt_slim" / "src" / "lib.rs",
-        Path(__file__),
-    ]
     return {
         "schema_version": HBT_CACHE_SCHEMA_VERSION,
         "engine": getattr(args, "engine", "reference"),
         "engine_version": execution_engine_version(args),
+        "execution_port": "future-spot-execution-port-v1",
+        "execution_adapter": f"{getattr(args, 'engine', 'reference')}-v1",
         "compact_schema_version": (
             COMPACT_SCHEMA_VERSION
+            if getattr(args, "market_data_cache", "event_npz") == "compact"
+            else None
+        ),
+        "compact_builder_version": (
+            COMPACT_BUILDER_VERSION
             if getattr(args, "market_data_cache", "event_npz") == "compact"
             else None
         ),
@@ -2326,7 +2386,12 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
         "run_keys": [record.run_key for record in records],
         "daily_configs": [_content_fingerprint(path) for path in config_paths],
         "event_files": [_stat_fingerprint(path) for path in event_paths],
-        "implementation_sha256": _combined_content_sha256(implementation_paths),
+        "implementation_sha256": _combined_content_sha256(
+            _hbt_implementation_paths(
+                getattr(args, "engine", "reference"),
+                getattr(args, "market_data_cache", "event_npz"),
+            )
+        ),
     }
 
 
@@ -2404,12 +2469,18 @@ def _content_fingerprint(path: Path) -> dict[str, Any]:
 
 def _combined_content_sha256(paths: list[Path]) -> str:
     digest = hashlib.sha256()
-    for path in paths:
-        digest.update(str(path.name).encode())
+    for path in sorted(paths, key=lambda value: value.as_posix()):
+        try:
+            identity = path.resolve().relative_to(WORKSPACE_ROOT.resolve()).as_posix()
+        except ValueError:
+            identity = path.resolve().as_posix()
+        digest.update(identity.encode())
+        digest.update(b"\0")
         try:
             digest.update(path.read_bytes())
         except FileNotFoundError:
             digest.update(b"<missing>")
+        digest.update(b"\0")
     return digest.hexdigest()
 
 

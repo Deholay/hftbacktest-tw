@@ -7,14 +7,19 @@ import unittest
 from unittest.mock import patch
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.ipc as ipc
 
 from future_spot.arbitrage.full_market_runner import (
     DailyPairRecord,
+    _hbt_implementation_paths,
     balanced_backtest_shards,
     build_compact_event_data,
+    compact_asset_audit,
     run_backtests,
 )
 from future_spot.arbitrage.models import PairConfig
+from hftbacktest_slim import BBO_SCHEMA
 
 
 def _pair(name: str) -> PairConfig:
@@ -48,6 +53,146 @@ class InlineExecutor:
 
 
 class PersistentExecutorTest(unittest.TestCase):
+    def test_strategy_compact_audit_combines_package_facts_with_tick_rules(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "future.arrow"
+            table = pa.Table.from_pylist(
+                [
+                    dict(
+                        zip(
+                            BBO_SCHEMA.names,
+                            (0, 100, 90, 499.5, 500.0, 1.0, 1.0, 499.5, 1),
+                        )
+                    ),
+                    dict(
+                        zip(
+                            BBO_SCHEMA.names,
+                            (1, 110, 105, 500.0, 500.5, 1.0, 1.0, 500.0, 2),
+                        )
+                    ),
+                ],
+                schema=BBO_SCHEMA,
+            ).replace_schema_metadata(
+                {
+                    b"schema_version": b"bbo_v1",
+                    b"local_timestamp_adjustment_ns": b"10",
+                }
+            )
+            with path.open("wb") as sink, ipc.new_file(sink, table.schema) as writer:
+                writer.write_table(table)
+
+            tick, summary = compact_asset_audit(path, "future", "2026-05-26")
+
+        self.assertEqual(tick, 0.5)
+        self.assertEqual(
+            summary,
+            {
+                "rows": 2,
+                "first_exch_ts": 100,
+                "last_exch_ts": 110,
+                "min_latency_ns": 0,
+                "max_latency_ns": 5,
+                "depth_events": None,
+                "trade_events": 1,
+            },
+        )
+
+    def test_manifest_fingerprints_every_sorted_relocated_native_source(self) -> None:
+        native_root = Path(__file__).resolve().parents[1] / "hftbacktest_slim" / "native"
+        expected = [
+            native_root / "Cargo.toml",
+            *sorted((native_root / "src").rglob("*.rs"), key=lambda path: path.as_posix()),
+        ]
+        selected = [
+            path
+            for path in _hbt_implementation_paths()
+            if path.is_relative_to(native_root)
+        ]
+
+        self.assertEqual(selected, expected)
+        self.assertTrue(all(path.is_file() for path in selected))
+        self.assertNotIn(
+            Path(__file__).resolve().parents[1] / "crates" / "hbt_slim" / "src" / "lib.rs",
+            _hbt_implementation_paths(),
+        )
+
+    def test_manifest_fingerprints_package_owned_python_runtime(self) -> None:
+        package_root = (
+            Path(__file__).resolve().parents[1]
+            / "hftbacktest_slim"
+            / "src"
+            / "hftbacktest_slim"
+        )
+        expected = sorted(
+            [
+                *(package_root / "engine").rglob("*.py"),
+                *(package_root / "cache").rglob("*.py"),
+                *(package_root / "market_data").rglob("*.py"),
+                package_root / "__init__.py",
+                package_root / "api.py",
+                package_root / "config.py",
+                package_root / "enums.py",
+                package_root / "errors.py",
+                package_root / "models.py",
+                package_root / "version.py",
+            ],
+            key=lambda path: path.as_posix(),
+        )
+        selected = [path for path in _hbt_implementation_paths() if path in expected]
+
+        self.assertEqual(selected, expected)
+        self.assertTrue(all(path.is_file() for path in selected))
+        implementation_paths = _hbt_implementation_paths()
+        self.assertTrue(all(path.is_file() for path in implementation_paths))
+        arbitrage_root = Path(__file__).resolve().parents[1] / "future_spot" / "arbitrage"
+        for name in (
+            "capital.py",
+            "config.py",
+            "execution_port.py",
+            "reference_execution.py",
+            "slim_execution.py",
+            "hbt_backtest.py",
+            "hbt_helpers.py",
+            "hbt_numba.py",
+            "hbt_rows.py",
+            "hbt_types.py",
+            "models.py",
+            "position_carry.py",
+            "strategy.py",
+            "strategy_adapter.py",
+            "ticks.py",
+            "utils.py",
+        ):
+            self.assertIn(arbitrage_root / name, _hbt_implementation_paths())
+        scripts_root = Path(__file__).resolve().parents[1] / "scripts"
+        for name in (
+            "daily_result_store.py",
+            "hbt_common.py",
+            "hbt_types.py",
+            "io_utils.py",
+            "strategy_api.py",
+        ):
+            self.assertIn(scripts_root / name, _hbt_implementation_paths())
+
+        reference_event_paths = _hbt_implementation_paths("reference", "event_npz")
+        self.assertFalse(
+            any(path.is_relative_to(package_root / "engine") for path in reference_event_paths)
+        )
+        self.assertNotIn(
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "compact_hbt_adapter.py",
+            _hbt_implementation_paths("slim", "compact"),
+        )
+        self.assertIn(
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "compact_hbt_adapter.py",
+            _hbt_implementation_paths("reference", "compact"),
+        )
+
     def test_compact_missing_date_preserves_reference_error_path(self) -> None:
         record = DailyPairRecord(
             "2026-07-10",
@@ -79,6 +224,58 @@ class PersistentExecutorTest(unittest.TestCase):
         self.assertEqual(audit["compact_cache_state"].tolist(), ["error"])
         self.assertEqual(audit["compact_build_invocation_scan_count"].tolist(), [0])
         self.assertIn("missing date source", audit.loc[0, "future_error"])
+
+    def test_compact_build_routes_multiple_pairs_through_one_source_per_kind(self) -> None:
+        records = [
+            DailyPairRecord(
+                "2026-07-10",
+                f"2026-07-10::{name}",
+                _pair(name),
+                Path(f"{name}.json"),
+            )
+            for name in ("a", "b")
+        ]
+        args = SimpleNamespace(
+            stock_tick_parquet_template="/data/stock_{date_nodash}.parquet",
+            event_futures_parquet_dir=Path("/data/futures"),
+            session_start="09:00:00",
+            session_end="13:25:00",
+            compact_cache_root=Path("/cache"),
+            compact_cache_compression="lz4",
+            compact_cache_profile="bbo",
+            compact_cache_batch_rows=1024,
+            compact_cache_max_gb=1.0,
+            compact_cache_min_free_gb=0.0,
+            rebuild_compact_cache=False,
+            continue_on_error=False,
+            engine="slim",
+        )
+        symbols = {
+            "stock": {f"S{name}": {"status": "valid", "file": f"S{name}.arrow"} for name in ("a", "b")},
+            "stock_future": {f"F{name}": {"status": "valid", "file": f"F{name}.arrow"} for name in ("a", "b")},
+        }
+        manifest = {
+            "cache_state": "miss",
+            "identity_sha256": "identity",
+            "build_invocation_scan_count": 2,
+            "sources": {
+                kind: {"symbols": values} for kind, values in symbols.items()
+            },
+        }
+        with patch(
+            "future_spot.arbitrage.full_market_runner.CompactCacheStore.build_date",
+            return_value=manifest,
+        ) as build:
+            paths, audit = build_compact_event_data(args, records)
+
+        self.assertEqual(build.call_count, 1)
+        sources = build.call_args.args[1]
+        self.assertEqual([(source.kind, source.symbols) for source in sources], [
+            ("stock", ("Sa", "Sb")),
+            ("stock_future", ("Fa", "Fb")),
+        ])
+        self.assertEqual(set(paths), {record.run_key for record in records})
+        self.assertEqual(audit["compact_build_invocation_scan_count"].tolist(), [2, 2])
 
     def test_run_backtests_uses_caller_owned_executor(self) -> None:
         records = [

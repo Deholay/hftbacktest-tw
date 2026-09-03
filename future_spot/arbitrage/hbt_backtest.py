@@ -6,30 +6,22 @@ import pandas as pd
 
 from scripts.strategy_api import Strategy, StrategyContext
 from scripts.hbt_common import (
-    apply_queue_model,
     feed_exch_ts,
     feed_latency_ns,
     feed_local_ts,
     feed_refreshed,
     fill_columns,
-    get_order,
-    hbt_feed_latency,
-    hbt_order_latency,
-    hbt_time_in_force,
     latency_event_local_ts,
-    order_is_active,
     round_price_to_tick,
 )
-from scripts.tw_stock_hftbacktest import import_hftbacktest, workspace_root
-from scripts.slim_engine import SlimBacktest, SlimHbtConstants, validate_slim_pair_config
 
 from .config import build_initial_position
+from .execution_port import ExecutionEngine
 from .hbt_helpers import (
     FUTURE_ASSET_NO,
     STOCK_ASSET_NO,
     asset_no_for_leg,
     hbt_order_qty,
-    infer_hbt_asset_tick_size,
     leg_side,
     opposite_side,
     quote_from_depth,
@@ -67,12 +59,7 @@ class HbtPairBacktester:
         strategy: Strategy | None = None,
     ) -> None:
         self.config = config
-        execution_engine = config.execution_engine.strip().lower()
-        self.hbtpkg = hbtpkg or (
-            SlimHbtConstants
-            if execution_engine == "slim"
-            else import_hftbacktest(workspace_root(config.spot.data))
-        )
+        self._hbtpkg_override = hbtpkg
         self.pricer = PairPricer()
         self._custom_strategy = strategy is not None
         self.strategy = strategy or default_strategy()
@@ -86,7 +73,7 @@ class HbtPairBacktester:
         self.python_decisions = 0
 
     def run(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        hbt = self._build_backtest()
+        hbt = self._build_execution_engine()
         try:
             engine = self.config.strategy_engine.strip().lower()
             if self.config.execution_engine.strip().lower() == "slim":
@@ -101,11 +88,9 @@ class HbtPairBacktester:
             summary = pd.DataFrame([self._summary_row(trades)])
             return trades, summary
         finally:
-            close = getattr(hbt, "close", None)
-            if close is not None:
-                close()
+            hbt.close()
 
-    def _run_python(self, hbt) -> None:
+    def _run_python(self, hbt: ExecutionEngine) -> None:
         step = 0
         last_market: PairMarket | None = None
         last_pricing: Any | None = None
@@ -114,7 +99,7 @@ class HbtPairBacktester:
                 break
             if self.config.max_trades is not None and len(self.rows) >= self.config.max_trades:
                 break
-            if hbt.elapse(self.config.step_ns) != 0:
+            if not hbt.advance(self.config.step_ns):
                 break
             step += 1
 
@@ -137,8 +122,11 @@ class HbtPairBacktester:
 
         self._record_final_market(hbt, step, last_market, last_pricing)
 
-    def _run_numba(self, hbt) -> None:
+    def _run_numba(self, hbt: ExecutionEngine) -> None:
         self._validate_numba_strategy()
+        scanner_backend = hbt.scanner_backend
+        if scanner_backend is None:
+            raise RuntimeError("Numba scanner requires the reference execution adapter")
         step = 0
         last_market: PairMarket | None = None
         last_pricing: Any | None = None
@@ -162,7 +150,7 @@ class HbtPairBacktester:
 
             self.scan_calls += 1
             scan_result = scan_until_wakeup(
-                hbt,
+                scanner_backend,
                 self.config.step_ns,
                 step,
                 remaining_steps,
@@ -309,22 +297,31 @@ class HbtPairBacktester:
         except KeyError as exc:
             raise RuntimeError(f"unknown Numba signal code: {code}") from exc
 
-    def _build_backtest(self):
+    def _build_execution_engine(self) -> ExecutionEngine:
         execution_engine = self.config.execution_engine.strip().lower()
         if execution_engine == "slim":
-            validate_slim_pair_config(self.config.pair)
+            from .slim_execution import SlimExecutionAdapter
+
+            SlimExecutionAdapter.validate_pair(self.config.pair)
             spot_tick = self.config.spot.tick_size or self._infer_compact_tick_size(self.config.spot)
             future_tick = self.config.future.tick_size or self._infer_compact_tick_size(self.config.future)
-            spot = HbtAssetConfig(**{**self.config.spot.__dict__, "tick_size": spot_tick})
-            future = HbtAssetConfig(**{**self.config.future.__dict__, "tick_size": future_tick})
-            self.resolved_tick_sizes = {"spot_tick_size": spot_tick, "future_tick_size": future_tick}
-            return SlimBacktest([spot, future])
+            adapter, self.resolved_tick_sizes = SlimExecutionAdapter.open(
+                self.config.spot,
+                self.config.future,
+                spot_tick_size=spot_tick,
+                future_tick_size=future_tick,
+            )
+            return adapter
         if execution_engine != "reference":
             raise ValueError(f"execution_engine must be 'reference' or 'slim': {self.config.execution_engine}")
-        spot_asset, spot_tick = self._build_asset(self.config.spot)
-        future_asset, future_tick = self._build_asset(self.config.future)
-        self.resolved_tick_sizes = {"spot_tick_size": spot_tick, "future_tick_size": future_tick}
-        return self.hbtpkg.HashMapMarketDepthBacktest([spot_asset, future_asset])
+        from .reference_execution import ReferenceExecutionAdapter
+
+        adapter, self.resolved_tick_sizes = ReferenceExecutionAdapter.open(
+            self.config.spot,
+            self.config.future,
+            hbtpkg=self._hbtpkg_override,
+        )
+        return adapter
 
     def _infer_compact_tick_size(self, asset_config: HbtAssetConfig) -> float:
         import pyarrow as pa
@@ -343,31 +340,6 @@ class HbtPairBacktester:
             price,
             {"exchtime": table["exch_ts"][0].as_py() if table.num_rows else 0},
         )
-
-    def _build_asset(self, asset_config: HbtAssetConfig):
-        tick_size = asset_config.tick_size or infer_hbt_asset_tick_size(
-            asset_config.data,
-            asset_config.instrument,
-            fallback=1.0,
-            trade_date=asset_config.trade_date,
-        )
-        asset = (
-            self.hbtpkg.BacktestAsset()
-            .data(str(asset_config.data))
-            .linear_asset(asset_config.contract_size)
-            .constant_order_latency(
-                asset_config.order_entry_latency_ns,
-                asset_config.order_response_latency_ns,
-            )
-            .no_partial_fill_exchange()
-            .trading_value_fee_model(asset_config.maker_fee, asset_config.taker_fee)
-            .tick_size(tick_size)
-            .lot_size(asset_config.lot_size)
-            .last_trades_capacity(asset_config.last_trades_capacity)
-        )
-        if asset_config.feed_latency_offset_ns:
-            asset = asset.latency_offset(asset_config.feed_latency_offset_ns)
-        return apply_queue_model(asset, asset_config), tick_size
 
     def _current_market(self, hbt) -> PairMarket | None:
         spot = quote_from_depth(hbt.depth(STOCK_ASSET_NO), self.config.pair.spot_symbol, hbt.current_timestamp)
@@ -430,7 +402,7 @@ class HbtPairBacktester:
             )
             return
 
-        if self.config.second_leg_delay_ns > 0 and hbt.elapse(self.config.second_leg_delay_ns) != 0:
+        if self.config.second_leg_delay_ns > 0 and not hbt.advance(self.config.second_leg_delay_ns):
             self._append_execution_row(
                 hbt,
                 step,
@@ -575,8 +547,8 @@ class HbtPairBacktester:
         mode = self.config.post_first_feed_wait
         if mode == "none":
             return True
-        start_spot = hbt_feed_latency(hbt, STOCK_ASSET_NO)
-        start_future = hbt_feed_latency(hbt, FUTURE_ASSET_NO)
+        start_spot = hbt.feed_latency(STOCK_ASSET_NO)
+        start_future = hbt.feed_latency(FUTURE_ASSET_NO)
         if self._post_first_feed_ready(mode, start_spot, start_future, hbt):
             return True
 
@@ -584,7 +556,7 @@ class HbtPairBacktester:
         poll_ns = max(1, self.config.post_first_feed_poll_ns)
         while int(hbt.current_timestamp) < deadline:
             step_ns = min(poll_ns, deadline - int(hbt.current_timestamp))
-            if hbt.elapse(step_ns) != 0:
+            if not hbt.advance(step_ns):
                 return False
             if self._post_first_feed_ready(mode, start_spot, start_future, hbt):
                 return True
@@ -597,8 +569,8 @@ class HbtPairBacktester:
         start_future: tuple[int, int] | None,
         hbt,
     ) -> bool:
-        spot_ready = feed_refreshed(start_spot, hbt_feed_latency(hbt, STOCK_ASSET_NO))
-        future_ready = feed_refreshed(start_future, hbt_feed_latency(hbt, FUTURE_ASSET_NO))
+        spot_ready = feed_refreshed(start_spot, hbt.feed_latency(STOCK_ASSET_NO))
+        future_ready = feed_refreshed(start_future, hbt.feed_latency(FUTURE_ASSET_NO))
         if mode == "spot":
             return spot_ready
         if mode == "future":
@@ -644,16 +616,10 @@ class HbtPairBacktester:
     ) -> HbtLegFill:
         asset_no = asset_no_for_leg(leg)
         order_id = self._next_order_id()
-        tif = hbt_time_in_force(self.hbtpkg, time_in_force)
-        if side == "buy":
-            rc = hbt.submit_buy_order(asset_no, order_id, price, qty, tif, self.hbtpkg.LIMIT, False)
-        elif side == "sell":
-            rc = hbt.submit_sell_order(asset_no, order_id, price, qty, tif, self.hbtpkg.LIMIT, False)
-        else:
-            raise RuntimeError(f"unsupported side: {side}")
+        rc = hbt.submit_limit(asset_no, order_id, side, price, qty, time_in_force)
         response = hbt.wait_order_response(asset_no, order_id, self.config.response_timeout_ns)
-        req_ts, order_exch_ts, resp_ts = hbt_order_latency(hbt, asset_no)
-        order = get_order(hbt, asset_no, order_id)
+        req_ts, order_exch_ts, resp_ts = hbt.order_latency(asset_no)
+        order = hbt.order(asset_no, order_id)
         filled = order is not None and float(order.exec_qty) > 0
         status = None if order is None else int(order.status)
         fill = HbtLegFill(
@@ -674,9 +640,8 @@ class HbtPairBacktester:
             order_exch_ts=order_exch_ts,
             order_resp_local_ts=resp_ts,
         )
-        if not filled and order_is_active(order, self.hbtpkg):
-            hbt.cancel(asset_no, order_id, False)
-            hbt.wait_order_response(asset_no, order_id, self.config.response_timeout_ns)
+        if not filled and hbt.order_is_active(order):
+            hbt.cancel_active_order(asset_no, order_id, self.config.response_timeout_ns)
         hbt.clear_inactive_orders(asset_no)
         return fill
 
@@ -880,8 +845,8 @@ class HbtPairBacktester:
         fill: HbtLegFill | None = None,
         local_ts: int | None = None,
     ) -> None:
-        spot_feed = hbt_feed_latency(hbt, STOCK_ASSET_NO)
-        future_feed = hbt_feed_latency(hbt, FUTURE_ASSET_NO)
+        spot_feed = hbt.feed_latency(STOCK_ASSET_NO)
+        future_feed = hbt.feed_latency(FUTURE_ASSET_NO)
         order_entry_latency_ns = None
         order_response_latency_ns = None
         if fill is not None and fill.order_req_local_ts is not None and fill.order_exch_ts is not None:

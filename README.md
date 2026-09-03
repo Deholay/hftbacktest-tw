@@ -5,8 +5,9 @@
 market-by-price 行情轉換為 HftBacktest events，提供精簡的跨策略 API，並實作包含
 延遲、部位留倉、資金重播及報表的全市場股票期貨／現貨套利流程。
 
-主要研究路徑是 `future_spot/`。根目錄下的 notebooks 仍可用於轉換結果檢查、
-queue model 實驗及新策略原型開發。
+主要研究路徑是 `future_spot/`。根目錄下的 notebooks 可用於轉換結果檢查、
+queue model 實驗、新策略原型，以及透過新版 `hftbacktest_slim` package 執行
+期現貨視覺化 runner。
 
 ## 回測結果
 
@@ -23,7 +24,7 @@ queue model 實驗及新策略原型開發。
 | 因資金不足遭拒的進場 | 4,021 筆，共 29 天 |
 | 接受出場 | 4,179 |
 
-![期現貨已實現損益投資組合總覽](docs/assets/futures-spot-portfolio-overview-20260101-20260731.png)
+![期現貨已實現損益投資組合總覽](docs/figure/futures-spot-portfolio-overview-20260101-20260731.png)
 
 這是模擬研究結果，不代表實盤績效。資金重播共用 NT$50M，並停用槓桿：現貨與
 期貨皆按名目金額的 100% 計入資金占用，且各自上限為 NT$25M；未納入未平倉部位
@@ -44,6 +45,13 @@ future_spot/output/hbt_daily_full_market_20260101_20260731_future_order_1ms_resp
 
 ```bash
 python3 -m pip install -r requirements.txt
+```
+
+從同一個 repository root 啟動已改接新版 neutral slim package 的期現貨
+視覺化 notebook：
+
+```bash
+jupyter notebook notebooks/hbt_pair_backtest_visualization.ipynb
 ```
 
 執行全市場工作前，先跑一個小型單行程 smoke test：
@@ -101,14 +109,39 @@ Slim 會保留設定的 `step_ms` 策略決策時鐘、各腿獨立的 feed/orde
 
 | 路徑 | Slim engine 職責 |
 | --- | --- |
-| `crates/hbt_slim/src/lib.rs` | Rust scheduler、BBO state、latency/order state，以及立即 FOK/IOC matching core。 |
-| `scripts/slim_engine.py` | `ctypes` binding、Arrow partition 載入，以及與 HBT 相容的 Python facade。 |
-| `scripts/compact_cache.py` | 版本化 compact schema、具資源上限的每日建置、驗證與原子發布。 |
-| `future_spot/arbitrage/hbt_backtest.py` | Engine 選擇與 pair strategy 整合。 |
+| `hftbacktest_slim/native/src/` | Rust scheduler、BBO state、latency/order state，以及立即 FOK/IOC matching core；依 types、book、scheduler、matcher、engine 與 FFI 職責分割。 |
+| `hftbacktest_slim/src/hftbacktest_slim/engine/` | Neutral `SlimEngine`、`ctypes` ABI binding、Arrow partition reader、lifecycle 與 capability validation。 |
+| `hftbacktest_slim/src/hftbacktest_slim/market_data/` | Canonical `bbo_v1` schema/aligned dtype、Top-5 normalization、timestamp ordering/sidecars 與 generic compact audit。 |
+| `hftbacktest_slim/src/hftbacktest_slim/cache/` | Builder v2 one-scan cache、manifest identity/validation、disk budgets 與 atomic publication。 |
+| `future_spot/arbitrage/execution_port.py`、`reference_execution.py`、`slim_execution.py` | Strategy-owned execution port，以及 reference／neutral slim adapters。 |
+| `future_spot/arbitrage/hbt_backtest.py` | 經由 execution port 執行共用 pair strategy 流程。 |
 | `future_spot/arbitrage/full_market_runner.py` | CLI、compact data 編排、依日期循序留倉、workers、結果持久化與 manifests。 |
 
 Linux 環境會產生 `target/release/libhbt_slim.so`。Compact cache 的預設位置為
 `data/tw_compact_v1/date=YYYYMMDD/source={stock|stock_future}/<symbol>.arrow`。
+Python neutral API 可由 `hftbacktest_slim` 匯入 `AssetConfig`、`SlimEngine`、
+`Side`、`TimeInForce`、`BBO_SCHEMA`、`CompactBuildConfig`、
+`CompactCacheStore` 與 `CompactSource`。Native library 依序採用明確的 `library_path`、
+`HFTBACKTEST_SLIM_LIBRARY`、package artifact，以及 root Cargo release artifact；
+package import 本身不會載入 shared library。Compact schema 仍為 `bbo_v1`，builder
+已升為 version `2`，因此 version 1 cache 會保守失效；physical fields 與 matching
+語意均未改變。`future_spot` slim path 直接使用 neutral API；
+`examples/slim_two_asset_strategy/` 以另一個獨立策略驗證相同擴充邊界。這次 integration
+source 變更與 Phase 6 source selection 會使舊 result manifests 失效，但移除舊入口
+本身不會使 compact cache 失效。
+
+安裝 `requirements.txt` 後，使用 package-owned cache commands：
+
+```bash
+python3 -m hftbacktest_slim.cli.build_cache --help
+python3 -m hftbacktest_slim.cli.benchmark_read --help
+```
+
+Cold build 對每個日期的股票及期貨 physical source 各讀一次 projected record
+batches；warm validated reuse 不讀 raw payload。預設 LZ4，亦保留 `none` 與 `zstd`。
+建置前依 `source_rows * 96 * 1.20` 檢查容量及 free-space reserve，每個 batch 後重查；
+manifest 最後寫入並以同檔案系統 atomic rename 發布，失敗時只清理當次 incomplete
+temporary date，不會自動刪除 completed cache、raw data 或 results。
 
 目前保留的一月至七月回測，除日期區間與資料路徑外，另使用以下會影響結果的執行與
 資金設定：
@@ -141,21 +174,23 @@ python3 future_spot/test/run_full_backtest.py \
 | `scripts/hbt_types.py` | 與策略無關的 HBT asset 與 fill dataclasses。 |
 | `scripts/hbt_common.py` | 共用的 queue、order、latency 與 fill helpers。 |
 | `scripts/io_utils.py` | 小型 DataFrame、CSV 與時間處理 helpers。 |
-| `scripts/compact_cache.py` | 可重用的 compact BBO cache schema、builder、manifest 與驗證。 |
-| `scripts/slim_engine.py` | Rust slim engine 的 Python binding 與 HBT-compatible facade。 |
+| `hftbacktest_slim/src/hftbacktest_slim/` | Neutral slim Python API、compact market-data/cache/CLI ownership，以及 runtime binding/reader/models。 |
 | `scripts/tw_stock_data_to_npz.py` | 將臺灣五檔資料列轉成 HftBacktest event arrays 或 `.npz`。 |
 | `scripts/tw_stock_hftbacktest.py` | 共用的股票回測設定、asset 建立、狀態與 BBO helpers。 |
 | `scripts/tw_stock_strategies.py` | 股票 notebook strategies 與 DataFrame summaries。 |
-| `crates/hbt_slim/` | 專案自行維護的 Rust slim scheduler 與 matcher。 |
+| `hftbacktest_slim/native/` | 專案自行維護的 Rust slim scheduler、matcher 與穩定 C ABI。 |
 | `future_spot/arbitrage/` | 期現貨定價、風險、執行、HBT、留倉、資金與報表實作。 |
+| `examples/slim_two_asset_strategy/` | 不依賴 `future_spot` 的 neutral slim API 第二策略範例。 |
 | `future_spot/scripts/` | 精簡的期現貨 CLI entrypoints。 |
 | `future_spot/test/run_full_backtest.py` | 完整回測、報表資料表與 PNG 產生流程。 |
+| `notebooks/hbt_pair_backtest_visualization.ipynb` | 使用已安裝 neutral slim API、委派期現貨 adapter 的薄視覺化 runner。 |
 | `notebooks/` | 精簡的實驗 runners 與跨策略整合範例。 |
 
-跨策略行為應放在根目錄的 `scripts/`。策略資料夾只負責自身領域模型、定價、風險、
-執行、設定與輸出 schema。新的策略家族應實作 `scripts.strategy_api`，不應從
+Slim runtime 的跨策略行為應放在 `hftbacktest_slim/`；其他跨策略 Python contracts
+仍放在根目錄的 `scripts/`。策略資料夾只負責自身領域模型、定價、風險、執行、設定與
+輸出 schema。新的策略家族應實作 `scripts.strategy_api`，不應從
 `future_spot` 匯入可重用行為。詳見
-[`STRATEGY_GUIDANCE.md`](STRATEGY_GUIDANCE.md) 與
+[`examples/slim_two_asset_strategy/README.md`](examples/slim_two_asset_strategy/README.md) 與
 [`notebooks/hbt_strategy_interface_example.ipynb`](notebooks/hbt_strategy_interface_example.ipynb).
 
 ## 期現貨流程
@@ -253,8 +288,8 @@ DataFrames，並將明細 frames 保留在個別變數中。
 執行聚焦的測試套件，並編譯所有保留的 Python entrypoints：
 
 ```bash
-python3 -m pytest -q tests future_spot/test
-python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py future_spot/test/*.py
+python3 -m pytest -q tests future_spot/test hftbacktest_slim/tests
+python3 -m compileall -q scripts future_spot hftbacktest_slim/src/hftbacktest_slim
 ```
 
 除錯 `ask5` 或 `bid5` 缺漏時，應同時確認來源／events 中不同價格 levels 的數量與

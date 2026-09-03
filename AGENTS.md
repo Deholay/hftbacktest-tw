@@ -3,16 +3,27 @@
 ## Mission
 
 This repository supports Taiwan market-microstructure research with
-`hftbacktest`. It has two related surfaces:
+`hftbacktest`. It has three related surfaces:
 
 1. Root stock/ETF/odd-lot/futures converters and notebook experiments.
 2. The `future_spot` full-market stock-future/spot arbitrage backtest, capital
    replay, and reporting pipeline.
+3. The project-owned `hftbacktest_slim` BBO replay runtime and compact-data
+   package shared by multiple strategy families.
 
 The active performance direction is defined in
 `HBT_ACCELERATION_STRATEGY.md`. Read that document before changing data
 loading, compact-cache formats, matching behavior, multiprocessing, carry,
 result persistence, or benchmark claims.
+
+The completed extraction of reusable slim-engine components into
+`hftbacktest_slim/` is governed by `HFTBACKTEST_SLIM_MIGRATION.md`. Read it
+before moving, adding, or importing slim runtime, native matching, or compact
+BBO code. For package location, ownership, and dependency direction, the
+migration document supersedes historical locations described in the
+acceleration strategy. The acceleration strategy remains authoritative for
+market-data, scheduler, matching, latency, cache, parity, and benchmark
+semantics.
 
 Preserve reproducibility and market-data semantics. Never improve speed or make
 a backtest look cleaner by silently dropping dates, pairs, errors, open
@@ -36,24 +47,38 @@ time, peak RSS, and disk growth.
 ## Architecture boundaries
 
 - Root `scripts/` is the cross-strategy Python library layer.
-- A future root `crates/` tree is the correct home for project-wide native
-  compact-data and matching components.
+- `hftbacktest_slim/` is the self-contained, cross-strategy slim runtime. It
+  owns the native Rust scheduler/matcher, Python binding, slim-native types and
+  public API, compact BBO schema, normalization, readers, cache builder,
+  manifests, validation, and slim-specific command-line tools.
+- New slim runtime code must not be added to root `scripts/`, root `crates/`,
+  or a strategy package. The Phase 6 migration removed the transitional slim
+  wrappers and old native location; do not recreate them.
+- `hftbacktest_slim` must not import `future_spot`, another strategy package,
+  `scripts.hbt_*`, `scripts.tw_stock_*`, or the installed `hftbacktest`
+  package. Enforce this with an automated dependency-boundary test.
+- Strategy packages may import `hftbacktest_slim`; the dependency must never
+  point from `hftbacktest_slim` back into a strategy package.
 - `scripts/strategy_api.py` owns project-wide strategy contracts:
   `StrategyContext`, `StrategyDecision`, `Strategy`, `StrategyRunner`,
   and the lightweight registry.
 - `scripts/hbt_types.py`, `scripts/hbt_common.py`, and
   `scripts/io_utils.py` own strategy-neutral HBT types, execution helpers,
   and I/O helpers.
-- Reusable compact-cache schema, manifest, validation, and reader code belongs
-  in the root library. Strategy-specific universe construction and source
-  resolution remain in `future_spot`.
+- Reference-HBT helpers and reference compact-to-event adapters remain outside
+  `hftbacktest_slim`. Reusable slim compact-cache schema, manifest,
+  normalization, validation, reader, and publication code belongs in
+  `hftbacktest_slim`. Strategy-specific universe construction and source
+  resolution remain in each strategy package.
 - Strategy folders own domain models, pricing, risk, execution, config parsing,
   output schemas, and adapters.
 - `future_spot` implements the root strategy interface in
   `future_spot/arbitrage/strategy_adapter.py`.
 - Never make a new strategy family import `future_spot` for reusable
-  behavior. Promote clean, domain-neutral code to root `scripts/` or
-  `crates/` first.
+  behavior. Promote clean slim-runtime behavior to `hftbacktest_slim` and
+  other domain-neutral behavior to root `scripts/` first.
+- New strategies must use the neutral `hftbacktest_slim` public API. Removed
+  HBT-shaped compatibility imports are not an extension surface.
 - Keep notebooks thin. Reusable conversion, execution, analytics, and plotting
   logic belongs in Python modules.
 - Keep `future_spot/scripts/` as thin CLI entrypoints. Business logic belongs
@@ -66,8 +91,10 @@ Maintain two explicit execution paths:
 - **Reference engine:** installed HftBacktest plus the existing event converter,
   Python implementation, and Numba scanner. It is the regression oracle,
   queue/passive-order research engine, and custom-strategy fallback.
-- **Slim engine:** the planned project-owned matching core for the constrained
-  BBO, no-partial-fill futures/spot path.
+- **Slim engine:** the project-owned, cross-strategy matching runtime in
+  `hftbacktest_slim/` for constrained BBO, immediate FOK/IOC,
+  no-partial-fill paths. Strategy-specific decisions and portfolio behavior
+  remain outside the runtime.
 
 Do not replace the reference engine or make the slim engine the default until
 the parity gates in `HBT_ACCELERATION_STRATEGY.md` pass. Every run manifest
@@ -84,6 +111,11 @@ behavioral comparison and unsupported modes.
 
 - `HBT_ACCELERATION_STRATEGY.md`: authoritative acceleration architecture,
   hazards, phases, benchmarks, and acceptance gates.
+- `HFTBACKTEST_SLIM_MIGRATION.md`: authoritative package-boundary, dependency,
+  relocation, compatibility, versioning, and migration acceptance plan for
+  `hftbacktest_slim`.
+- `hftbacktest_slim/`: current home for the shared Python/Rust slim runtime,
+  compact BBO data layer, and stable backend-facing API.
 - `scripts/tw_stock_data_to_npz.py`: source rows to HftBacktest event arrays
   or `.npz` files for the reference path.
 - `scripts/tw_stock_hftbacktest.py`: `BacktestConfig`, asset setup, import
@@ -97,6 +129,9 @@ behavioral comparison and unsupported modes.
   `notebooks/hftbacktest_TWStockFuture.ipynb`: daily-parquet runners.
 - `notebooks/hbt_strategy_interface_example.ipynb`: cross-strategy adapter
   example.
+- `notebooks/hbt_pair_backtest_visualization.ipynb`: thin futures/spot report
+  runner that uses the installed neutral slim package and delegates strategy
+  behavior to `future_spot`.
 
 ### Futures/spot implementation
 
@@ -382,29 +417,36 @@ are intentionally absent from `requirements.txt`.
    and report consumer before editing a result-defining path.
 2. Read `HBT_ACCELERATION_STRATEGY.md` and identify the affected phase,
    semantic baseline, and acceptance gate.
-3. Keep changes inside the correct architectural layer.
-4. Label whether a change is performance-only or semantic. Semantic changes
-   require a new manifest identity and separate baseline.
-5. Add focused tests for affected behavior. Depending on scope, cover daily vs
+3. For any slim package API, native matcher, compact BBO, or package-boundary
+   change, also read `HFTBACKTEST_SLIM_MIGRATION.md` and identify
+   the migration phase and dependency boundary affected.
+4. Keep changes inside the correct architectural layer. Do not combine a file
+   relocation with an unversioned semantic change.
+5. Label whether a change is performance-only, relocation-only, or semantic.
+   Semantic changes require a new manifest identity and separate baseline.
+6. Add focused tests for affected behavior. Depending on scope, cover daily vs
    symbol-source parity, Top-5 aggregation, single-scan enforcement,
    per-symbol timestamp correction, equal-time priority, FOK/IOC behavior,
    latency, carry, capital, disk interruption, cache invalidation, daily
    persistence, and restart parity.
-6. Run focused tests first. Benchmark only after correctness gates pass.
-7. Preserve unrelated user changes and generated outputs.
-8. Compile every retained Python entrypoint and any native workspace.
-9. Inspect `git diff --check`, the final diff, generated files, manifests,
+7. For `hftbacktest_slim` changes, run package-isolation and external-import
+   smoke tests in addition to behavioral parity tests.
+8. Run focused tests first. Benchmark only after correctness gates pass.
+9. Preserve unrelated user changes and generated outputs.
+10. Compile every retained Python entrypoint, the `hftbacktest_slim` package
+    once introduced, and any native workspace.
+11. Inspect `git diff --check`, the final diff, generated files, manifests,
    secrets, and `run_errors.csv` where a run was executed.
 
 Python validation baseline:
 
 ```bash
-python3 -m pytest -q tests future_spot/test
-python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py future_spot/test/*.py
+python3 -m pytest -q tests future_spot/test hftbacktest_slim/tests
+python3 -m compileall -q scripts future_spot hftbacktest_slim/src/hftbacktest_slim
 git diff --check
 ```
 
-When a Rust workspace is added:
+Rust validation:
 
 ```bash
 cargo test --workspace

@@ -342,8 +342,7 @@ The slim kernel needs only:
 - Local and exchange market views.
 - Independent feed, order-entry, and response latency per leg.
 - A deterministic event scheduler.
-- Limit order submit, FOK/IOC fill or expiry, response, and audited cancel
-  compatibility.
+- Limit order submit, FOK/IOC fill or expiry, and response visibility.
 - No-partial-fill execution at the opposite best price.
 - Current timestamp, BBO/quantity, order state, and latency timestamps.
 - The default futures/spot pricing and signal scanner, or an equivalent bounded
@@ -354,11 +353,13 @@ partial-fill exchange, inverse assets, generic fee/state accounting, recorder,
 statistics, historical latency interpolation, market orders, or order modify
 unless a later strategy demonstrates a real need.
 
-Place a domain-neutral Rust crate under a root-level `crates/` directory. Put
-strategy-neutral Python bindings/adapters in root `scripts/`; put futures/spot
-pricing, risk, position, output mapping, and CLI integration in
-`future_spot/arbitrage/`. A new strategy must not depend on `future_spot` for
-reusable matching behavior.
+The completed migration places the domain-neutral Rust crate under
+`hftbacktest_slim/native/` and the neutral Python API, binding, compact schema,
+cache, and CLIs under `hftbacktest_slim/src/hftbacktest_slim/`. Futures/spot
+pricing, risk, position, output mapping, and CLI integration remain in
+`future_spot/arbitrage/`; reference-only conversion adapters remain in root
+`scripts/`. A new strategy must not depend on `future_spot` for reusable
+matching behavior. Historical pre-migration locations are not supported.
 
 ### Time-in-force correctness gate
 

@@ -13,7 +13,7 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 
-from scripts.compact_cache import COMPACT_SCHEMA_VERSION
+from hftbacktest_slim import COMPACT_SCHEMA_VERSION  # noqa: E402
 from scripts.tw_stock_data_to_npz import (
     ConversionStats,
     build_events_from_parquet_frame,

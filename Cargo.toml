@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hbt_slim"]
+members = ["hftbacktest_slim/native"]
 resolver = "2"
 
 [profile.release]

@@ -12,7 +12,7 @@
 
 同口徑的 3 月 cold workload 約快 2.65×。 舊版約 4,023 秒（67.1 分鐘），新版約 1,520 秒（25.3 分鐘），減少約 62.2%，省下 41.7 分鐘。
 
-![alt text](image.png)
+![alt text](figure/image.png)
 
 
 # 優化方法

@@ -7,14 +7,6 @@ from typing import Any
 
 import numpy as np
 
-from scripts.tw_stock_data_to_npz import (
-    DEPTH_CLEAR_EVENT,
-    DEPTH_EVENT,
-    DEPTH_SNAPSHOT_EVENT,
-    EVENT_FLAG_MASK,
-    TRADE_EVENT,
-)
-
 from .models import PairConfig, PairPosition, Quote, Signal
 from .ticks import tw_stock_future_tick_size, tw_stock_tick_size
 from .utils import STOCK_BOARD_LOT_SHARES
@@ -61,6 +53,16 @@ def hbt_asset_audit(
     fallback: float = 1.0,
 ) -> tuple[float, dict[str, int | None]]:
     """Load an event archive once and return its tick size and audit summary."""
+    # Keep the reference pair runtime independent from compact/slim imports.
+    # These converter constants are needed only by runner-side event auditing.
+    from scripts.tw_stock_data_to_npz import (
+        DEPTH_CLEAR_EVENT,
+        DEPTH_EVENT,
+        DEPTH_SNAPSHOT_EVENT,
+        EVENT_FLAG_MASK,
+        TRADE_EVENT,
+    )
+
     with np.load(path) as archive:
         scalar_names = {
             "event_rows",

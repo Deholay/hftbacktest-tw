@@ -15,13 +15,15 @@ import polars as pl
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
-
-from scripts.compact_cache import CompactBuildConfig, CompactCacheStore
+from hftbacktest_slim import (
+    CompactBuildConfig,
+    CompactCacheStore,
+    normalized_bbo_from_depth_columns,
+)
 from scripts.compact_hbt_adapter import compact_to_reference_events
 from scripts.tw_stock_data_to_npz import (
     _float_matrix,
     build_events_from_parquet_frame,
-    normalized_bbo_from_depth_columns,
     symbol_filter_values,
 )
 

@@ -25,14 +25,15 @@ Key files:
 Notebook/test runner:
 
 ```text
-future_spot/test/hbt_pair_backtest_visualization.ipynb
+../notebooks/hbt_pair_backtest_visualization.ipynb
 future_spot/test/run_full_backtest.py
 ../notebooks/hbt_strategy_interface_example.ipynb
 ```
 
-The visualization notebook is intentionally a thin runner. Its configuration,
-pipeline, report-table, and plotting functions are split into Python modules in
-`future_spot/test/`. Both the notebook and `run_full_backtest.py` save:
+The root visualization notebook is intentionally a thin runner. It imports the
+installed neutral `hftbacktest_slim` API and delegates futures/spot policy to
+the strategy-owned adapter and support modules in `future_spot/`. Both the
+notebook and `run_full_backtest.py` save:
 
 - entry / exit rules;
 - estimated profit by symbol and by pair;
@@ -42,10 +43,21 @@ pipeline, report-table, and plotting functions are split into Python modules in
 - report CSVs under the selected output directory's `reports/` folder;
 - five PNG charts under its `figures/` folder.
 
+Install from the repository root so the kernel resolves the slim src-layout
+package through the editable installation. The notebook only exposes the
+validated repository root for the repository-owned `future_spot` and `scripts`
+packages; it never adds `hftbacktest_slim/src` directly:
+
+```bash
+python3 -m pip install -e ./hftbacktest_slim
+jupyter notebook notebooks/hbt_pair_backtest_visualization.ipynb
+```
+
 The root strategy interface example notebook demonstrates the
 `scripts.strategy_api` contract plus the futures/spot adapter in
-`arbitrage/strategy_adapter.py`. Keep cross-strategy examples in root
-`notebooks/`; keep futures/spot-specific test/report runners in `future_spot/test/`.
+`arbitrage/strategy_adapter.py`. Root notebooks remain thin orchestration and
+examples; futures/spot implementation and reusable report helpers remain in
+`future_spot/`.
 
 ## Run Command
 
@@ -84,6 +96,16 @@ returns to Python for signals, periodic market samples, risk checks, execution,
 and report rows. Every non-HOLD signal row is still retained. Backtest reuse is protected by `backtest_manifest.json`,
 which fingerprints result-affecting arguments, daily configs, event-file stats,
 and strategy/HBT implementation files.
+
+`HbtPairBacktester` now runs through the strategy-owned port in
+`arbitrage/execution_port.py`. `ReferenceExecutionAdapter` retains installed
+HftBacktest asset/queue/TIF/cancel behavior and exposes its raw backend only to
+the existing Numba scanner. `SlimExecutionAdapter` converts the same two asset
+configs to neutral `hftbacktest_slim.AssetConfig` values and maps neutral depth,
+latency, immediate-order, status, and lifecycle models. Common pair logic no
+longer depends on HBT constants or the slim HBT-compatible facade. A visible
+active slim FOK/IOC order is an invariant violation because passive cancel is
+outside the supported slim profile.
 
 Use `--strategy-engine python` as the reference/fallback path. Numba currently
 supports only the default future/spot strategy; a custom `Strategy` must use the
@@ -247,8 +269,14 @@ Current HBT full-market path:
 - `arbitrage_config_base.json`: non-secret template config used by the daily
   config builder. Generated daily configs are written under the output
   directory.
-- `arbitrage/hbt_backtest.py`: pair-level HBT strategy simulation and latency
-  event capture. It accepts a root-interface-compatible strategy object.
+- `arbitrage/hbt_backtest.py`: pair-level strategy simulation and latency event
+  capture through the execution port. It accepts a root-interface-compatible
+  strategy object.
+- `arbitrage/execution_port.py`: minimal engine-neutral clock, BBO, latency,
+  immediate-order, response, cleanup, and lifecycle protocol.
+- `arbitrage/reference_execution.py`: installed HftBacktest construction,
+  strict TIF/side mapping, queue/cancel behavior, and Numba backend boundary.
+- `arbitrage/slim_execution.py`: direct neutral `hftbacktest_slim` consumer.
 - `arbitrage/strategy_adapter.py`: futures/spot implementation of
   `scripts.strategy_api`.
 - `arbitrage/daily_pipeline.py`: date selection, path resolution, daily pair
@@ -312,7 +340,16 @@ trades, summary = backtester.run()
 ```
 
 For non-futures/spot strategy families, create a separate implementation folder
-and adapt to `scripts.strategy_api` instead of importing `future_spot`.
+and use the neutral slim API or adapt to `scripts.strategy_api` instead of
+importing `future_spot`. `examples/slim_two_asset_strategy/` is the small,
+synthetic-Arrow, clocked FOK example. Deprecated migration imports are removed;
+only the neutral package API is supported.
+
+Because the execution port, adapters, and final package-owned implementation
+selection are result-defining sources, their migration changes
+`backtest_manifest.json` fingerprints and intentionally invalidates old result
+caches. Compact schema `bbo_v1`, compact builder version 2, native ABI 1,
+matching semantics, and persisted result schemas are unchanged.
 
 ## Latest Run Snapshot
 
