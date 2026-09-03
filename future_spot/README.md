@@ -43,8 +43,10 @@ notebook and `run_full_backtest.py` save:
 - report CSVs under the selected output directory's `reports/` folder;
 - five PNG charts under its `figures/` folder.
 
-Install from and start Jupyter at the repository root so the kernel resolves
-the editable src-layout package rather than relying on a notebook path shim:
+Install from the repository root so the kernel resolves the slim src-layout
+package through the editable installation. The notebook only exposes the
+validated repository root for the repository-owned `future_spot` and `scripts`
+packages; it never adds `hftbacktest_slim/src` directly:
 
 ```bash
 python3 -m pip install -e ./hftbacktest_slim

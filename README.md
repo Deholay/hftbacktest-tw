@@ -24,7 +24,7 @@ queue model 實驗、新策略原型，以及透過新版 `hftbacktest_slim` pac
 | 因資金不足遭拒的進場 | 4,021 筆，共 29 天 |
 | 接受出場 | 4,179 |
 
-![期現貨已實現損益投資組合總覽](docs/assets/futures-spot-portfolio-overview-20260101-20260731.png)
+![期現貨已實現損益投資組合總覽](docs/figure/futures-spot-portfolio-overview-20260101-20260731.png)
 
 這是模擬研究結果，不代表實盤績效。資金重播共用 NT$50M，並停用槓桿：現貨與
 期貨皆按名目金額的 100% 計入資金占用，且各自上限為 NT$25M；未納入未平倉部位
