@@ -5,10 +5,16 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from hftbacktest_slim import BBO_SCHEMA, COMPACT_SCHEMA_VERSION
-from hftbacktest_slim.engine.arrow_reader import SLIM_ROW_DTYPE
-from hftbacktest_slim.market_data.audit import compact_partition_audit
-from hftbacktest_slim.market_data.normalize import normalized_bbo_from_depth_columns
+from hftbacktest_slim import (
+    BBO_SCHEMA,
+    COMPACT_SCHEMA_VERSION,
+    aggregate_depth_side,
+    normalized_bbo_from_depth_columns,
+)
+from hftbacktest_slim.market_data import (
+    SLIM_ROW_DTYPE,
+    compact_partition_audit,
+)
 from hftbacktest_slim.market_data.schema import PHYSICAL_FIELDS
 
 
@@ -98,6 +104,7 @@ def test_normalization_preserves_locked_and_crossed_best_prices() -> None:
 def test_reference_converter_uses_the_package_normalization_object() -> None:
     from scripts import tw_stock_data_to_npz as converter
 
+    assert converter.aggregate_depth_side is aggregate_depth_side
     assert converter.normalized_bbo_from_depth_columns is normalized_bbo_from_depth_columns
 
 

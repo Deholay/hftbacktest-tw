@@ -19,8 +19,14 @@ from future_spot.arbitrage.hbt_types import HbtPairBacktestConfig
 from future_spot.arbitrage.models import PairConfig
 from future_spot.arbitrage.reference_execution import ReferenceExecutionAdapter
 from future_spot.arbitrage.slim_execution import SlimExecutionAdapter
-from hftbacktest_slim import AssetConfig, EngineClosedError, OrderStatus, Side, TimeInForce
-from hftbacktest_slim.market_data import BBO_SCHEMA
+from hftbacktest_slim import (
+    AssetConfig,
+    BBO_SCHEMA,
+    EngineClosedError,
+    OrderStatus,
+    Side,
+    TimeInForce,
+)
 from scripts.compact_hbt_adapter import compact_to_reference_events
 from scripts.hbt_types import HbtAssetConfig
 from scripts.strategy_api import StrategyDecision
@@ -184,14 +190,14 @@ def test_reference_adapter_construction_mapping_and_close(tmp_path: Path) -> Non
     adapter.close()
 
 
-def test_active_future_spot_slim_path_has_no_compatibility_imports() -> None:
+def test_active_future_spot_slim_path_uses_only_the_neutral_root_api() -> None:
     root = Path(__file__).resolve().parents[1] / "future_spot" / "arbitrage"
     selected = [
         root / "hbt_backtest.py",
         root / "execution_port.py",
         root / "slim_execution.py",
     ]
-    violations: list[str] = []
+    package_imports: list[str] = []
     for path in selected:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -201,9 +207,9 @@ def test_active_future_spot_slim_path_has_no_compatibility_imports() -> None:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 modules.append(node.module)
             for module in modules:
-                if module == "scripts.slim_engine" or module.startswith("hftbacktest_slim.compat"):
-                    violations.append(f"{path.name}: {module}")
-    assert violations == []
+                if module.partition(".")[0] == "hftbacktest_slim":
+                    package_imports.append(module)
+    assert package_imports == ["hftbacktest_slim"]
 
 
 def test_reference_pair_module_import_does_not_load_slim_package() -> None:

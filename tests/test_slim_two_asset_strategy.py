@@ -2,18 +2,12 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-import sys
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-PACKAGE_SOURCE = Path(__file__).resolve().parents[1] / "hftbacktest_slim" / "src"
-if str(PACKAGE_SOURCE) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_SOURCE))
-
 from examples.slim_two_asset_strategy import CrossedMarketProbe
-from hftbacktest_slim import AssetConfig, OrderStatus
-from hftbacktest_slim.market_data import BBO_SCHEMA
+from hftbacktest_slim import AssetConfig, BBO_SCHEMA, OrderStatus
 
 
 def _write_partition(path: Path, rows: list[tuple]) -> Path:
@@ -63,7 +57,6 @@ def test_second_strategy_uses_its_own_clock_and_neutral_order(tmp_path: Path) ->
 
 def test_second_strategy_import_boundary() -> None:
     root = Path(__file__).resolve().parents[1] / "examples" / "slim_two_asset_strategy"
-    forbidden = ("future_spot", "scripts.slim_engine", "hftbacktest_slim.compat")
     violations: list[str] = []
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -74,6 +67,9 @@ def test_second_strategy_import_boundary() -> None:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 modules.append(node.module)
             for module in modules:
-                if any(module == name or module.startswith(f"{name}.") for name in forbidden):
+                if module.partition(".")[0] == "future_spot" or (
+                    module.partition(".")[0] == "hftbacktest_slim"
+                    and module != "hftbacktest_slim"
+                ):
                     violations.append(f"{path.relative_to(root)}: {module}")
     assert violations == []

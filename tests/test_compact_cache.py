@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 import polars as pl
 
-from scripts.compact_cache import (
+from hftbacktest_slim import (
     BBO_SCHEMA,
     CompactBuildConfig,
     CompactCacheBudgetError,

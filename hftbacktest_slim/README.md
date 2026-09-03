@@ -1,7 +1,7 @@
 # hftbacktest-slim
 
 `hftbacktest-slim` is the project-owned, strategy-neutral compact-BBO data and
-replay runtime. Version `0.3.0a2` includes the Phase 5 consumer boundary: the canonical
+replay runtime. Version `0.3.0` is the stable Phase 6 public boundary: the canonical
 schema/native dtype, Top-5 normalization, timestamp ordering, audit, streaming
 cache builder, manifest validation, sidecars, resource controls, publication,
 reader, compact CLIs, and neutral engine API live in this standalone package,
@@ -80,6 +80,12 @@ from hftbacktest_slim import (
 )
 ```
 
+The lazy root API also exposes `aggregate_depth_side` and
+`normalized_bbo_from_depth_columns` for converters. The documented
+`hftbacktest_slim.market_data` subpackage exposes `compact_partition_audit` and
+schema/dtype constants for reference adapters. Binding, FFI, hashing,
+manifest-publication, and temporary file helpers remain internal.
+
 `COMPACT_SCHEMA_VERSION` remains `bbo_v1`. Its physical Arrow IPC File/Feather
 V2 fields are fixed and nullable in this exact order:
 
@@ -117,7 +123,7 @@ sidecars, writes the date manifest last, then atomically publishes. Failures
 clean only that incomplete temporary date; completed cache, raw inputs, and
 results are never automatically deleted.
 
-Installable package commands retain the legacy arguments and JSON shapes:
+Installable package commands retain the established arguments and auditable JSON shapes:
 
 ```bash
 hftbacktest-slim-build-cache \
@@ -158,35 +164,33 @@ cargo build --workspace --release
 
 On Linux x86-64 this produces `target/release/libhbt_slim.so`.
 
-## Compatibility and remaining migration work
+## Phase 6 import migration
 
-The primary futures/spot slim path no longer imports the legacy
-`scripts.slim_engine` path or `hftbacktest_slim.compat.hbt`. It constructs
-neutral `AssetConfig` values and uses `SlimEngine`, `Side`, `TimeInForce`, and
-`OrderStatus` through `future_spot`'s execution adapter. An independent example
-under `examples/slim_two_asset_strategy/` also uses only the neutral public API.
+Deprecated HBT-shaped imports, root compact re-exports, root compact CLI
+delegates, and the old native crate location are removed. Use these supported
+replacements:
 
-`scripts.slim_engine` remains an import-only wrapper around
-`hftbacktest_slim.compat.hbt`, which preserves HBT-shaped methods, numeric
-constants, integer return codes, order mapping behavior, and historical no-op
-cancel/clear calls for compatibility tests and callers not yet migrated. It is
-not an extension surface; new strategies must use the neutral API.
+| Removed location | Supported replacement |
+| --- | --- |
+| `scripts.slim_engine` | `from hftbacktest_slim import AssetConfig, SlimEngine, Side, TimeInForce, OrderStatus` |
+| `hftbacktest_slim.compat.hbt` | The same neutral root API; HBT-shaped names and integer-return methods are removed |
+| `scripts.compact_cache` | `from hftbacktest_slim import BBO_SCHEMA, CompactBuildConfig, CompactCacheStore, CompactSource` |
+| `scripts/build_compact_cache.py` | `python -m hftbacktest_slim.cli.build_cache` or `hftbacktest-slim-build-cache` |
+| `scripts/benchmark_compact_read.py` | `python -m hftbacktest_slim.cli.benchmark_read` or `hftbacktest-slim-benchmark-read` |
+| `crates/hbt_slim` | `hftbacktest_slim/native` |
 
-The wrapper contains a temporary repository-local `src/` path bootstrap so the
-existing uninstalled checkout continues to run. Phase 6 owns removal after all
-remaining callers migrate.
-
-`scripts.compact_cache` is now an import-only re-export and
-`scripts/build_compact_cache.py` plus `scripts/benchmark_compact_read.py` are
-thin CLI delegates. They emit no worker deprecation warnings. The explicit
+There is no HBT compatibility namespace in the installed package. The explicit
 reference-HftBacktest bridge remains outside the package at
-`scripts/compact_hbt_adapter.py`; it imports the package schema but the package
-never imports it. Strategy pricing, execution policy, carry, capital, and
-reporting remain outside this package. Phase 5 changes result implementation
-fingerprints and therefore invalidates old result manifests; compact-cache
-identity is unchanged. Full-date, complete-month, and multi-date carry parity
-were validated on mounted March 2026 market data and are recorded in the
-migration inventory; this integration refactor makes no performance claim.
+`scripts/compact_hbt_adapter.py`; it imports the package schema/cache contract,
+while the package never imports the adapter or third-party HftBacktest.
+Strategy pricing, execution policy, carry, capital, and reporting remain
+outside this package.
+
+The final result implementation fingerprint selection intentionally invalidates
+older result manifests. Compact-cache identity is unchanged because schema
+`bbo_v1`, builder version `2`, and the compact implementation are unchanged.
+Full-date, complete-month, and multi-date carry parity are recorded in
+`PHASE0_INVENTORY.md`; Phase 6 makes no performance claim.
 
 ## Installation
 
@@ -196,3 +200,24 @@ PyArrow:
 ```bash
 python3 -m pip install /path/to/hftbacktest_slim
 ```
+
+Repository workflows install the same package in editable mode through the
+root `requirements.txt`; they do not mutate `sys.path` to expose the `src`
+tree. Offline validation may add `--no-index --no-deps --no-build-isolation`
+when `setuptools>=68` and the runtime dependencies are already present.
+
+Native artifacts are intentionally built separately and are not embedded in
+the source distribution or wheel. A standalone copy builds into its own tree
+and selects that exact artifact as follows:
+
+```bash
+cd /path/to/hftbacktest_slim
+cargo build --manifest-path native/Cargo.toml --release --target-dir target
+export HFTBACKTEST_SLIM_LIBRARY="$PWD/target/release/libhbt_slim.so"
+python3 -c 'from hftbacktest_slim import AssetConfig, SlimEngine; print(SlimEngine)'
+```
+
+Passing the same absolute path as `SlimEngine(..., library_path=...)` takes
+priority over the environment. This source-tree build does not require the
+repository Cargo workspace, an old native directory, root slim scripts, or the
+third-party `hftbacktest` package.

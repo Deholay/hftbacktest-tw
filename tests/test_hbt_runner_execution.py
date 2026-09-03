@@ -19,7 +19,7 @@ from future_spot.arbitrage.full_market_runner import (
     run_backtests,
 )
 from future_spot.arbitrage.models import PairConfig
-from scripts.compact_cache import BBO_SCHEMA
+from hftbacktest_slim import BBO_SCHEMA
 
 
 def _pair(name: str) -> PairConfig:
@@ -144,35 +144,53 @@ class PersistentExecutorTest(unittest.TestCase):
 
         self.assertEqual(selected, expected)
         self.assertTrue(all(path.is_file() for path in selected))
-        self.assertNotIn(
-            Path(__file__).resolve().parents[1] / "scripts" / "slim_engine.py",
-            _hbt_implementation_paths(),
-        )
-        self.assertIn(
-            Path(__file__).resolve().parents[1] / "scripts" / "compact_cache.py",
-            _hbt_implementation_paths(),
-        )
+        implementation_paths = _hbt_implementation_paths()
+        self.assertTrue(all(path.is_file() for path in implementation_paths))
         arbitrage_root = Path(__file__).resolve().parents[1] / "future_spot" / "arbitrage"
         for name in (
+            "capital.py",
+            "config.py",
             "execution_port.py",
             "reference_execution.py",
             "slim_execution.py",
             "hbt_backtest.py",
+            "hbt_helpers.py",
+            "hbt_numba.py",
+            "hbt_rows.py",
+            "hbt_types.py",
+            "models.py",
+            "position_carry.py",
             "strategy.py",
             "strategy_adapter.py",
+            "ticks.py",
+            "utils.py",
         ):
             self.assertIn(arbitrage_root / name, _hbt_implementation_paths())
+        scripts_root = Path(__file__).resolve().parents[1] / "scripts"
+        for name in (
+            "daily_result_store.py",
+            "hbt_common.py",
+            "hbt_types.py",
+            "io_utils.py",
+            "strategy_api.py",
+        ):
+            self.assertIn(scripts_root / name, _hbt_implementation_paths())
 
         reference_event_paths = _hbt_implementation_paths("reference", "event_npz")
-        self.assertNotIn(package_root / "compat" / "hbt.py", reference_event_paths)
         self.assertFalse(
             any(path.is_relative_to(package_root / "engine") for path in reference_event_paths)
+        )
+        self.assertNotIn(
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "compact_hbt_adapter.py",
+            _hbt_implementation_paths("slim", "compact"),
         )
         self.assertIn(
             Path(__file__).resolve().parents[1]
             / "scripts"
             / "compact_hbt_adapter.py",
-            _hbt_implementation_paths(),
+            _hbt_implementation_paths("reference", "compact"),
         )
 
     def test_compact_missing_date_preserves_reference_error_path(self) -> None:

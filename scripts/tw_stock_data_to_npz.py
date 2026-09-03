@@ -46,12 +46,8 @@ import numpy as np
 from numba import njit
 
 
-_SLIM_PACKAGE_SOURCE = Path(__file__).resolve().parents[1] / "hftbacktest_slim" / "src"
-if str(_SLIM_PACKAGE_SOURCE) not in sys.path:
-    sys.path.insert(0, str(_SLIM_PACKAGE_SOURCE))
-
-from hftbacktest_slim.market_data.normalize import (  # noqa: E402
-    _aggregate_depth_side,
+from hftbacktest_slim import (  # noqa: E402
+    aggregate_depth_side,
     normalized_bbo_from_depth_columns,
 )
 
@@ -1164,7 +1160,7 @@ def _fill_events_from_columns(
                 trade_events += 1
 
         if emit_depth:
-            bid_count = _aggregate_depth_side(
+            bid_count = aggregate_depth_side(
                 bid_prices,
                 bid_quantities,
                 row,
@@ -1199,7 +1195,7 @@ def _fill_events_from_columns(
                     depth_events += 1
                 replay_best_bid = work_prices[0]
 
-            ask_count = _aggregate_depth_side(
+            ask_count = aggregate_depth_side(
                 ask_prices,
                 ask_quantities,
                 row,

@@ -63,8 +63,8 @@ import hftbacktest_slim
 repository = pathlib.Path({str(REPOSITORY_ROOT)!r}).resolve()
 cwd = pathlib.Path.cwd().resolve()
 assert cwd != repository and repository not in cwd.parents
-assert hftbacktest_slim.__version__ == "0.3.0a2"
-assert importlib.metadata.version("hftbacktest-slim") == "0.3.0a2"
+assert hftbacktest_slim.__version__ == "0.3.0"
+assert importlib.metadata.version("hftbacktest-slim") == "0.3.0"
 assert hftbacktest_slim.AssetConfig("0050", "0050.arrow", 0.05).symbol == "0050"
 forbidden = sorted(
     name

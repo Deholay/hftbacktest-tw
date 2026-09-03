@@ -1,13 +1,15 @@
 # Futures/Spot Backtest Test Runner
 
-This folder contains the thin notebook and the reusable scripts behind it:
+This folder contains the reusable support modules behind the root notebook and
+the command-line runner:
 
 - `backtest_config.py`: notebook defaults and path normalization.
 - `backtest_pipeline.py`: daily configs, event conversion, HBT, and core CSVs.
 - `report_tables.py`: profit, failure, cash/ROI, and latency CSV reports.
 - `report_plots.py`: five PNG report figures.
 - `run_full_backtest.py`: one-command entrypoint for the complete workflow.
-- `hbt_pair_backtest_visualization.ipynb`: step-by-step interactive runner.
+- `../../notebooks/hbt_pair_backtest_visualization.ipynb`: step-by-step
+  interactive runner using the installed neutral `hftbacktest_slim` package.
 
 Run the whole workflow from the repository root:
 

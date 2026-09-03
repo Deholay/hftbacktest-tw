@@ -16,11 +16,11 @@ The active performance direction is defined in
 loading, compact-cache formats, matching behavior, multiprocessing, carry,
 result persistence, or benchmark claims.
 
-The extraction of reusable slim-engine components into
+The completed extraction of reusable slim-engine components into
 `hftbacktest_slim/` is governed by `HFTBACKTEST_SLIM_MIGRATION.md`. Read it
-before moving, adding, or importing slim runtime, native matching, compact BBO,
-or compatibility code. For package location, ownership, and dependency
-direction, the migration document supersedes older locations described in the
+before moving, adding, or importing slim runtime, native matching, or compact
+BBO code. For package location, ownership, and dependency direction, the
+migration document supersedes historical locations described in the
 acceleration strategy. The acceleration strategy remains authoritative for
 market-data, scheduler, matching, latency, cache, parity, and benchmark
 semantics.
@@ -52,8 +52,8 @@ time, peak RSS, and disk growth.
   public API, compact BBO schema, normalization, readers, cache builder,
   manifests, validation, and slim-specific command-line tools.
 - New slim runtime code must not be added to root `scripts/`, root `crates/`,
-  or a strategy package. Existing slim code in those locations is migration
-  source code and must move according to `HFTBACKTEST_SLIM_MIGRATION.md`.
+  or a strategy package. The Phase 6 migration removed the transitional slim
+  wrappers and old native location; do not recreate them.
 - `hftbacktest_slim` must not import `future_spot`, another strategy package,
   `scripts.hbt_*`, `scripts.tw_stock_*`, or the installed `hftbacktest`
   package. Enforce this with an automated dependency-boundary test.
@@ -77,9 +77,8 @@ time, peak RSS, and disk growth.
 - Never make a new strategy family import `future_spot` for reusable
   behavior. Promote clean slim-runtime behavior to `hftbacktest_slim` and
   other domain-neutral behavior to root `scripts/` first.
-- New strategies must use the neutral `hftbacktest_slim` public API, not the
-  transitional HBT-compatible facade. Compatibility modules exist only to
-  migrate current consumers and must not become a new extension surface.
+- New strategies must use the neutral `hftbacktest_slim` public API. Removed
+  HBT-shaped compatibility imports are not an extension surface.
 - Keep notebooks thin. Reusable conversion, execution, analytics, and plotting
   logic belongs in Python modules.
 - Keep `future_spot/scripts/` as thin CLI entrypoints. Business logic belongs
@@ -115,7 +114,7 @@ behavioral comparison and unsupported modes.
 - `HFTBACKTEST_SLIM_MIGRATION.md`: authoritative package-boundary, dependency,
   relocation, compatibility, versioning, and migration acceptance plan for
   `hftbacktest_slim`.
-- `hftbacktest_slim/`: target home for the shared Python/Rust slim runtime,
+- `hftbacktest_slim/`: current home for the shared Python/Rust slim runtime,
   compact BBO data layer, and stable backend-facing API.
 - `scripts/tw_stock_data_to_npz.py`: source rows to HftBacktest event arrays
   or `.npz` files for the reference path.
@@ -130,6 +129,9 @@ behavioral comparison and unsupported modes.
   `notebooks/hftbacktest_TWStockFuture.ipynb`: daily-parquet runners.
 - `notebooks/hbt_strategy_interface_example.ipynb`: cross-strategy adapter
   example.
+- `notebooks/hbt_pair_backtest_visualization.ipynb`: thin futures/spot report
+  runner that uses the installed neutral slim package and delegates strategy
+  behavior to `future_spot`.
 
 ### Futures/spot implementation
 
@@ -415,8 +417,8 @@ are intentionally absent from `requirements.txt`.
    and report consumer before editing a result-defining path.
 2. Read `HBT_ACCELERATION_STRATEGY.md` and identify the affected phase,
    semantic baseline, and acceptance gate.
-3. For any slim extraction, package API, native matcher, compact BBO, or slim
-   compatibility change, also read `HFTBACKTEST_SLIM_MIGRATION.md` and identify
+3. For any slim package API, native matcher, compact BBO, or package-boundary
+   change, also read `HFTBACKTEST_SLIM_MIGRATION.md` and identify
    the migration phase and dependency boundary affected.
 4. Keep changes inside the correct architectural layer. Do not combine a file
    relocation with an unversioned semantic change.
@@ -439,12 +441,12 @@ are intentionally absent from `requirements.txt`.
 Python validation baseline:
 
 ```bash
-python3 -m pytest -q tests future_spot/test
-python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py future_spot/test/*.py
+python3 -m pytest -q tests future_spot/test hftbacktest_slim/tests
+python3 -m compileall -q scripts future_spot hftbacktest_slim/src/hftbacktest_slim
 git diff --check
 ```
 
-When a Rust workspace is added:
+Rust validation:
 
 ```bash
 cargo test --workspace

@@ -1,3 +1,6 @@
+# Project-owned slim runtime (run this requirements install from the repository root).
+-e ./hftbacktest_slim
+
 # Core numeric/data stack.
 numpy>=2.0,<2.3
 numba>=0.61

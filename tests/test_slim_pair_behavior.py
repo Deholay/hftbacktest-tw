@@ -10,7 +10,7 @@ import pytest
 from future_spot.arbitrage.hbt_backtest import HbtPairBacktester
 from future_spot.arbitrage.hbt_types import HbtPairBacktestConfig
 from future_spot.arbitrage.models import PairConfig
-from scripts.compact_cache import BBO_SCHEMA
+from hftbacktest_slim import BBO_SCHEMA
 from scripts.hbt_types import HbtAssetConfig
 
 

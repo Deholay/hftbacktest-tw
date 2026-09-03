@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -13,10 +12,6 @@ from typing import Any
 import numpy as np
 import polars as pl
 import pyarrow as pa
-
-_PACKAGE_SOURCE = Path(__file__).resolve().parents[1] / "hftbacktest_slim" / "src"
-if str(_PACKAGE_SOURCE) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_SOURCE))
 
 from hftbacktest_slim import COMPACT_SCHEMA_VERSION  # noqa: E402
 from scripts.tw_stock_data_to_npz import (

@@ -2,10 +2,9 @@
 
 ## Status and decision
 
-The slim engine is expected to serve multiple strategy families. Its reusable
-runtime must therefore be extracted from the current root `scripts/`, root
-`crates/`, and `future_spot` integration locations into a self-contained
-root-level package:
+Implementation status (2026-09-03): **Phases 0–6 complete**. The reusable slim
+runtime has been extracted from its historical root and strategy integration
+locations into the self-contained root-level package:
 
 ```text
 ROOT/hftbacktest_slim/
@@ -52,7 +51,8 @@ hftbacktest_slim
     ^
     |-- future_spot strategy adapter
     |-- another strategy adapter
-    `-- backend or strategy runner
+    |-- backend or strategy runner
+    `-- reference compact adapter
 
 reference HftBacktest <--- parity/compatibility tests ---> hftbacktest_slim
 ```
@@ -72,7 +72,7 @@ PyArrow are allowed. A package-boundary test must inspect imports and fail on a
 forbidden dependency. A subprocess smoke test must also prove that importing
 and opening the public API does not import the installed `hftbacktest` package.
 
-## Target package layout
+## Final package layout
 
 The exact module split may evolve, but ownership must follow this structure:
 
@@ -89,6 +89,9 @@ hftbacktest_slim/
 │       ├── errors.py
 │       ├── models.py
 │       ├── version.py
+│       ├── cli/
+│       │   ├── build_cache.py
+│       │   └── benchmark_read.py
 │       ├── engine/
 │       │   ├── binding.py
 │       │   ├── replay.py
@@ -115,9 +118,6 @@ hftbacktest_slim/
 │       ├── matcher.rs
 │       ├── engine.rs
 │       └── ffi.rs
-├── cli/
-│   ├── build_cache.py
-│   └── benchmark_read.py
 └── tests/
 ```
 
@@ -154,9 +154,12 @@ modules must not be treated as backend contracts.
   schema, but slim must not import it.
 - Cross-engine parity tools and fixtures that intentionally import both sides.
 
-## Current-to-target relocation map
+## Historical old-to-final relocation map
 
-| Current location | Target or action |
+The left column records pre-migration locations only; none is supported after
+Phase 6.
+
+| Historical location | Final location or action |
 | --- | --- |
 | `crates/hbt_slim/Cargo.toml` | Move to `hftbacktest_slim/native/Cargo.toml`; update the root Cargo workspace member. |
 | `crates/hbt_slim/src/lib.rs` | Move and split under `hftbacktest_slim/native/src/` without changing behavior. |
@@ -191,10 +194,11 @@ The neutral engine API should provide current time, bounded clock advancement,
 BBO/depth views, feed and order latency, immediate order submission, response
 waiting, order lookup, and explicit close/context-manager behavior.
 
-Do not expose HftBacktest names as the primary contract. `SlimBacktest`,
-`SlimHbtConstants`, `submit_buy_order`, and similar HBT-shaped APIs may exist
-temporarily under an explicit compatibility namespace for current consumers.
-New strategy code must use neutral enums and `submit_order`-style methods.
+HftBacktest names are not part of the final contract. During Phases 1–5,
+`SlimBacktest`, `SlimHbtConstants`, `submit_buy_order`, and similar HBT-shaped
+APIs existed temporarily under an explicit compatibility namespace; Phase 6
+removed them. New strategy code must use neutral enums and
+`submit_order`-style methods.
 
 The public API must document the supported profile:
 
@@ -238,7 +242,7 @@ does not load `hftbacktest`, `future_spot`, or root HBT helpers.
 Implementation status (2026-09-02): **complete**. The crate is owned by
 `hftbacktest_slim/native/`, its C ABI and root Cargo target path are unchanged,
 and the Phase 2 Rust, ctypes-binding, pair-parity, manifest-fingerprint, and
-package-boundary gates pass. Phases 3 through 6 remain pending.
+package-boundary gates pass. Later phases are now complete.
 
 - Relocate the Rust crate under `hftbacktest_slim/native/`.
 - Split types, book, scheduler, matcher, engine, and FFI by responsibility.
@@ -253,9 +257,9 @@ exactly.
 
 Implementation status (2026-09-02): **complete**. The neutral Python engine,
 ctypes ABI binding, compact Arrow row reader, immutable runtime models, native
-library discovery, HBT compatibility facade, and legacy import-only wrapper
-are package-owned. Native ABI/matching behavior and compact-cache ownership are
-unchanged; Phases 4 through 6 remain pending.
+library discovery, then-transitional HBT facade, and then-legacy wrapper were
+package-owned at this checkpoint. Native ABI/matching behavior and compact-cache
+ownership were unchanged; later phases are now complete.
 
 - Move ctypes structs, signatures, library loading, Arrow row reading, depth
   and order views, and engine lifecycle.
@@ -278,7 +282,7 @@ converter imports the package normalization implementation. Builder-version-1
 caches and the relocated implementation fingerprint invalidate
 conservatively. Physical schema, native ABI, Rust/engine versions, matching,
 strategy, carry, capital, and reporting semantics are unchanged. Phases 5 and
-6 remain pending.
+6 are now complete.
 
 - Move schema, normalization, ordering, builder, reader, manifest, sidecars,
   disk checks, and atomic publication.
@@ -301,7 +305,7 @@ five-pair parity gates pass. A 42-pair complete date and the full 22-trading-day
 March 2026 month (638 daily pairs) also pass exact semantic-table parity with
 carry enabled and zero errors. Result implementation
 manifests invalidate because adapter sources changed, while compact identities,
-versions, matching, and output schemas do not. Phase 6 remains pending.
+versions, matching, and output schemas do not. Phase 6 is now complete.
 
 - Make `future_spot` the first adapter using the neutral public API.
 - Move only generic compact audit/build behavior out of the full-market runner.
@@ -316,24 +320,33 @@ semantic baseline.
 
 ### Phase 6: remove transitional locations
 
-- Keep old modules as import-only wrappers while current callers migrate.
-- Do not maintain duplicate implementations in old and new paths.
-- The old `crates/hbt_slim` native location was removed in Phase 2. Remove the
-  remaining Python wrappers only after repository imports, docs, notebooks,
-  tests, manifests, and build commands use the new package.
+Implementation status (2026-09-03): **complete**. All active consumers and
+tests use the neutral package API. The root engine/cache wrappers, root compact
+CLI delegates, package HBT compatibility namespace, compatibility-only tests,
+and old native location are absent. Reference compact reconstruction remains in
+`scripts/compact_hbt_adapter.py`. Root setup installs the src-layout package,
+and package-owned module/console CLIs are the supported compact commands.
+
+The Python package is stable version `0.3.0`. Native ABI `1`, Rust crate
+`0.2.0`, engine `rust-0.2.0`, compact schema `bbo_v1`, builder `2`, strict TIF,
+strategy clock, and persisted schemas are unchanged. Result manifests
+intentionally invalidate because deleted paths were removed from active source
+selection; compact identities do not invalidate solely due to wrapper removal.
+
+No external-data gate remains pending: Phase 5 already passed a complete
+42-pair date and the 22-trading-day March 2026, 638-pair parity rollout with
+carry and zero errors. Phase 6 reuses that semantic evidence and adds clean
+package/install/build/search gates; it does not claim a new performance result.
 
 Gate: repository search finds no runtime import of old slim locations, and a
 clean build/test run succeeds without them.
 
-## Compatibility policy
+## Historical compatibility and removal policy
 
-- Compatibility wrappers must re-export or delegate to one implementation;
-  they must not fork logic.
-- New strategy code must not import compatibility wrappers.
-- Deprecation warnings may be added only when they do not pollute worker output
-  or persisted audit artifacts.
-- Remove wrappers in a separately reviewable change after all consumers are
-  migrated.
+- During Phases 1–5, wrappers delegated to one implementation and never forked
+  logic.
+- Phase 6 removed those deprecated imports after every active consumer moved.
+- Do not recreate compatibility aliases for new strategy code.
 - The reference compact adapter remains supported and is not considered a
   transitional slim wrapper.
 
@@ -363,8 +376,8 @@ Focused validation must include:
 cargo test --workspace
 cargo fmt --check --all
 cargo clippy --workspace --all-targets -- -D warnings
-python3 -m pytest -q tests future_spot/test
-python3 -m py_compile scripts/*.py future_spot/arbitrage/*.py future_spot/scripts/*.py future_spot/test/*.py
+python3 -m pytest -q tests future_spot/test hftbacktest_slim/tests
+python3 -m compileall -q scripts future_spot hftbacktest_slim/src/hftbacktest_slim
 git diff --check
 ```
 

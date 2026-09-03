@@ -121,8 +121,9 @@ def resolve_library_path(
             return resolved
     rendered = ", ".join(str(path) for path in attempted)
     raise NativeLibraryNotFoundError(
-        "slim native library was not found; build it with "
-        f"'cargo build --workspace --release' or set {LIBRARY_ENVIRONMENT_VARIABLE}. "
+        "slim native library was not found; build from the package project with "
+        "'cargo build --manifest-path native/Cargo.toml --release --target-dir target' "
+        f"and set {LIBRARY_ENVIRONMENT_VARIABLE}, or build the repository workspace. "
         f"Checked: {rendered}"
     )
 

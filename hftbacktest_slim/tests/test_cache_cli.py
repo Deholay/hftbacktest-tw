@@ -6,7 +6,6 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import hftbacktest_slim
 from hftbacktest_slim.cli import benchmark_read, build_cache
 
 
@@ -26,35 +25,7 @@ def _raw(path: Path) -> None:
     pq.write_table(pa.table(values), path)
 
 
-def test_old_import_path_reexports_exact_package_objects() -> None:
-    from scripts import compact_cache as legacy
-
-    for name in (
-        "BBO_SCHEMA",
-        "COMPACT_BUILDER_VERSION",
-        "COMPACT_SCHEMA_VERSION",
-        "CompactBuildConfig",
-        "CompactCacheBudgetError",
-        "CompactCacheError",
-        "CompactCacheStore",
-        "CompactSource",
-    ):
-        assert getattr(legacy, name) is getattr(hftbacktest_slim, name)
-
-
-def test_old_cli_modules_are_direct_delegates() -> None:
-    from scripts import benchmark_compact_read as legacy_benchmark
-    from scripts import build_compact_cache as legacy_build
-
-    assert legacy_build.main is build_cache.main
-    assert legacy_build.parse_args is build_cache.parse_args
-    assert legacy_build.run is build_cache.run
-    assert legacy_benchmark.main is benchmark_read.main
-    assert legacy_benchmark.parse_args is benchmark_read.parse_args
-    assert legacy_benchmark.run is benchmark_read.run
-
-
-def test_package_build_and_benchmark_keep_legacy_json_shapes(tmp_path: Path) -> None:
+def test_package_build_and_benchmark_json_shapes(tmp_path: Path) -> None:
     raw = tmp_path / "daily.parquet"
     cache = tmp_path / "cache"
     _raw(raw)

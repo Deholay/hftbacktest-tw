@@ -25,11 +25,9 @@ PROJECT_ROOT = ARBITRAGE_ROOT.parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 ROOT_SCRIPT_ROOT = WORKSPACE_ROOT / "scripts"
 FUTURE_SPOT_SCRIPT_ROOT = PROJECT_ROOT / "scripts"
-SLIM_PACKAGE_SOURCE_ROOT = WORKSPACE_ROOT / "hftbacktest_slim" / "src"
 for path in (
     ROOT_SCRIPT_ROOT,
     FUTURE_SPOT_SCRIPT_ROOT,
-    SLIM_PACKAGE_SOURCE_ROOT,
     WORKSPACE_ROOT,
     PROJECT_ROOT,
 ):
@@ -2302,18 +2300,30 @@ def _hbt_implementation_paths(
     )
     return sorted(
         [
+            ARBITRAGE_ROOT / "capital.py",
+            ARBITRAGE_ROOT / "config.py",
             ARBITRAGE_ROOT / "hbt_backtest.py",
             ARBITRAGE_ROOT / "execution_port.py",
             ARBITRAGE_ROOT / "reference_execution.py",
             ARBITRAGE_ROOT / "slim_execution.py",
             ARBITRAGE_ROOT / "hbt_numba.py",
             ARBITRAGE_ROOT / "hbt_helpers.py",
+            ARBITRAGE_ROOT / "hbt_rows.py",
+            ARBITRAGE_ROOT / "hbt_types.py",
+            ARBITRAGE_ROOT / "models.py",
             ARBITRAGE_ROOT / "strategy.py",
             ARBITRAGE_ROOT / "strategy_adapter.py",
+            ARBITRAGE_ROOT / "ticks.py",
+            ARBITRAGE_ROOT / "utils.py",
             ARBITRAGE_ROOT / "position_carry.py",
+            ROOT_SCRIPT_ROOT / "daily_result_store.py",
+            ROOT_SCRIPT_ROOT / "hbt_common.py",
+            ROOT_SCRIPT_ROOT / "hbt_types.py",
+            ROOT_SCRIPT_ROOT / "io_utils.py",
+            ROOT_SCRIPT_ROOT / "strategy_api.py",
             *(
-                [ROOT_SCRIPT_ROOT / "compact_cache.py", ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py"]
-                if market_data_cache == "compact"
+                [ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py"]
+                if engine == "reference" and market_data_cache == "compact"
                 else []
             ),
             *slim_python_sources,

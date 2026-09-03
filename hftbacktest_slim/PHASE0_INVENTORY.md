@@ -694,3 +694,115 @@ Package `0.3.0a2`, Rust crate `0.2.0`, engine identity `rust-0.2.0`, native ABI
 `1`, `COMPACT_SCHEMA_VERSION = "bbo_v1"`, compact builder `2`, strict TIF
 semantics, strategy clock, matching behavior, and persisted output schema
 versions are unchanged. No performance benchmark or speed claim is made.
+
+## Phase 6 pre-cleanup audit
+
+The Phase 6 worktree began clean on branch `feat/extract_module` (five commits
+ahead of its configured upstream). `git status --short --branch` produced no
+tracked or untracked path entries, so the cleanup did not overlap unrelated
+user changes or generated outputs.
+
+The tracked-file audit used `git ls-files` plus `rg` across Python, Rust, TOML,
+shell, Markdown, JSON, YAML, and notebook JSON for the deprecated engine/cache
+imports, HBT-shaped names, old native/shared-library locations, and old compact
+commands. Matches were classified before deletion:
+
+| Classification | Pre-cleanup matches and decision |
+| --- | --- |
+| Active runtime consumer | None. `future_spot/arbitrage/slim_execution.py` already used the neutral root API. Repository-local src exposure in the full runner and reference conversion tools was installation scaffolding, not a runtime contract, and was removed. |
+| Active test | Root compact, pair, runner, and retained engine tests imported deprecated paths; they were migrated to the root package API. The second-strategy and adapter boundary tests contained deprecated names only as assertions and were rewritten to assert the positive neutral boundary. |
+| Active CLI/build configuration | Four root wrapper/delegate files remained. Root Cargo already named only `hftbacktest_slim/native`; no tracked old native crate file remained. The root requirements file did not yet install the src-layout package. |
+| Active manifest fingerprint | The future/spot result fingerprint still named the root compact wrapper. It was removed; the reference compact adapter is now selected only for reference compact reconstruction. Package compact identity never included the wrappers. |
+| Documentation requiring update | `AGENTS.md`, both architecture documents, root/package/future-spot READMEs, build/test commands, and Phase 6 status still described the transition. Notebook source cells contained no deprecated slim import or compact command. |
+| Historical migration record | The relocation map and phase-by-phase audit in this file and `HFTBACKTEST_SLIM_MIGRATION.md` intentionally retain old names as explicitly historical evidence. |
+| Generated output | Generated result/report trees were not edited. Notebook output references to “compatibility CSV” describe persisted report exports, not the removed slim API. |
+
+Phase 5 was rechecked before cleanup with:
+
+```bash
+PYTHONPATH=hftbacktest_slim/src .venv/bin/python -m pytest -q \
+  hftbacktest_slim/tests tests/test_execution_adapters.py \
+  tests/test_slim_pair_parity.py tests/test_slim_two_asset_strategy.py \
+  tests/test_hbt_runner_execution.py
+```
+
+It passed all 87 selected tests. The audit confirmed the direct futures/spot
+consumer, the independent two-asset strategy, exact focused parity coverage,
+builder `2`, schema `bbo_v1`, and the package dependency boundary before any
+wrapper was removed. A final pre-deletion Python/TOML/config search showed that
+the only remaining deprecated imports and HBT-shaped names were the retained
+root facade test, the package compatibility-only test, and the compatibility
+implementations themselves. The root facade test was first rewritten against
+`SlimEngine`; the compatibility-only test and implementations were then
+deleted with narrow file patches.
+
+## Phase 6 completion result
+
+Phase 6 is complete. The four root slim/cache wrappers and CLI delegates, the
+two compatibility-package modules, and two compatibility-only test modules
+were removed. Retained engine/cache/pair/runner tests now import the neutral
+root API. The reference bridge and validator remain under `scripts/`, import
+the package contract, and no longer expose the package through a runtime
+`sys.path` mutation. `future_spot` and the independent two-asset example use
+only supported neutral imports.
+
+The public root exports are deliberate and lazy. Converter normalization is
+available as `aggregate_depth_side` and `normalized_bbo_from_depth_columns`
+without changing the package-owned compact implementation files. The package
+is now `0.3.0`; native ABI `1`, Rust crate `0.2.0`, engine identity
+`rust-0.2.0`, schema `bbo_v1`, builder `2`, strict FOK/IOC semantics, strategy
+clock, and persisted result schemas remain unchanged.
+
+The pre-existing Phase 5 compact identity was checked directly against the
+final sources. Its builder/implementation SHA-256 remains
+`d2d775a64e0d7ad86d895e55c6c76959c05240db8151d6483d695b0e2b5072c0`,
+and its Top-5 normalization SHA-256 remains
+`1dc8b7507bd94f5764b198c6926a5be7384721125938d9c81879f0a2a562b019`.
+Thus wrapper removal does not invalidate completed compact cache. The result
+implementation selection now excludes deleted paths, fingerprints package
+runtime/compact/native sources plus both execution adapters, all direct pair
+execution/strategy dependencies, capital, carry, daily persistence, and shared
+root contracts, and adds the reference compact adapter only for reference
+compact reconstruction. This intentionally invalidates older result manifests.
+
+### Phase 6 validation
+
+| Exact command or check | Outcome |
+| --- | --- |
+| Focused pre-cleanup package, boundary, adapter, parity, second-strategy, and manifest tests | PASS: 87 tests before deletion. |
+| Focused final public API, dependency boundary, native loading, compact cache/CLI, adapters, parity, second strategy, manifests, and external install | PASS: 68 tests, followed by 37 final API/normalization/manifest tests after the last source edits. |
+| `cargo test --workspace` | PASS: 13 Rust tests and 0 doc-test failures. |
+| `cargo fmt --check --all` | PASS: no output. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS: no warnings. |
+| `cargo build --workspace --release` | PASS. |
+| `cargo build --manifest-path hftbacktest_slim/native/Cargo.toml --release` | PASS. |
+| Standalone copied package: `cargo build --manifest-path native/Cargo.toml --release --target-dir target` | PASS without a root workspace or historical native location. |
+| Offline copied-package install: `python3 -m pip install --no-index --no-deps --no-build-isolation --target <temporary> <copied-package>` | PASS: built and installed `hftbacktest-slim-0.3.0`; the installed Python package intentionally contained no `.so`. |
+| Offline editable install in a clean temporary virtual environment followed by an isolated external-cwd import | PASS: `0.3.0` resolved from the copied package `src` tree. |
+| Isolated installed-package engine smoke test with explicit standalone library path | PASS: package import loaded no HftBacktest, strategy, or root-script module; engine opened the exact copied-package artifact and advanced BBO data. |
+| `python3 -m pytest -q hftbacktest_slim/tests` | PASS: 64 retained package tests. |
+| `python3 -m pytest -q tests/test_slim_engine.py` | PASS: 2 neutral engine tests. |
+| `python3 -m pytest -q tests/test_slim_pair_parity.py` | PASS: exact synthetic pair parity. |
+| `python3 -m pytest -q tests/test_compact_cache.py` | PASS: 7 cache/reference reconstruction tests. |
+| `python3 -m pytest -q tests/test_hbt_runner_execution.py` | PASS: 7 runner/manifest/exclusion/persistence tests. |
+| `python3 -m pytest -q tests/test_daily_result_pipeline.py` | PASS: 2 date persistence/restart tests. |
+| Relevant source parity, converter, daily store/timings, comparison, Numba, carry, capital, exclusion, reporting, and replot tests | PASS: 49 tests. |
+| Reference-only adapter, custom strategy, and import-isolation selection without a native override | PASS: 3 tests; reference import did not load the slim package. |
+| `python3 -m pytest -q tests future_spot/test hftbacktest_slim/tests` against the final copied install/native build | PASS: 158 tests. |
+| `python3 -m compileall -q` over retained scripts, package, strategies, tests, and entrypoints with a temporary pycache prefix | PASS. |
+| Package module CLI help, both installed console-script help commands, and future/spot CLI help | PASS: exit status 0. Missing required cache-build arguments returned status 2. |
+| Final repository searches for deprecated imports/names, old native/workspace paths, old commands, manifest paths, duplicate ctypes binding, duplicate BBO normalization, and duplicate cache implementation | PASS: old names occur only in the explicitly historical migration document, this inventory, and the package README migration table; exactly one active binding, normalization implementation, and cache store remain. |
+| Phase 5 error artifacts | PASS: both root `run_errors.csv` files contain no data row and all 44 daily error Parquet partitions contain zero rows. |
+| `git diff --check` | PASS. |
+
+The repository `.venv` intentionally lacks `setuptools`, so the first
+`--no-build-isolation` editable-install attempt in that pre-existing
+environment could not import the build backend. This is not a package or gate
+failure: the clean temporary environment with local setuptools completed the
+offline editable install, and the system build tooling completed the offline
+wheel/target install. No network dependency was used.
+
+No new real-data run or performance benchmark was performed in Phase 6. The
+complete-date/month/carry semantic evidence above remains the applicable
+reference/slim rollout gate. No market-data, matching, latency, strategy,
+carry, capital, exclusion, persistence, or reporting behavior changed.

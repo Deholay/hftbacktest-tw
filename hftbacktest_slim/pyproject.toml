@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hftbacktest-slim"
-version = "0.3.0a2"
+version = "0.3.0"
 description = "Neutral package boundary for the project-owned slim BBO replay runtime"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "hftbacktest-slim maintainers" }]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]

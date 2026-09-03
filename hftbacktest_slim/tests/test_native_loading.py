@@ -74,7 +74,10 @@ def test_missing_library_error_is_typed_and_lists_resolution_help(
     monkeypatch.setattr(
         binding, "development_library_path", lambda: tmp_path / "missing-development.so"
     )
-    with pytest.raises(NativeLibraryNotFoundError, match="cargo build.*HFTBACKTEST_SLIM_LIBRARY"):
+    with pytest.raises(
+        NativeLibraryNotFoundError,
+        match="native/Cargo.toml.*HFTBACKTEST_SLIM_LIBRARY",
+    ):
         binding.resolve_library_path()
 
 

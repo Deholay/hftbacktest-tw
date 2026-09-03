@@ -35,6 +35,11 @@ _COMPACT_EXPORTS = {
     "CompactBuildConfig": (".cache.config", "CompactBuildConfig"),
     "CompactCacheStore": (".cache.store", "CompactCacheStore"),
     "CompactSource": (".cache.config", "CompactSource"),
+    "aggregate_depth_side": (".market_data.normalize", "_aggregate_depth_side"),
+    "normalized_bbo_from_depth_columns": (
+        ".market_data.normalize",
+        "normalized_bbo_from_depth_columns",
+    ),
 }
 
 
@@ -82,4 +87,6 @@ __all__ = (
     "TimeInForce",
     "UnsupportedCapabilityError",
     "__version__",
+    "aggregate_depth_side",
+    "normalized_bbo_from_depth_columns",
 )

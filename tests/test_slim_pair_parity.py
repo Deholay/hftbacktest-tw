@@ -11,7 +11,7 @@ import pyarrow.ipc as ipc
 from future_spot.arbitrage.hbt_backtest import HbtPairBacktester
 from future_spot.arbitrage.hbt_types import HbtPairBacktestConfig
 from future_spot.arbitrage.models import PairConfig
-from scripts.compact_cache import BBO_SCHEMA
+from hftbacktest_slim import BBO_SCHEMA
 from scripts.compact_hbt_adapter import compact_to_reference_events
 from scripts.hbt_types import HbtAssetConfig
 from scripts.tw_stock_hftbacktest import import_hftbacktest
