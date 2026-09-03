@@ -292,6 +292,17 @@ disk-budget, and cache-invalidation tests pass.
 
 ### Phase 5: migrate strategy consumers
 
+Implementation status (2026-09-03): **complete**. `future_spot` now owns a minimal execution port plus
+separate reference and neutral slim adapters. Its primary slim path imports the
+documented root API and no compatibility facade. The reference Python/Numba
+paths remain intact, and `examples/slim_two_asset_strategy/` independently
+exercises a clocked FOK order with synthetic Arrow input. Synthetic one-pair and
+five-pair parity gates pass. A 42-pair complete date and the full 22-trading-day
+March 2026 month (638 daily pairs) also pass exact semantic-table parity with
+carry enabled and zero errors. Result implementation
+manifests invalidate because adapter sources changed, while compact identities,
+versions, matching, and output schemas do not. Phase 6 remains pending.
+
 - Make `future_spot` the first adapter using the neutral public API.
 - Move only generic compact audit/build behavior out of the full-market runner.
 - Keep pricing, risk, execution policy, carry, capital, reports, and strategy

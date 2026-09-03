@@ -105,11 +105,12 @@ Slim 會保留設定的 `step_ms` 策略決策時鐘、各腿獨立的 feed/orde
 | `hftbacktest_slim/src/hftbacktest_slim/engine/` | Neutral `SlimEngine`、`ctypes` ABI binding、Arrow partition reader、lifecycle 與 capability validation。 |
 | `hftbacktest_slim/src/hftbacktest_slim/market_data/` | Canonical `bbo_v1` schema/aligned dtype、Top-5 normalization、timestamp ordering/sidecars 與 generic compact audit。 |
 | `hftbacktest_slim/src/hftbacktest_slim/cache/` | Builder v2 one-scan cache、manifest identity/validation、disk budgets 與 atomic publication。 |
-| `hftbacktest_slim/src/hftbacktest_slim/compat/hbt.py` | 現有 `future_spot` 暫時使用的 HBT-compatible facade。 |
+| `hftbacktest_slim/src/hftbacktest_slim/compat/hbt.py` | Phase 6 前保留、但 `future_spot` 主要路徑不再使用的 HBT-compatible facade。 |
 | `scripts/slim_engine.py` | 僅保留舊 import path 的過渡 re-export wrapper；不再包含 runtime implementation。 |
 | `scripts/compact_cache.py` | 僅保留舊 compact import path 的過渡 re-export wrapper。 |
 | `scripts/build_compact_cache.py`、`scripts/benchmark_compact_read.py` | 保留舊命令的 package CLI delegates。 |
-| `future_spot/arbitrage/hbt_backtest.py` | Engine 選擇與 pair strategy 整合。 |
+| `future_spot/arbitrage/execution_port.py`、`reference_execution.py`、`slim_execution.py` | Strategy-owned execution port，以及 reference／neutral slim adapters。 |
+| `future_spot/arbitrage/hbt_backtest.py` | 經由 execution port 執行共用 pair strategy 流程。 |
 | `future_spot/arbitrage/full_market_runner.py` | CLI、compact data 編排、依日期循序留倉、workers、結果持久化與 manifests。 |
 
 Linux 環境會產生 `target/release/libhbt_slim.so`。Compact cache 的預設位置為
@@ -120,7 +121,10 @@ Python neutral API 可由 `hftbacktest_slim` 匯入 `AssetConfig`、`SlimEngine`
 `HFTBACKTEST_SLIM_LIBRARY`、package artifact，以及 root Cargo release artifact；
 package import 本身不會載入 shared library。Compact schema 仍為 `bbo_v1`，builder
 已升為 version `2`，因此 version 1 cache 會保守失效；physical fields 與 matching
-語意均未改變。Phase 5 的 strategy execution consumer migration 尚未進行。
+語意均未改變。Phase 5 已將 `future_spot` slim path 改為直接使用 neutral API；
+`examples/slim_two_asset_strategy/` 以另一個獨立策略驗證相同擴充邊界。這次 integration
+source 變更會使舊 result manifests 失效，但不會使 compact cache 失效。Phase 6 才會
+移除相容 wrappers。
 
 Package-owned cache commands 與舊 wrappers 使用相同參數和 JSON 輸出形狀：
 
@@ -170,12 +174,13 @@ python3 future_spot/test/run_full_backtest.py \
 | `scripts/io_utils.py` | 小型 DataFrame、CSV 與時間處理 helpers。 |
 | `scripts/compact_cache.py` | Package compact API 的過渡 import-only wrapper。 |
 | `hftbacktest_slim/src/hftbacktest_slim/` | Neutral slim Python API、compact market-data/cache/CLI ownership、runtime binding/reader/models，以及暫時的 HBT compatibility namespace。 |
-| `scripts/slim_engine.py` | 現有 consumer 的過渡 import-only wrapper。 |
+| `scripts/slim_engine.py` | 舊 caller 與 compatibility tests 的過渡 import-only wrapper；主要 `future_spot` path 不使用。 |
 | `scripts/tw_stock_data_to_npz.py` | 將臺灣五檔資料列轉成 HftBacktest event arrays 或 `.npz`。 |
 | `scripts/tw_stock_hftbacktest.py` | 共用的股票回測設定、asset 建立、狀態與 BBO helpers。 |
 | `scripts/tw_stock_strategies.py` | 股票 notebook strategies 與 DataFrame summaries。 |
 | `hftbacktest_slim/native/` | 專案自行維護的 Rust slim scheduler、matcher 與穩定 C ABI。 |
 | `future_spot/arbitrage/` | 期現貨定價、風險、執行、HBT、留倉、資金與報表實作。 |
+| `examples/slim_two_asset_strategy/` | 不依賴 `future_spot` 的 neutral slim API 第二策略範例。 |
 | `future_spot/scripts/` | 精簡的期現貨 CLI entrypoints。 |
 | `future_spot/test/run_full_backtest.py` | 完整回測、報表資料表與 PNG 產生流程。 |
 | `notebooks/` | 精簡的實驗 runners 與跨策略整合範例。 |
@@ -184,7 +189,7 @@ Slim runtime 的跨策略行為應放在 `hftbacktest_slim/`；其他跨策略 P
 仍放在根目錄的 `scripts/`。策略資料夾只負責自身領域模型、定價、風險、執行、設定與
 輸出 schema。新的策略家族應實作 `scripts.strategy_api`，不應從
 `future_spot` 匯入可重用行為。詳見
-[`STRATEGY_GUIDANCE.md`](STRATEGY_GUIDANCE.md) 與
+[`examples/slim_two_asset_strategy/README.md`](examples/slim_two_asset_strategy/README.md) 與
 [`notebooks/hbt_strategy_interface_example.ipynb`](notebooks/hbt_strategy_interface_example.ipynb).
 
 ## 期現貨流程

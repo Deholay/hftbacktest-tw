@@ -130,11 +130,13 @@ class PersistentExecutorTest(unittest.TestCase):
                 *(package_root / "engine").rglob("*.py"),
                 *(package_root / "cache").rglob("*.py"),
                 *(package_root / "market_data").rglob("*.py"),
+                package_root / "__init__.py",
+                package_root / "api.py",
                 package_root / "config.py",
                 package_root / "enums.py",
+                package_root / "errors.py",
                 package_root / "models.py",
                 package_root / "version.py",
-                package_root / "compat" / "hbt.py",
             ],
             key=lambda path: path.as_posix(),
         )
@@ -142,13 +144,29 @@ class PersistentExecutorTest(unittest.TestCase):
 
         self.assertEqual(selected, expected)
         self.assertTrue(all(path.is_file() for path in selected))
-        self.assertIn(
+        self.assertNotIn(
             Path(__file__).resolve().parents[1] / "scripts" / "slim_engine.py",
             _hbt_implementation_paths(),
         )
         self.assertIn(
             Path(__file__).resolve().parents[1] / "scripts" / "compact_cache.py",
             _hbt_implementation_paths(),
+        )
+        arbitrage_root = Path(__file__).resolve().parents[1] / "future_spot" / "arbitrage"
+        for name in (
+            "execution_port.py",
+            "reference_execution.py",
+            "slim_execution.py",
+            "hbt_backtest.py",
+            "strategy.py",
+            "strategy_adapter.py",
+        ):
+            self.assertIn(arbitrage_root / name, _hbt_implementation_paths())
+
+        reference_event_paths = _hbt_implementation_paths("reference", "event_npz")
+        self.assertNotIn(package_root / "compat" / "hbt.py", reference_event_paths)
+        self.assertFalse(
+            any(path.is_relative_to(package_root / "engine") for path in reference_event_paths)
         )
         self.assertIn(
             Path(__file__).resolve().parents[1]

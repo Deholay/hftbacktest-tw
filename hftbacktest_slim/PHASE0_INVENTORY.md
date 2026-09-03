@@ -537,3 +537,160 @@ engine APIs from a working directory outside the repository while proving no
 `scripts`, `future_spot`, or installed `hftbacktest` dependency. No full-market
 data run or performance benchmark was executed, so Phase 4 creates no
 `run_errors.csv` and makes no throughput claim.
+
+## Phase 5 pre-change baseline
+
+The Phase 5 baseline was captured on 2026-09-03 against the completed Phase 4
+tree. `git status --short` was empty before editing. The requested system
+interpreter commands fail during collection because `/usr/bin/python3` still
+lacks NumPy, PyArrow, and Pandas; the same pre-existing environment limitation
+is recorded in the Phase 3 and Phase 4 sections. The repository-managed virtual
+environment is therefore the executable semantic baseline.
+
+| Exact command | Outcome |
+| --- | --- |
+| `cargo build --workspace --release` | PASS: release workspace built without rebuilding semantic sources. |
+| `python3 -m pytest -q hftbacktest_slim/tests` | PRE-EXISTING ENVIRONMENT FAILURE: four collection errors because `/usr/bin/python3` has no NumPy/PyArrow. |
+| `python3 -m pytest -q tests/test_slim_engine.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection because `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q tests/test_slim_pair_parity.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection because `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q tests/test_hbt_runner_execution.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection because `/usr/bin/python3` has no Pandas. |
+| `python3 -m pytest -q tests/test_daily_result_pipeline.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection because `/usr/bin/python3` has no Pandas. |
+| `python3 -m pytest -q future_spot/test/test_hbt_numba.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection because `/usr/bin/python3` has no NumPy. |
+| `python3 -m pytest -q future_spot/test/test_position_carry.py` | PRE-EXISTING ENVIRONMENT FAILURE during collection because `/usr/bin/python3` has no Pandas. |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests` | PASS: 70 package tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py` | PASS: 2 compatibility-facade tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_pair_parity.py` | PASS: 1 exact reference/slim pair-parity test. |
+| `.venv/bin/python -m pytest -q tests/test_hbt_runner_execution.py` | PASS: 7 runner, exclusion, multiprocessing-error, and daily persistence tests. |
+| `.venv/bin/python -m pytest -q tests/test_daily_result_pipeline.py` | PASS: 2 daily-pipeline tests. |
+| `.venv/bin/python -m pytest -q future_spot/test/test_hbt_numba.py` | PASS: 4 Numba scanner tests. |
+| `.venv/bin/python -m pytest -q future_spot/test/test_position_carry.py` | PASS: 3 carry and expiry tests. |
+| `.venv/bin/python -m pytest -q tests/test_daily_result_store.py` | PASS: 7 persistence and resume-manifest tests. |
+| `.venv/bin/python -m pytest -q future_spot/test/test_capital.py tests/test_backtest_pipeline_timings.py` | PASS: 8 capital and timing tests. |
+| `.venv/bin/python -m pytest -q future_spot/test/test_fast_pipeline.py` | PASS: 11 runner-manifest, exclusion, configuration, and report tests. |
+| `.venv/bin/python -m pytest -q future_spot/test/test_report_tables_streaming.py future_spot/test/test_result_replot.py` | PASS: 6 reporting tests. |
+| `.venv/bin/python -m pytest -q tests/test_compare_engine_outputs.py tests/test_hbt_common.py` | PASS: 7 comparison and strict HBT-helper tests. |
+
+Before Phase 5, assets are fixed at stock `0` and future `1`; the reference
+constructor creates `[spot, future]` `BacktestAsset` values and
+`HashMapMarketDepthBacktest`, while the slim constructor passes the same two
+asset configs to the transitional `SlimBacktest`. The decision clock advances
+once by `step_ns` (default 1,000,000,000 ns) before each evaluation and is not a
+feed-event clock. Reference supports Python and Numba scanners; custom
+strategies force the Python reference path. Slim forces the Python strategy
+loop and compact Arrow input.
+
+The mixed runner maps strict `GTC`, `GTX`, `FOK`, and `IOC` strings with
+`hbt_time_in_force`; slim exposes numeric status `NEW=1`, `EXPIRED=2`, and
+`FILLED=3` through HBT-shaped facade objects. It submits a limit buy/sell,
+interprets nonzero submit return codes as immediate failure, waits for the
+specific order response, captures request/exchange/response timestamps, looks
+up the visible order, records positive executed quantity as a fill, cancels an
+active reference order, waits for that cancellation, and clears inactive
+orders. Feed latency is the current exchange/local timestamp tuple; order
+latency is the last request/exchange/response tuple.
+
+The frozen execution sequence is: step advance, both local BBO reads, pricing,
+one strategy evaluation, configured first-leg submission and response, optional
+`none|spot|future|both|any` post-first-feed polling, refreshed pricing,
+second-leg profit-condition recheck, second-leg submission or audited failure,
+and configured first-leg flatten. Feed timeout is recorded as
+`POST_FIRST_FEED_TIMEOUT`; first-leg non-fill, second-leg non-fill, profit-check
+failure, and flatten outcomes remain explicit. Final positions, realized PnL,
+carry contract identity, expiry residuals, and summary/trade/market/latency
+column construction all remain owned by `future_spot`.
+
+The pre-change result manifest records selected engine and version, strategy
+clock, TIF semantics, result-affecting settings, and one combined source hash.
+That hash includes the pair backtester, Numba scanner, HBT helpers, strategy,
+strategy adapter, carry, compact/native modules, both neutral slim modules and
+the transitional `scripts/slim_engine.py` and compatibility facade regardless
+of selected runtime. Phase 5 is expected to replace that indiscriminate active
+compatibility dependency with deterministic execution-port and selected-adapter
+fingerprints; result manifests may invalidate, while compact identity and all
+persisted output schemas remain unchanged.
+
+## Phase 5 post-migration result
+
+Phase 5 is complete. `future_spot` owns `execution_port.py` and separate
+reference/slim adapters. Common pair execution accepts the port and no longer
+uses an HBT constants object. The slim adapter imports only documented neutral
+root-package types, converts the existing stock/future configs to exactly two
+ordered `AssetConfig` values, and treats an active immediate order as an
+invariant violation. The reference adapter retains installed-package isolation,
+`BacktestAsset`, `HashMapMarketDepthBacktest`, queue selection, strict TIF,
+cancel/cleanup, and the raw backend required by the unchanged Numba scanner.
+The HBT compatibility facade and `scripts/slim_engine.py` remain intact for
+Phase 6, but are absent from the active futures/spot slim path and its result
+fingerprint.
+
+`examples/slim_two_asset_strategy/` is the independent second strategy. It
+imports no `future_spot` or compatibility module, controls a fixed clock,
+compares two BBOs, submits a crossing FOK order through the neutral API,
+observes `OrderView`, and closes with the context lifecycle. Its synthetic
+fixture also freezes the no-displayed-size-cap behavior.
+
+The result manifest now records `future-spot-execution-port-v1`, the selected
+adapter identity, and a sorted hash over the port, both adapters, pair runner,
+strategy/adapter, and selected package/native/compact sources. This intentionally
+invalidates prior result manifests. Compact cache identity is unchanged.
+
+### Phase 5 validation
+
+| Exact command | Outcome |
+| --- | --- |
+| `.venv/bin/python -m pytest -q tests/test_execution_adapters.py` | PASS: 7 adapter, strict mapping, lifecycle, pickling, custom-strategy, and reference-isolation tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_pair_behavior.py` | PASS: 11 clock, fill/non-fill, entry/response-latency feed movement, second-leg, flatten, feed-wait, and timeout tests. |
+| `.venv/bin/python -m pytest -q hftbacktest_slim/tests` | PASS: 70 package, compatibility, boundary, and external-install tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_engine.py` | PASS: 2 retained compatibility-wrapper tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_pair_parity.py` | PASS: synthetic one-pair and aggregated five-pair exact reference/slim parity. |
+| `.venv/bin/python -m pytest -q tests/test_hbt_runner_execution.py` | PASS: 7 runner, manifest-path, multiprocessing-error, exclusion, and persistence tests. |
+| `.venv/bin/python -m pytest -q tests/test_daily_result_pipeline.py tests/test_daily_result_store.py` | PASS: 9 daily persistence and restart tests. |
+| `.venv/bin/python -m pytest -q future_spot/test/test_hbt_numba.py future_spot/test/test_position_carry.py` | PASS: 7 Numba, strict TIF, carry, and expiry tests. |
+| `.venv/bin/python -m pytest -q future_spot/test/test_capital.py future_spot/test/test_fast_pipeline.py future_spot/test/test_report_tables_streaming.py future_spot/test/test_result_replot.py tests/test_compare_engine_outputs.py` | PASS: 26 capital, manifest, exclusion, reporting, and comparison tests. |
+| `.venv/bin/python -m pytest -q tests/test_slim_two_asset_strategy.py` | PASS: 2 independent-strategy behavior and import-boundary tests. |
+| `.venv/bin/python -m pytest -q tests future_spot/test hftbacktest_slim/tests` | PASS: 164 tests. |
+| `cargo test --workspace` | PASS: 13 Rust tests and 0 doc-test failures. |
+| `cargo fmt --check --all` | PASS: no output. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS: no warnings. |
+| `cargo build --workspace --release` | PASS: unchanged release artifact built. |
+| `PYTHONPYCACHEPREFIX=/tmp/hftbacktest_phase5_pycache .venv/bin/python -m compileall -q scripts future_spot/arbitrage future_spot/scripts future_spot/test hftbacktest_slim/src/hftbacktest_slim examples/slim_two_asset_strategy tests hftbacktest_slim/tests` | PASS: retained modules, adapters, examples, and tests compiled. |
+| `python3 -m pip install --no-deps --no-index --no-build-isolation --target <temporary> ./hftbacktest_slim` followed by an external-cwd import | PASS with system build tooling and repository-venv runtime dependencies; package `0.3.0a2` imported without strategy or installed-HBT modules. |
+| `git diff --check` | PASS: no whitespace errors. |
+
+The first local-install attempt with `.venv/bin/python` failed before building
+because that virtual environment intentionally has no `setuptools`; the package
+test's system base interpreter has local setuptools 68.1.2, and the required
+offline `--no-build-isolation` install/import smoke test passes there. No
+network dependency was used.
+
+### Phase 5 cross-engine rollout
+
+Both real-data engines used `market-data-cache=compact`, `strategy-engine=python`,
+the same result-defining defaults, separate `/tmp` output roots, and one shared
+builder-v2 compact root. The slim path cold-built each compact date; reference
+then validated warm cache hits and used the explicit compact-to-reference
+bridge. Neither run changed tracked generated outputs.
+
+| Rollout level | Outcome |
+| --- | --- |
+| Synthetic one pair/date | PASS: exact trade/fill/status/price/quantity/request/exchange/response timestamp parity. |
+| Synthetic five pairs/date | PASS: exact concatenated summary, trades, market, and latency parity. |
+| Complete 2026-05-21 date | PASS: 42 pairs; 10,984 trade, 14,252 market, 205 latency, 21,968 entry/exit, 42 summary, and 42 carry rows exact; zero errors. |
+| Complete March 2026 month | PASS: 22 trading dates and 638 daily pairs; 91,693 trade, 243,650 market, 5,100 latency, 183,386 entry/exit, 638 summary, and 638 carry rows exact; zero errors. |
+| Multiple dates with carry | PASS within the March run: sequential date barriers, exact carried contract/direction/quantity restoration, held-pair universe expansion, no implicit roll, and exact carry tables. |
+
+The canonical comparison command was
+`python future_spot/test/compare_engine_outputs.py --reference
+/tmp/hbt_phase5_reference_month --slim /tmp/hbt_phase5_slim_month --output
+/tmp/hbt_phase5_month_parity.json`; it returned `equal: true` for every date and
+semantic table. The normalized daily universe/exclusion columns are exact.
+Expected diagnostics differ: engine/version, Arrow versus reconstructed-NPZ
+paths and physical row counts, and cold cache miss/scan count versus warm hit.
+Daily manifests are complete on both sides and intentionally retain those
+engine/input/table-file identities. Both root `run_errors.csv` files and all 44
+daily error partitions contain zero rows.
+
+Package `0.3.0a2`, Rust crate `0.2.0`, engine identity `rust-0.2.0`, native ABI
+`1`, `COMPACT_SCHEMA_VERSION = "bbo_v1"`, compact builder `2`, strict TIF
+semantics, strategy clock, matching behavior, and persisted output schema
+versions are unchanged. No performance benchmark or speed claim is made.

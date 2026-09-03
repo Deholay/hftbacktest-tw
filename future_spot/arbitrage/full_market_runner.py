@@ -2271,21 +2271,31 @@ def hbt_manifest_path(output_dir: Path) -> Path:
     return output_dir / HBT_MANIFEST_NAME
 
 
-def _hbt_implementation_paths() -> list[Path]:
+def _hbt_implementation_paths(
+    engine: str = "slim", market_data_cache: str = "compact"
+) -> list[Path]:
     slim_python_root = WORKSPACE_ROOT / "hftbacktest_slim" / "src" / "hftbacktest_slim"
-    slim_python_sources = sorted(
-        [
-            *(slim_python_root / "engine").rglob("*.py"),
-            *(slim_python_root / "cache").rglob("*.py"),
-            *(slim_python_root / "market_data").rglob("*.py"),
-            slim_python_root / "config.py",
-            slim_python_root / "enums.py",
-            slim_python_root / "models.py",
-            slim_python_root / "version.py",
-            slim_python_root / "compat" / "hbt.py",
-        ],
-        key=lambda path: path.as_posix(),
-    )
+    slim_runtime_sources = [
+        *(slim_python_root / "engine").rglob("*.py"),
+        slim_python_root / "config.py",
+        slim_python_root / "enums.py",
+        slim_python_root / "errors.py",
+        slim_python_root / "models.py",
+        slim_python_root / "version.py",
+    ]
+    compact_sources = [
+        *(slim_python_root / "cache").rglob("*.py"),
+        *(slim_python_root / "market_data").rglob("*.py"),
+    ]
+    slim_python_sources = [
+        slim_python_root / "__init__.py",
+        slim_python_root / "api.py",
+    ]
+    if engine == "slim":
+        slim_python_sources.extend(slim_runtime_sources)
+    if engine == "slim" or market_data_cache == "compact":
+        slim_python_sources.extend(compact_sources)
+    slim_python_sources = sorted(set(slim_python_sources), key=lambda path: path.as_posix())
     native_root = WORKSPACE_ROOT / "hftbacktest_slim" / "native"
     native_sources = sorted(
         (native_root / "src").rglob("*.rs"), key=lambda path: path.as_posix()
@@ -2293,17 +2303,21 @@ def _hbt_implementation_paths() -> list[Path]:
     return sorted(
         [
             ARBITRAGE_ROOT / "hbt_backtest.py",
+            ARBITRAGE_ROOT / "execution_port.py",
+            ARBITRAGE_ROOT / "reference_execution.py",
+            ARBITRAGE_ROOT / "slim_execution.py",
             ARBITRAGE_ROOT / "hbt_numba.py",
             ARBITRAGE_ROOT / "hbt_helpers.py",
             ARBITRAGE_ROOT / "strategy.py",
             ARBITRAGE_ROOT / "strategy_adapter.py",
             ARBITRAGE_ROOT / "position_carry.py",
-            ROOT_SCRIPT_ROOT / "compact_cache.py",
-            ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py",
+            *(
+                [ROOT_SCRIPT_ROOT / "compact_cache.py", ROOT_SCRIPT_ROOT / "compact_hbt_adapter.py"]
+                if market_data_cache == "compact"
+                else []
+            ),
             *slim_python_sources,
-            ROOT_SCRIPT_ROOT / "slim_engine.py",
-            native_root / "Cargo.toml",
-            *native_sources,
+            *([native_root / "Cargo.toml", *native_sources] if engine == "slim" else []),
             Path(__file__),
         ],
         key=lambda path: path.as_posix(),
@@ -2340,6 +2354,8 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
         "schema_version": HBT_CACHE_SCHEMA_VERSION,
         "engine": getattr(args, "engine", "reference"),
         "engine_version": execution_engine_version(args),
+        "execution_port": "future-spot-execution-port-v1",
+        "execution_adapter": f"{getattr(args, 'engine', 'reference')}-v1",
         "compact_schema_version": (
             COMPACT_SCHEMA_VERSION
             if getattr(args, "market_data_cache", "event_npz") == "compact"
@@ -2360,7 +2376,12 @@ def hbt_manifest_payload(args: argparse.Namespace, records: list[DailyPairRecord
         "run_keys": [record.run_key for record in records],
         "daily_configs": [_content_fingerprint(path) for path in config_paths],
         "event_files": [_stat_fingerprint(path) for path in event_paths],
-        "implementation_sha256": _combined_content_sha256(_hbt_implementation_paths()),
+        "implementation_sha256": _combined_content_sha256(
+            _hbt_implementation_paths(
+                getattr(args, "engine", "reference"),
+                getattr(args, "market_data_cache", "event_npz"),
+            )
+        ),
     }
 
 

@@ -85,6 +85,16 @@ and report rows. Every non-HOLD signal row is still retained. Backtest reuse is 
 which fingerprints result-affecting arguments, daily configs, event-file stats,
 and strategy/HBT implementation files.
 
+`HbtPairBacktester` now runs through the strategy-owned port in
+`arbitrage/execution_port.py`. `ReferenceExecutionAdapter` retains installed
+HftBacktest asset/queue/TIF/cancel behavior and exposes its raw backend only to
+the existing Numba scanner. `SlimExecutionAdapter` converts the same two asset
+configs to neutral `hftbacktest_slim.AssetConfig` values and maps neutral depth,
+latency, immediate-order, status, and lifecycle models. Common pair logic no
+longer depends on HBT constants or the slim HBT-compatible facade. A visible
+active slim FOK/IOC order is an invariant violation because passive cancel is
+outside the supported slim profile.
+
 Use `--strategy-engine python` as the reference/fallback path. Numba currently
 supports only the default future/spot strategy; a custom `Strategy` must use the
 Python engine. The first pair handled by each worker includes JIT compilation;
@@ -247,8 +257,15 @@ Current HBT full-market path:
 - `arbitrage_config_base.json`: non-secret template config used by the daily
   config builder. Generated daily configs are written under the output
   directory.
-- `arbitrage/hbt_backtest.py`: pair-level HBT strategy simulation and latency
-  event capture. It accepts a root-interface-compatible strategy object.
+- `arbitrage/hbt_backtest.py`: pair-level strategy simulation and latency event
+  capture through the execution port. It accepts a root-interface-compatible
+  strategy object.
+- `arbitrage/execution_port.py`: minimal engine-neutral clock, BBO, latency,
+  immediate-order, response, cleanup, and lifecycle protocol.
+- `arbitrage/reference_execution.py`: installed HftBacktest construction,
+  strict TIF/side mapping, queue/cancel behavior, and Numba backend boundary.
+- `arbitrage/slim_execution.py`: direct neutral `hftbacktest_slim` consumer;
+  it does not import `scripts.slim_engine` or `hftbacktest_slim.compat.hbt`.
 - `arbitrage/strategy_adapter.py`: futures/spot implementation of
   `scripts.strategy_api`.
 - `arbitrage/daily_pipeline.py`: date selection, path resolution, daily pair
@@ -312,7 +329,15 @@ trades, summary = backtester.run()
 ```
 
 For non-futures/spot strategy families, create a separate implementation folder
-and adapt to `scripts.strategy_api` instead of importing `future_spot`.
+and use the neutral slim API or adapt to `scripts.strategy_api` instead of
+importing `future_spot`. `examples/slim_two_asset_strategy/` is the small,
+synthetic-Arrow, clocked FOK example. The compatibility facade remains only for
+Phase 6 migration cleanup.
+
+Because the execution port and adapters are result-defining sources, Phase 5
+changes `backtest_manifest.json` implementation fingerprints and intentionally
+invalidates old result caches. Compact schema `bbo_v1`, compact builder version
+2, native ABI 1, matching semantics, and persisted result schemas are unchanged.
 
 ## Latest Run Snapshot
 

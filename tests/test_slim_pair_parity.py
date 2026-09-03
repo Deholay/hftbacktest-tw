@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
@@ -143,3 +144,28 @@ def test_reference_and_slim_pair_fill_golden_match(tmp_path: Path) -> None:
     ]
     assert not reference_trades.empty
     assert reference_trades[columns].to_dict("records") == slim_trades[columns].to_dict("records")
+
+    reference_frames = {"trades": [], "summary": [], "market": [], "latency": []}
+    slim_frames = {"trades": [], "summary": [], "market": [], "latency": []}
+    for index in range(5):
+        named_pair = replace(pair, name=f"A_AF_{index}")
+        reference_runner = HbtPairBacktester(
+            replace(reference, pair=named_pair), hbtpkg=import_hftbacktest(Path(__file__).resolve().parents[1])
+        )
+        ref_trades, ref_summary = reference_runner.run()
+        slim_runner = HbtPairBacktester(replace(slim, pair=named_pair))
+        native_trades, native_summary = slim_runner.run()
+        for target, runner, trades, summary in (
+            (reference_frames, reference_runner, ref_trades, ref_summary),
+            (slim_frames, slim_runner, native_trades, native_summary),
+        ):
+            target["trades"].append(trades)
+            target["summary"].append(summary)
+            target["market"].append(runner.market_frame())
+            target["latency"].append(runner.latency_frame())
+
+    for table in reference_frames:
+        pd.testing.assert_frame_equal(
+            pd.concat(reference_frames[table], ignore_index=True),
+            pd.concat(slim_frames[table], ignore_index=True),
+        )
